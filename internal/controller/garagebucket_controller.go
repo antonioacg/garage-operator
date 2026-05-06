@@ -232,8 +232,24 @@ func (r *GarageBucketReconciler) reconcileBucket(ctx context.Context, bucket *ga
 		alias = bucket.Spec.GlobalAlias
 	}
 
+	prevBucketID := bucket.Status.BucketID
 	existingBucket, err := r.getOrCreateBucket(ctx, bucket, garageClient, alias)
 	if err != nil {
+		return err
+	}
+
+	// Persist status.BucketID immediately whenever it is newly learned or created.
+	// Without this, a crash between creation and the end-of-reconcile status write
+	// causes the next reconcile to lose track of the bucket and create a duplicate.
+	if bucket.Status.BucketID != prevBucketID {
+		if err := r.Status().Update(ctx, bucket); err != nil {
+			return fmt.Errorf("failed to persist bucket ID: %w", err)
+		}
+	}
+
+	// Ensure the global alias is set. This is an explicit idempotent step because
+	// CreateBucket no longer sets the alias atomically — see getOrCreateBucket for why.
+	if err := r.reconcileGlobalAlias(ctx, garageClient, existingBucket.ID, alias, existingBucket.GlobalAliases); err != nil {
 		return err
 	}
 
@@ -303,22 +319,37 @@ func (r *GarageBucketReconciler) getOrCreateBucket(ctx context.Context, bucket *
 		return nil, fmt.Errorf("failed to get bucket by alias %s: %w", alias, err)
 	}
 
+	// Create without a global alias so Garage only performs one atomic write
+	// (inserting the bucket record). The Garage CreateBucket handler is not
+	// atomic: it writes the bucket record first and then sets the alias in a
+	// separate step. If the alias step fails, Garage returns an error but the
+	// bare bucket record already exists — producing an orphan with no alias
+	// that the operator cannot find on the next reconcile, which then creates
+	// another orphan, and so on. Separating creation from alias-setting (via
+	// reconcileGlobalAlias) eliminates this failure mode.
 	log.Info("Creating bucket", "alias", alias)
-	created, err := garageClient.CreateBucket(ctx, garage.CreateBucketRequest{GlobalAlias: alias})
+	created, err := garageClient.CreateBucket(ctx, garage.CreateBucketRequest{})
 	if err != nil {
-		if garage.IsConflict(err) {
-			log.Info("Bucket creation conflict, fetching existing bucket", "alias", alias)
-			existing, getErr := garageClient.GetBucket(ctx, garage.GetBucketRequest{GlobalAlias: alias})
-			if getErr != nil {
-				return nil, fmt.Errorf("failed to create bucket (conflict) and failed to get existing bucket: %w (original: %v)", getErr, err)
-			}
-			bucket.Status.BucketID = existing.ID
-			return existing, nil
-		}
 		return nil, fmt.Errorf("failed to create bucket: %w", err)
 	}
 	bucket.Status.BucketID = created.ID
 	return created, nil
+}
+
+func (r *GarageBucketReconciler) reconcileGlobalAlias(ctx context.Context, garageClient *garage.Client, bucketID, alias string, currentAliases []string) error {
+	for _, a := range currentAliases {
+		if a == alias {
+			return nil
+		}
+	}
+	_, err := garageClient.AddBucketAlias(ctx, garage.AddBucketAliasRequest{
+		BucketID:    bucketID,
+		GlobalAlias: alias,
+	})
+	if err != nil && !garage.IsConflict(err) {
+		return fmt.Errorf("failed to set global alias %q on bucket %s: %w", alias, bucketID, err)
+	}
+	return nil
 }
 
 func (r *GarageBucketReconciler) updateBucketSettings(ctx context.Context, bucket *garagev1beta1.GarageBucket, garageClient *garage.Client, existingBucket *garage.Bucket) error {
