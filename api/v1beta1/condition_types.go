@@ -179,8 +179,8 @@ const (
 	// ReasonGatewayNodesOffline indicates no nodes are connected in either direction
 	ReasonGatewayNodesOffline = "NodesOffline"
 
-	// ReasonPerNodeNotImplemented indicates publicEndpoint.loadBalancer.perNode is not yet supported;
-	// use network.rpcPublicAddr as a workaround
+	// ReasonPerNodeNotImplemented indicates a reconciler version does not support
+	// publicEndpoint.loadBalancer.perNode.
 	ReasonPerNodeNotImplemented = "PerNodeNotImplemented"
 )
 
