@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
+	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
 
 var _ = Describe("publicEndpoint reconciliation", func() {
@@ -56,7 +57,7 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 			_ = k8sClient.Update(ctx, cluster)
 			_ = k8sClient.Delete(ctx, cluster)
 		}
-		for _, name := range []string{peClusterName, peClusterName + "-headless", peClusterName + "-rpc"} {
+		for _, name := range []string{peClusterName, peClusterName + "-headless", peClusterName + "-rpc", peClusterName + "-0-rpc", peClusterName + "-1-rpc", peClusterName + "-2-rpc"} {
 			_ = k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: peNamespace}})
 		}
 		_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: peClusterName + "-config", Namespace: peNamespace}})
@@ -152,6 +153,55 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: peClusterName + "-config", Namespace: peNamespace}, cm)).To(Succeed())
 			Expect(cm.Data["garage.toml"]).To(ContainSubstring(`rpc_public_addr = "explicit.example.com:3901"`))
 			Expect(cm.Data["garage.toml"]).NotTo(ContainSubstring("10.0.0.5"))
+		})
+
+		It("creates per-node LoadBalancer RPC services when perNode is true", func() {
+			cluster := &garagev1beta1.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: peClusterName, Namespace: peNamespace},
+				Spec: garagev1beta1.GarageClusterSpec{
+					Replicas:    2,
+					Replication: &garagev1beta1.ReplicationConfig{Factor: 1},
+					PublicEndpoint: &garagev1beta1.PublicEndpointConfig{
+						Type: publicEndpointTypeLoadBalancer,
+						LoadBalancer: &garagev1beta1.LoadBalancerEndpointConfig{
+							PerNode: true,
+							ServiceMeta: garagev1beta1.ServiceMeta{
+								Annotations: map[string]string{"metallb.universe.tf/address-pool": "garage-rpc"},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+
+			shared := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: peClusterName + "-rpc", Namespace: peNamespace},
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{{Name: rpcPortName, Port: 3901}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, shared)).To(Succeed())
+
+			reconcileTwice()
+
+			err := k8sClient.Get(ctx, types.NamespacedName{Name: peClusterName + "-rpc", Namespace: peNamespace}, &corev1.Service{})
+			Expect(k8serrors.IsNotFound(err)).To(BeTrue())
+
+			for _, podName := range []string{peClusterName + "-0", peClusterName + "-1"} {
+				rpcSvc := &corev1.Service{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: podName + "-rpc", Namespace: peNamespace}, rpcSvc)).To(Succeed())
+				Expect(rpcSvc.Spec.Type).To(Equal(corev1.ServiceTypeLoadBalancer))
+				Expect(rpcSvc.Spec.Selector).To(HaveKeyWithValue("statefulset.kubernetes.io/pod-name", podName))
+				Expect(rpcSvc.Spec.Ports).To(ContainElement(HaveField("Port", int32(3901))))
+				Expect(rpcSvc.Annotations).To(HaveKeyWithValue("metallb.universe.tf/address-pool", "garage-rpc"))
+			}
+
+			updated := &garagev1beta1.GarageCluster{}
+			Expect(k8sClient.Get(ctx, nn, updated)).To(Succeed())
+			cond := findCondition(updated.Status.Conditions, garagev1beta1.ConditionPublicEndpointReady)
+			Expect(cond).NotTo(BeNil())
+			Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 		})
 	})
 
@@ -286,8 +336,42 @@ var _ = Describe("publicEndpoint reconciliation", func() {
 			addr := reconciler.deriveGatewayExternalAddr(ctx, cluster)
 			Expect(addr).To(BeEmpty())
 		})
+
+		It("returns the matching per-node LoadBalancer address when perNode is true", func() {
+			cluster := &garagev1beta1.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: peClusterName, Namespace: peNamespace},
+				Spec: garagev1beta1.GarageClusterSpec{
+					PublicEndpoint: &garagev1beta1.PublicEndpointConfig{
+						Type: publicEndpointTypeLoadBalancer,
+						LoadBalancer: &garagev1beta1.LoadBalancerEndpointConfig{
+							PerNode: true,
+						},
+					},
+				},
+			}
+
+			svc := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: peClusterName + "-0-rpc", Namespace: peNamespace},
+				Spec: corev1.ServiceSpec{
+					Type:  corev1.ServiceTypeLoadBalancer,
+					Ports: []corev1.ServicePort{{Name: rpcPortName, Port: 3901}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, svc)).To(Succeed())
+			svc.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "10.0.0.6"}}
+			Expect(k8sClient.Status().Update(ctx, svc)).To(Succeed())
+
+			addr := reconciler.deriveGatewayExternalAddrForNode(ctx, cluster, garage.NodeInfo{
+				Hostname: ptrString(peClusterName + "-0"),
+			})
+			Expect(addr).To(Equal("10.0.0.6:3901"))
+		})
 	})
 })
+
+func ptrString(v string) *string {
+	return &v
+}
 
 func findCondition(conditions []metav1.Condition, condType string) *metav1.Condition {
 	for i := range conditions {

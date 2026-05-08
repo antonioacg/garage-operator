@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1316,13 +1317,7 @@ func (r *GarageClusterReconciler) reconcilePublicEndpointService(ctx context.Con
 	svcName := cluster.Name + "-rpc"
 
 	if cluster.Spec.PublicEndpoint == nil {
-		// Clean up any existing -rpc service if publicEndpoint was removed
-		existing := &corev1.Service{}
-		if err := r.Get(ctx, types.NamespacedName{Name: svcName, Namespace: cluster.Namespace}, existing); err == nil {
-			log.Info("Deleting public endpoint RPC service (publicEndpoint removed)", "name", svcName)
-			return r.Delete(ctx, existing)
-		}
-		return nil
+		return r.deletePublicEndpointServices(ctx, cluster)
 	}
 
 	ep := cluster.Spec.PublicEndpoint
@@ -1338,11 +1333,14 @@ func (r *GarageClusterReconciler) reconcilePublicEndpointService(ctx context.Con
 	switch ep.Type {
 	case publicEndpointTypeLoadBalancer:
 		if ep.LoadBalancer != nil && ep.LoadBalancer.PerNode {
+			if err := r.reconcilePerNodeLoadBalancerServices(ctx, cluster, rpcPort, ep.LoadBalancer.ServiceMeta); err != nil {
+				return err
+			}
 			meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
 				Type:               garagev1beta1.ConditionPublicEndpointReady,
-				Status:             metav1.ConditionFalse,
-				Reason:             garagev1beta1.ReasonPerNodeNotImplemented,
-				Message:            "publicEndpoint.loadBalancer.perNode is not yet implemented; set network.rpcPublicAddr to the externally-routable RPC address",
+				Status:             metav1.ConditionTrue,
+				Reason:             garagev1beta1.ReasonReconcileSuccess,
+				Message:            "Per-node LoadBalancer RPC services are reconciled",
 				ObservedGeneration: cluster.Generation,
 			})
 			return nil
@@ -1391,6 +1389,127 @@ func (r *GarageClusterReconciler) reconcilePublicEndpointService(ctx context.Con
 
 	log.Info("Reconciling public endpoint RPC service", "name", svcName, "type", svcType)
 	return reconcileService(ctx, r.Client, svc, cluster, r.Scheme)
+}
+
+func (r *GarageClusterReconciler) reconcilePerNodeLoadBalancerServices(ctx context.Context, cluster *garagev1beta1.GarageCluster, rpcPort int32, svcMeta garagev1beta1.ServiceMeta) error {
+	log := logf.FromContext(ctx)
+
+	if err := r.deletePublicEndpointService(ctx, cluster, cluster.Name+"-rpc"); err != nil {
+		return err
+	}
+
+	replicas := cluster.Spec.Replicas
+	if replicas == 0 {
+		replicas = 3
+	}
+	desired := make(map[string]struct{}, replicas)
+
+	for i := int32(0); i < replicas; i++ {
+		podName := fmt.Sprintf("%s-%d", cluster.Name, i)
+		svcName := podName + "-rpc"
+		desired[svcName] = struct{}{}
+
+		selector := r.selectorLabelsForCluster(cluster)
+		selector["statefulset.kubernetes.io/pod-name"] = podName
+
+		svc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        svcName,
+				Namespace:   cluster.Namespace,
+				Labels:      mergeLabels(r.labelsForCluster(cluster), svcMeta.Labels),
+				Annotations: svcMeta.Annotations,
+			},
+			Spec: corev1.ServiceSpec{
+				Type:                     corev1.ServiceTypeLoadBalancer,
+				Selector:                 selector,
+				Ports:                    []corev1.ServicePort{rpcServicePort(rpcPort, 0)},
+				PublishNotReadyAddresses: true,
+			},
+		}
+
+		log.Info("Reconciling per-node public endpoint RPC service", "name", svcName, "pod", podName, "type", corev1.ServiceTypeLoadBalancer)
+		if err := reconcileService(ctx, r.Client, svc, cluster, r.Scheme); err != nil {
+			return err
+		}
+	}
+
+	serviceList := &corev1.ServiceList{}
+	if err := r.List(ctx, serviceList, client.InNamespace(cluster.Namespace), client.MatchingLabels(r.labelsForCluster(cluster))); err != nil {
+		return err
+	}
+	for i := range serviceList.Items {
+		svc := &serviceList.Items[i]
+		if !isClusterPerNodeRPCServiceName(cluster.Name, svc.Name) {
+			continue
+		}
+		if _, ok := desired[svc.Name]; ok {
+			continue
+		}
+		log.Info("Deleting stale per-node public endpoint RPC service", "name", svc.Name)
+		if err := r.Delete(ctx, svc); err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *GarageClusterReconciler) deletePublicEndpointServices(ctx context.Context, cluster *garagev1beta1.GarageCluster) error {
+	if err := r.deletePublicEndpointService(ctx, cluster, cluster.Name+"-rpc"); err != nil {
+		return err
+	}
+
+	serviceList := &corev1.ServiceList{}
+	if err := r.List(ctx, serviceList, client.InNamespace(cluster.Namespace), client.MatchingLabels(r.labelsForCluster(cluster))); err != nil {
+		return err
+	}
+	for i := range serviceList.Items {
+		svc := &serviceList.Items[i]
+		if !isClusterPerNodeRPCServiceName(cluster.Name, svc.Name) {
+			continue
+		}
+		if err := r.Delete(ctx, svc); err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *GarageClusterReconciler) deletePublicEndpointService(ctx context.Context, cluster *garagev1beta1.GarageCluster, name string) error {
+	existing := &corev1.Service{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: cluster.Namespace}, existing); err == nil {
+		return r.Delete(ctx, existing)
+	} else if !errors.IsNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+func rpcServicePort(rpcPort, nodePort int32) corev1.ServicePort {
+	port := corev1.ServicePort{
+		Name:       rpcPortName,
+		Port:       rpcPort,
+		TargetPort: intstr.FromInt32(rpcPort),
+		Protocol:   corev1.ProtocolTCP,
+	}
+	if nodePort != 0 {
+		port.NodePort = nodePort
+	}
+	return port
+}
+
+func isClusterPerNodeRPCServiceName(clusterName, serviceName string) bool {
+	prefix := clusterName + "-"
+	suffix := "-rpc"
+	if !strings.HasPrefix(serviceName, prefix) || !strings.HasSuffix(serviceName, suffix) {
+		return false
+	}
+	ordinal := strings.TrimSuffix(strings.TrimPrefix(serviceName, prefix), suffix)
+	if ordinal == "" {
+		return false
+	}
+	_, err := strconv.Atoi(ordinal)
+	return err == nil
 }
 
 // resolveGarageImage determines the container image from image/imageRepository fields.
@@ -3380,20 +3499,9 @@ func (r *GarageClusterReconciler) deriveGatewayExternalAddr(ctx context.Context,
 	switch cluster.Spec.PublicEndpoint.Type {
 	case publicEndpointTypeLoadBalancer:
 		if cluster.Spec.PublicEndpoint.LoadBalancer != nil && cluster.Spec.PublicEndpoint.LoadBalancer.PerNode {
-			return "" // not yet implemented
+			return r.loadBalancerServiceAddr(ctx, cluster.Namespace, cluster.Name+"-0-rpc", rpcPort)
 		}
-		svc := &corev1.Service{}
-		if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name + "-rpc", Namespace: cluster.Namespace}, svc); err == nil {
-			for _, ing := range svc.Status.LoadBalancer.Ingress {
-				addr := ing.IP
-				if addr == "" {
-					addr = ing.Hostname
-				}
-				if addr != "" {
-					return fmt.Sprintf("%s:%d", addr, rpcPort)
-				}
-			}
-		}
+		return r.loadBalancerServiceAddr(ctx, cluster.Namespace, cluster.Name+"-rpc", rpcPort)
 	case publicEndpointTypeNodePort:
 		if ep := cluster.Spec.PublicEndpoint.NodePort; ep != nil && len(ep.ExternalAddresses) > 0 {
 			basePort := ep.BasePort
@@ -3404,6 +3512,45 @@ func (r *GarageClusterReconciler) deriveGatewayExternalAddr(ctx context.Context,
 		}
 	}
 
+	return ""
+}
+
+func (r *GarageClusterReconciler) deriveGatewayExternalAddrForNode(ctx context.Context, cluster *garagev1beta1.GarageCluster, node garage.NodeInfo) string {
+	if cluster.Spec.Network.RPCPublicAddr != "" {
+		return cluster.Spec.Network.RPCPublicAddr
+	}
+	if cluster.Spec.PublicEndpoint == nil ||
+		cluster.Spec.PublicEndpoint.Type != publicEndpointTypeLoadBalancer ||
+		cluster.Spec.PublicEndpoint.LoadBalancer == nil ||
+		!cluster.Spec.PublicEndpoint.LoadBalancer.PerNode {
+		return r.deriveGatewayExternalAddr(ctx, cluster)
+	}
+
+	rpcPort := DefaultRPCPort
+	if cluster.Spec.Network.RPCBindPort != 0 {
+		rpcPort = cluster.Spec.Network.RPCBindPort
+	}
+
+	if node.Hostname != nil && *node.Hostname != "" {
+		return r.loadBalancerServiceAddr(ctx, cluster.Namespace, *node.Hostname+"-rpc", rpcPort)
+	}
+	return r.loadBalancerServiceAddr(ctx, cluster.Namespace, cluster.Name+"-0-rpc", rpcPort)
+}
+
+func (r *GarageClusterReconciler) loadBalancerServiceAddr(ctx context.Context, namespace, name string, rpcPort int32) string {
+	svc := &corev1.Service{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, svc); err != nil {
+		return ""
+	}
+	for _, ing := range svc.Status.LoadBalancer.Ingress {
+		addr := ing.IP
+		if addr == "" {
+			addr = ing.Hostname
+		}
+		if addr != "" {
+			return fmt.Sprintf("%s:%d", addr, rpcPort)
+		}
+	}
 	return ""
 }
 
@@ -3456,13 +3603,12 @@ func (r *GarageClusterReconciler) connectGatewayToExternalCluster(ctx context.Co
 		return
 	}
 
-	// Derive the operator-known external address for this gateway cluster.
-	// Used to override internal (pod/service) IPs that Garage may report when
-	// rpc_public_addr is not set — such addresses are unreachable from external clusters.
-	overrideAddr := r.deriveGatewayExternalAddr(ctx, cluster)
-
 	connectedToGateway := 0
 	for _, node := range gatewayStatus.Nodes {
+		// Derive the operator-known external address for this gateway node. Used to
+		// override internal (pod/service) IPs or an empty self-address from Garage.
+		overrideAddr := r.deriveGatewayExternalAddrForNode(ctx, cluster, node)
+
 		addr := ""
 		if node.Address != nil {
 			addr = *node.Address
