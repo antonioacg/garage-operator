@@ -18,9 +18,3 @@ resources: {}
 cosi:
   enabled: true
   driverName: garage.rajsingh.info
-  socketPath: /var/lib/cosi/cosi.sock
-  sidecar:
-    # Use public sidecar image from k8s-staging
-    image: gcr.io/k8s-staging-sig-storage/objectstorage-sidecar:latest
-    pullPolicy: IfNotPresent
-    resources: {}

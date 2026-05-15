@@ -22,27 +22,17 @@ import (
 	"encoding/hex"
 	"fmt"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	"github.com/rajsinghtech/garage-operator/internal/controller"
 	"github.com/rajsinghtech/garage-operator/internal/garage"
-	cosiproto "sigs.k8s.io/container-object-storage-interface/proto"
 )
 
 var log = ctrl.Log.WithName("cosi-provisioner")
-
-func warnUnknownParams(ctx context.Context, unknown []string) {
-	if len(unknown) > 0 {
-		logf.FromContext(ctx).Info("unrecognized BucketClass/BucketAccessClass parameters will be ignored", "params", unknown)
-	}
-}
 
 // GarageClient defines the interface for Garage API operations used by COSI
 type GarageClient interface {
@@ -60,28 +50,70 @@ type GarageClient interface {
 // GarageClientFactory creates a GarageClient for a given cluster
 type GarageClientFactory func(ctx context.Context, c client.Client, cluster *garagev1beta1.GarageCluster) (GarageClient, error)
 
-// defaultGarageClientFactory uses the controller helper to create real Garage clients.
-// clusterDomain is stored on the ProvisionerServer and threaded through via a closure
-// in NewProvisionerServer; the factory signature matches GarageClientFactory.
+// makeDefaultGarageClientFactory returns a GarageClientFactory backed by the real controller helper.
 func makeDefaultGarageClientFactory(clusterDomain string) GarageClientFactory {
 	return func(ctx context.Context, c client.Client, cluster *garagev1beta1.GarageCluster) (GarageClient, error) {
 		return controller.GetGarageClient(ctx, c, cluster, clusterDomain)
 	}
 }
 
-// ProvisionerServer implements the COSI Provisioner service
-type ProvisionerServer struct {
-	cosiproto.UnimplementedProvisionerServer
+// BucketResult is returned from EnsureBucket.
+type BucketResult struct {
+	BucketID    string
+	GlobalAlias string
+	Endpoint    string
+	Region      string
+}
+
+// AccessResult is returned from GrantAccess.
+type AccessResult struct {
+	AccountID       string
+	AccessKeyID     string
+	SecretAccessKey string
+	PerBucket       []BucketResult // one entry per slot
+}
+
+// BucketAccessSlot pairs a Garage bucket ID with the access mode requested for
+// that specific bucket. v1alpha2 allows mixed read/write modes per claim
+// within a single BucketAccess.
+type BucketAccessSlot struct {
+	BucketID   string
+	AccessMode AccessMode
+}
+
+// AccessMode is the Read/Write capability requested for a BucketAccess.
+type AccessMode int
+
+const (
+	AccessModeReadWrite AccessMode = iota
+	AccessModeReadOnly
+	AccessModeWriteOnly
+)
+
+func mapAccessModeForGarage(m AccessMode) garage.BucketKeyPerms {
+	switch m {
+	case AccessModeReadOnly:
+		return garage.BucketKeyPerms{Read: true}
+	case AccessModeWriteOnly:
+		return garage.BucketKeyPerms{Write: true}
+	default:
+		return garage.BucketKeyPerms{Read: true, Write: true}
+	}
+}
+
+// Provisioner performs Garage-side bucket/key operations on behalf of COSI
+// reconcilers. Pure Go API — no gRPC types in method signatures.
+type Provisioner struct {
 	client              client.Client
-	namespace           string // Namespace for shadow resources
+	namespace           string
 	clusterDomain       string
 	shadowManager       *ShadowManager
 	garageClientFactory GarageClientFactory
 }
 
-// NewProvisionerServer creates a new ProvisionerServer
-func NewProvisionerServer(c client.Client, namespace, clusterDomain string) *ProvisionerServer {
-	return &ProvisionerServer{
+// NewProvisioner creates a new Provisioner.
+func NewProvisioner(c client.Client, namespace, clusterDomain string) *Provisioner {
+	return &Provisioner{
 		client:              c,
 		namespace:           namespace,
 		clusterDomain:       clusterDomain,
@@ -90,9 +122,9 @@ func NewProvisionerServer(c client.Client, namespace, clusterDomain string) *Pro
 	}
 }
 
-// NewProvisionerServerWithFactory creates a ProvisionerServer with a custom GarageClient factory (for testing)
-func NewProvisionerServerWithFactory(c client.Client, namespace string, factory GarageClientFactory) *ProvisionerServer {
-	return &ProvisionerServer{
+// NewProvisionerWithFactory creates a Provisioner with a custom GarageClient factory (for testing).
+func NewProvisionerWithFactory(c client.Client, namespace string, factory GarageClientFactory) *Provisioner {
+	return &Provisioner{
 		client:              c,
 		namespace:           namespace,
 		clusterDomain:       "cluster.local",
@@ -101,315 +133,140 @@ func NewProvisionerServerWithFactory(c client.Client, namespace string, factory 
 	}
 }
 
-// DriverCreateBucket creates a new bucket
-func (s *ProvisionerServer) DriverCreateBucket(ctx context.Context, req *cosiproto.DriverCreateBucketRequest) (*cosiproto.DriverCreateBucketResponse, error) {
-	log.Info("DriverCreateBucket called", "name", req.Name)
-
-	if req.Name == "" {
-		return nil, status.Errorf(codes.InvalidArgument, "bucket name is required")
+// EnsureBucket creates or idempotently returns an existing Garage bucket.
+func (p *Provisioner) EnsureBucket(ctx context.Context, name string, params *BucketClassParameters) (*BucketResult, error) {
+	if name == "" {
+		return nil, fmt.Errorf("bucket name is required")
 	}
 
-	// Parse parameters
-	params, err := ParseBucketClassParameters(req.Parameters, s.namespace)
+	cluster, err := p.getCluster(ctx, params.ClusterRef, params.ClusterNamespace)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid parameters: %v", err)
-	}
-	warnUnknownParams(ctx, params.UnknownParams)
-
-	// Get the GarageCluster
-	cluster := &garagev1beta1.GarageCluster{}
-	if err := s.client.Get(ctx, types.NamespacedName{
-		Name:      params.ClusterRef,
-		Namespace: params.ClusterNamespace,
-	}, cluster); err != nil {
-		if client.IgnoreNotFound(err) == nil {
-			return nil, ErrClusterNotFound(params.ClusterRef, params.ClusterNamespace)
-		}
-		return nil, status.Errorf(codes.Unavailable, "failed to get cluster: %v", err)
+		return nil, err
 	}
 
-	// Check cluster is ready
-	if cluster.Status.Phase != garagev1beta1.PhaseRunning {
-		return nil, ErrClusterNotReady(params.ClusterRef, params.ClusterNamespace)
-	}
-
-	// Get Garage client
-	garageClient, err := s.garageClientFactory(ctx, s.client, cluster)
+	gc, err := p.garageClientFactory(ctx, p.client, cluster)
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "failed to create garage client: %v", err)
+		return nil, fmt.Errorf("garage client: %w", err)
 	}
 
-	// Use the COSI-provided name directly for bucket creation
-	// COSI names are DNS-safe and unique
-	bucketAlias := sanitizeBucketName(req.Name)
-	createReq := garage.CreateBucketRequest{
-		GlobalAlias: bucketAlias,
-	}
-
-	garageBucket, err := garageClient.CreateBucket(ctx, createReq)
+	bucketAlias := sanitizeBucketName(name)
+	gb, err := gc.CreateBucket(ctx, garage.CreateBucketRequest{GlobalAlias: bucketAlias})
 	if err != nil {
 		if garage.IsConflict(err) {
-			// Bucket exists - check if it matches requested config (idempotent)
-			existing, getErr := garageClient.GetBucket(ctx, garage.GetBucketRequest{GlobalAlias: bucketAlias})
+			existing, getErr := gc.GetBucket(ctx, garage.GetBucketRequest{GlobalAlias: bucketAlias})
 			if getErr == nil {
 				if !bucketQuotasMatch(existing.Quotas, params) {
-					return nil, status.Errorf(codes.AlreadyExists, "bucket %q already exists with different configuration", bucketAlias)
+					return nil, fmt.Errorf("bucket %q exists with different configuration", bucketAlias)
 				}
-				log.Info("Bucket already exists with matching config, returning existing", "bucketId", existing.ID)
-				return s.buildCreateBucketResponse(ctx, existing.ID, cluster)
+				log.Info("bucket already exists with matching config", "bucketId", existing.ID)
+				return p.buildBucketResult(ctx, existing.ID, cluster)
 			}
 		}
-		return nil, MapGarageErrorToCOSI(err)
+		return nil, err
 	}
 
-	// Apply quotas if specified - return error on failure
 	if params.MaxSize != nil || params.MaxObjects != nil {
-		updateReq := garage.UpdateBucketRequest{
-			ID: garageBucket.ID,
-		}
-		updateReq.Body.Quotas = &garage.BucketQuotas{}
+		upd := garage.UpdateBucketRequest{ID: gb.ID}
+		upd.Body.Quotas = &garage.BucketQuotas{}
 		if params.MaxSize != nil {
 			size := uint64(params.MaxSize.Value())
-			updateReq.Body.Quotas.MaxSize = &size
+			upd.Body.Quotas.MaxSize = &size
 		}
 		if params.MaxObjects != nil {
-			maxObj := uint64(*params.MaxObjects)
-			updateReq.Body.Quotas.MaxObjects = &maxObj
+			m := uint64(*params.MaxObjects)
+			upd.Body.Quotas.MaxObjects = &m
 		}
-		if _, err := garageClient.UpdateBucket(ctx, updateReq); err != nil {
-			log.Error(err, "Failed to apply quotas to bucket, deleting bucket", "bucketId", garageBucket.ID)
-			// Clean up the bucket since we couldn't apply required quotas
-			_ = garageClient.DeleteBucket(ctx, garageBucket.ID)
-			return nil, status.Errorf(codes.Internal, "failed to apply quotas to bucket: %v", err)
+		if _, err := gc.UpdateBucket(ctx, upd); err != nil {
+			log.Error(err, "failed to apply quotas, rolling back bucket", "bucketId", gb.ID)
+			_ = gc.DeleteBucket(ctx, gb.ID)
+			return nil, fmt.Errorf("apply quotas: %w", err)
 		}
 	}
 
-	// Create shadow GarageBucket resource with bucketId annotation for later lookup
-	_, err = s.shadowManager.CreateShadowBucketWithID(ctx, req.Name, garageBucket.ID, params.ClusterRef, params.ClusterNamespace, params)
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		log.Error(err, "Failed to create shadow GarageBucket, rolling back Garage bucket", "name", req.Name, "bucketId", garageBucket.ID)
-		// Rollback: delete the Garage bucket since we can't track it without the shadow resource
-		if deleteErr := garageClient.DeleteBucket(ctx, garageBucket.ID); deleteErr != nil {
-			log.Error(deleteErr, "Failed to rollback Garage bucket after shadow resource failure", "bucketId", garageBucket.ID)
+	if _, err := p.shadowManager.CreateShadowBucketWithID(ctx, name, gb.ID, params.ClusterRef, params.ClusterNamespace, params); err != nil && !apierrors.IsAlreadyExists(err) {
+		log.Error(err, "failed to create shadow bucket, rolling back", "name", name, "bucketId", gb.ID)
+		if deleteErr := gc.DeleteBucket(ctx, gb.ID); deleteErr != nil {
+			log.Error(deleteErr, "failed to rollback Garage bucket", "bucketId", gb.ID)
 		}
-		return nil, status.Errorf(codes.Internal, "failed to create shadow resource: %v", err)
+		return nil, fmt.Errorf("create shadow: %w", err)
 	}
 
-	log.Info("Bucket created successfully", "bucketId", garageBucket.ID, "name", bucketAlias)
-	return s.buildCreateBucketResponse(ctx, garageBucket.ID, cluster)
+	log.Info("bucket created", "bucketId", gb.ID, "alias", bucketAlias)
+	return p.buildBucketResult(ctx, gb.ID, cluster)
 }
 
-// DriverDeleteBucket deletes a bucket
-func (s *ProvisionerServer) DriverDeleteBucket(ctx context.Context, req *cosiproto.DriverDeleteBucketRequest) (*cosiproto.DriverDeleteBucketResponse, error) {
-	log.Info("DriverDeleteBucket called", "bucketId", req.BucketId)
-
-	if req.BucketId == "" {
-		return nil, status.Errorf(codes.InvalidArgument, "bucket_id is required")
+// DeleteBucket removes a Garage bucket and its shadow resource.
+func (p *Provisioner) DeleteBucket(ctx context.Context, bucketID string, params *BucketClassParameters) error {
+	if bucketID == "" {
+		return fmt.Errorf("bucketID is required")
 	}
 
-	// Parse parameters (renamed from DeleteContext in v1alpha2)
-	params, err := ParseBucketClassParameters(req.Parameters, s.namespace)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid parameters: %v", err)
-	}
-	warnUnknownParams(ctx, params.UnknownParams)
-
-	// Get the GarageCluster
 	cluster := &garagev1beta1.GarageCluster{}
-	if err := s.client.Get(ctx, types.NamespacedName{
-		Name:      params.ClusterRef,
-		Namespace: params.ClusterNamespace,
-	}, cluster); err != nil {
-		if client.IgnoreNotFound(err) == nil {
-			// Cluster doesn't exist, still try to cleanup shadow resources
-			log.Info("Cluster not found, cleaning up shadow resources only", "cluster", params.ClusterRef)
-			if cleanupErr := s.shadowManager.DeleteShadowBucketByID(ctx, req.BucketId); cleanupErr != nil {
-				log.Error(cleanupErr, "Failed to delete shadow bucket by ID", "bucketId", req.BucketId)
-			}
-			return &cosiproto.DriverDeleteBucketResponse{}, nil
-		}
-		return nil, status.Errorf(codes.Unavailable, "failed to get cluster: %v", err)
+	err := p.client.Get(ctx, types.NamespacedName{Name: params.ClusterRef, Namespace: params.ClusterNamespace}, cluster)
+	if err != nil && client.IgnoreNotFound(err) == nil {
+		log.Info("cluster not found, cleaning up shadow only", "cluster", params.ClusterRef)
+		_ = p.shadowManager.DeleteShadowBucketByID(ctx, bucketID)
+		return nil
 	}
-
-	// Get Garage client
-	garageClient, err := s.garageClientFactory(ctx, s.client, cluster)
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "failed to create garage client: %v", err)
+		return fmt.Errorf("get cluster: %w", err)
 	}
 
-	// Delete bucket from Garage
-	if err := garageClient.DeleteBucket(ctx, req.BucketId); err != nil {
+	gc, err := p.garageClientFactory(ctx, p.client, cluster)
+	if err != nil {
+		return fmt.Errorf("garage client: %w", err)
+	}
+
+	if err := gc.DeleteBucket(ctx, bucketID); err != nil {
 		if garage.IsNotFound(err) {
-			log.Info("Bucket already deleted from Garage", "bucketId", req.BucketId)
+			log.Info("bucket already deleted from Garage", "bucketId", bucketID)
 		} else if garage.IsBucketNotEmpty(err) {
-			return nil, status.Errorf(codes.FailedPrecondition, "bucket is not empty, delete all objects first")
+			return fmt.Errorf("bucket not empty: %w", err)
 		} else {
-			return nil, MapGarageErrorToCOSI(err)
+			return err
 		}
 	}
 
-	// Delete shadow GarageBucket resource by bucketId
-	if err := s.shadowManager.DeleteShadowBucketByID(ctx, req.BucketId); err != nil {
-		log.Error(err, "Failed to delete shadow GarageBucket", "bucketId", req.BucketId)
-	}
-
-	log.Info("Bucket deleted successfully", "bucketId", req.BucketId)
-	return &cosiproto.DriverDeleteBucketResponse{}, nil
+	_ = p.shadowManager.DeleteShadowBucketByID(ctx, bucketID)
+	log.Info("bucket deleted", "bucketId", bucketID)
+	return nil
 }
 
-// DriverGetExistingBucket retrieves info for an existing bucket (static provisioning)
-func (s *ProvisionerServer) DriverGetExistingBucket(ctx context.Context, req *cosiproto.DriverGetExistingBucketRequest) (*cosiproto.DriverGetExistingBucketResponse, error) {
-	log.Info("DriverGetExistingBucket called", "existingBucketId", req.ExistingBucketId)
-
-	if req.ExistingBucketId == "" {
-		return nil, status.Errorf(codes.InvalidArgument, "existing_bucket_id is required")
+// GrantAccess creates or idempotently returns a Garage key with access to the given bucket slots.
+// Each slot specifies its own AccessMode so a single BucketAccess can grant
+// mixed RW/RO permissions across buckets, as v1alpha2 requires.
+// The returned AccessResult.PerBucket is in the same order as the input slots —
+// callers may index it positionally against their slot slice.
+func (p *Provisioner) GrantAccess(ctx context.Context, accountName string, slots []BucketAccessSlot, params *BucketAccessClassParameters, serviceAccountName string) (*AccessResult, error) {
+	if accountName == "" {
+		return nil, fmt.Errorf("accountName is required")
+	}
+	if len(slots) == 0 {
+		return nil, fmt.Errorf("at least one bucket is required")
 	}
 
-	// Parse parameters
-	params, err := ParseBucketClassParameters(req.Parameters, s.namespace)
+	cluster, err := p.getCluster(ctx, params.ClusterRef, params.ClusterNamespace)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid parameters: %v", err)
-	}
-	warnUnknownParams(ctx, params.UnknownParams)
-
-	// Get the GarageCluster
-	cluster := &garagev1beta1.GarageCluster{}
-	if err := s.client.Get(ctx, types.NamespacedName{
-		Name:      params.ClusterRef,
-		Namespace: params.ClusterNamespace,
-	}, cluster); err != nil {
-		if client.IgnoreNotFound(err) == nil {
-			return nil, ErrClusterNotFound(params.ClusterRef, params.ClusterNamespace)
-		}
-		return nil, status.Errorf(codes.Unavailable, "failed to get cluster: %v", err)
+		return nil, err
 	}
 
-	// Check cluster is ready
-	if cluster.Status.Phase != garagev1beta1.PhaseRunning {
-		return nil, ErrClusterNotReady(params.ClusterRef, params.ClusterNamespace)
-	}
-
-	// Get Garage client
-	garageClient, err := s.garageClientFactory(ctx, s.client, cluster)
+	gc, err := p.garageClientFactory(ctx, p.client, cluster)
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "failed to create garage client: %v", err)
+		return nil, fmt.Errorf("garage client: %w", err)
 	}
 
-	// Look up the bucket by ID
-	bucket, err := garageClient.GetBucket(ctx, garage.GetBucketRequest{ID: req.ExistingBucketId})
-	if err != nil {
-		if garage.IsNotFound(err) {
-			return nil, status.Errorf(codes.NotFound, "bucket %s not found", req.ExistingBucketId)
-		}
-		return nil, MapGarageErrorToCOSI(err)
-	}
+	keyName := sanitizeKeyName(accountName)
 
-	// Try shadow resource first; fall back to bucket's GlobalAliases for buckets
-	// that predate COSI management (lazy shadow creation on first access).
-	globalAlias, err := s.shadowManager.GetShadowBucketGlobalAliasByID(ctx, req.ExistingBucketId)
-	if err != nil {
-		if len(bucket.GlobalAliases) == 0 {
-			return nil, status.Errorf(codes.NotFound, "bucket %s has no global alias", req.ExistingBucketId)
-		}
-		globalAlias = bucket.GlobalAliases[0]
-		// Lazily create shadow resource so future lookups (e.g. grant access) work
-		_, createErr := s.shadowManager.CreateShadowBucketWithID(ctx, globalAlias, bucket.ID, params.ClusterRef, params.ClusterNamespace, params)
-		if createErr != nil && !apierrors.IsAlreadyExists(createErr) {
-			log.Error(createErr, "Failed to lazily create shadow bucket for existing bucket", "bucketId", bucket.ID)
-		}
-	}
-
-	return &cosiproto.DriverGetExistingBucketResponse{
-		BucketId: bucket.ID,
-		Protocols: &cosiproto.ObjectProtocolAndBucketInfo{
-			S3: &cosiproto.S3BucketInfo{
-				BucketId: globalAlias,
-				Endpoint: s.getS3Endpoint(cluster),
-				Region:   s.getS3Region(cluster),
-				AddressingStyle: &cosiproto.S3AddressingStyle{
-					Style: cosiproto.S3AddressingStyle_PATH,
-				},
-			},
-		},
-	}, nil
-}
-
-// DriverGrantBucketAccess grants access to a bucket
-func (s *ProvisionerServer) DriverGrantBucketAccess(ctx context.Context, req *cosiproto.DriverGrantBucketAccessRequest) (*cosiproto.DriverGrantBucketAccessResponse, error) {
-	// v1alpha2: Name→AccountName, BucketId→Buckets array, AuthenticationType is now a struct
-	log.Info("DriverGrantBucketAccess called", "accountName", req.AccountName, "buckets", len(req.Buckets))
-
-	if req.AccountName == "" {
-		return nil, status.Errorf(codes.InvalidArgument, "account name is required")
-	}
-
-	// Reject SERVICE_ACCOUNT authentication (Garage only supports KEY authentication)
-	if req.AuthenticationType != nil && req.AuthenticationType.Type == cosiproto.AuthenticationType_SERVICE_ACCOUNT {
-		return nil, ErrUnsupportedAuthType
-	}
-
-	// Validate protocol - only S3 (or UNKNOWN, which means driver chooses)
-	if req.Protocol != nil && req.Protocol.Type != cosiproto.ObjectProtocol_UNKNOWN && req.Protocol.Type != cosiproto.ObjectProtocol_S3 {
-		return nil, ErrUnsupportedProtocol
-	}
-
-	// Validate we have at least one bucket
-	if len(req.Buckets) == 0 {
-		return nil, status.Errorf(codes.InvalidArgument, "at least one bucket is required")
-	}
-
-	// Validate all bucket IDs are present
-	for i, b := range req.Buckets {
-		if b.BucketId == "" {
-			return nil, status.Errorf(codes.InvalidArgument, "bucketId is required for bucket at index %d", i)
-		}
-	}
-
-	// Parse parameters
-	params, err := ParseBucketAccessClassParameters(req.Parameters, s.namespace)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid parameters: %v", err)
-	}
-	warnUnknownParams(ctx, params.UnknownParams)
-
-	// Get the GarageCluster
-	cluster := &garagev1beta1.GarageCluster{}
-	if err := s.client.Get(ctx, types.NamespacedName{
-		Name:      params.ClusterRef,
-		Namespace: params.ClusterNamespace,
-	}, cluster); err != nil {
-		if client.IgnoreNotFound(err) == nil {
-			return nil, ErrClusterNotFound(params.ClusterRef, params.ClusterNamespace)
-		}
-		return nil, status.Errorf(codes.Unavailable, "failed to get cluster: %v", err)
-	}
-
-	// Check cluster is ready
-	if cluster.Status.Phase != garagev1beta1.PhaseRunning {
-		return nil, ErrClusterNotReady(params.ClusterRef, params.ClusterNamespace)
-	}
-
-	// Get Garage client
-	garageClient, err := s.garageClientFactory(ctx, s.client, cluster)
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "failed to create garage client: %v", err)
-	}
-
-	// Use COSI-provided name for key name
-	keyName := sanitizeKeyName(req.AccountName)
-
-	// Check for idempotency - see if key already exists
-	existingKey, err := garageClient.GetKey(ctx, garage.GetKeyRequest{Search: keyName, ShowSecretKey: true})
-	if err == nil && existingKey != nil {
-		log.Info("Key already exists, verifying bucket permissions", "keyId", existingKey.AccessKeyID)
-
-		// Ensure all requested buckets have correct permissions
-		for _, b := range req.Buckets {
-			perms := mapAccessMode(b.AccessMode)
+	// Idempotency: reuse existing key, re-applying permissions as needed.
+	existing, err := gc.GetKey(ctx, garage.GetKeyRequest{Search: keyName, ShowSecretKey: true})
+	var key *garage.Key
+	if err == nil && existing != nil {
+		log.Info("key already exists, verifying bucket permissions", "keyId", existing.AccessKeyID)
+		for _, slot := range slots {
+			perms := mapAccessModeForGarage(slot.AccessMode)
 			needsUpdate := true
-			for _, kb := range existingKey.Buckets {
-				if kb.ID == b.BucketId {
-					// Check if permissions match
+			for _, kb := range existing.Buckets {
+				if kb.ID == slot.BucketID {
 					if kb.Permissions.Read == perms.Read && kb.Permissions.Write == perms.Write {
 						needsUpdate = false
 					}
@@ -417,218 +274,190 @@ func (s *ProvisionerServer) DriverGrantBucketAccess(ctx context.Context, req *co
 				}
 			}
 			if needsUpdate {
-				log.Info("Setting bucket permissions for existing key", "keyId", existingKey.AccessKeyID, "bucketId", b.BucketId, "read", perms.Read, "write", perms.Write)
-				allowReq := garage.AllowBucketKeyRequest{
-					BucketID:    b.BucketId,
-					AccessKeyID: existingKey.AccessKeyID,
+				if _, err := gc.AllowBucketKey(ctx, garage.AllowBucketKeyRequest{
+					BucketID:    slot.BucketID,
+					AccessKeyID: existing.AccessKeyID,
 					Permissions: perms,
-				}
-				if _, err := garageClient.AllowBucketKey(ctx, allowReq); err != nil {
-					log.Error(err, "Failed to set bucket permissions for existing key", "bucketId", b.BucketId, "keyId", existingKey.AccessKeyID)
-					return nil, MapGarageErrorToCOSI(err)
+				}); err != nil {
+					return nil, err
 				}
 			}
 		}
-
-		// Verify secret key is available
-		if existingKey.SecretAccessKey == "" {
-			return nil, status.Errorf(codes.Internal, "existing key secret is not available")
+		if existing.SecretAccessKey == "" {
+			return nil, fmt.Errorf("existing key %s has no secret available", existing.AccessKeyID)
 		}
-
-		return s.buildGrantAccessResponse(ctx, existingKey, req.Buckets, cluster)
+		results, err := p.buildPerBucketResults(ctx, slots, cluster)
+		if err != nil {
+			return nil, err
+		}
+		return &AccessResult{
+			AccountID:       existing.AccessKeyID,
+			AccessKeyID:     existing.AccessKeyID,
+			SecretAccessKey: existing.SecretAccessKey,
+			PerBucket:       results,
+		}, nil
 	}
 
-	// Create key in Garage
-	key, err := garageClient.CreateKey(ctx, keyName)
+	createdKey := false
+	key, err = gc.CreateKey(ctx, keyName)
 	if err != nil {
-		return nil, MapGarageErrorToCOSI(err)
+		return nil, err
 	}
+	createdKey = true
 
-	// Grant access to all requested buckets with correct permissions
-	bucketPerms := make([]BucketPermission, 0, len(req.Buckets))
-	for _, b := range req.Buckets {
-		perms := mapAccessMode(b.AccessMode)
-		allowReq := garage.AllowBucketKeyRequest{
-			BucketID:    b.BucketId,
+	bucketPerms := make([]BucketPermission, 0, len(slots))
+	for _, slot := range slots {
+		perms := mapAccessModeForGarage(slot.AccessMode)
+		if _, err := gc.AllowBucketKey(ctx, garage.AllowBucketKeyRequest{
+			BucketID:    slot.BucketID,
 			AccessKeyID: key.AccessKeyID,
 			Permissions: perms,
-		}
-		if _, err := garageClient.AllowBucketKey(ctx, allowReq); err != nil {
-			log.Error(err, "Failed to grant access to bucket", "bucketId", b.BucketId, "keyId", key.AccessKeyID)
-			_ = garageClient.DeleteKey(ctx, key.AccessKeyID)
-			return nil, MapGarageErrorToCOSI(err)
+		}); err != nil {
+			log.Error(err, "failed to grant access, rolling back key", "bucketId", slot.BucketID, "keyId", key.AccessKeyID)
+			_ = gc.DeleteKey(ctx, key.AccessKeyID)
+			return nil, err
 		}
 		bucketPerms = append(bucketPerms, BucketPermission{
-			BucketID: b.BucketId, // Garage bucket ID (hex), required by GarageKey controller
+			BucketID: slot.BucketID,
 			Read:     perms.Read,
 			Write:    perms.Write,
-			Owner:    false,
 		})
 	}
 
-	// Create shadow GarageKey resource
-	_, err = s.shadowManager.CreateShadowKeyWithID(ctx, req.AccountName, key.AccessKeyID, params.ClusterRef, params.ClusterNamespace, bucketPerms, req.ServiceAccountName)
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		log.Error(err, "Failed to create shadow GarageKey", "name", req.AccountName)
-	}
-
-	log.Info("Bucket access granted successfully", "accountId", key.AccessKeyID, "buckets", len(req.Buckets))
-	return s.buildGrantAccessResponse(ctx, key, req.Buckets, cluster)
-}
-
-// buildGrantAccessResponse builds response for granted access with info for all requested buckets
-func (s *ProvisionerServer) buildGrantAccessResponse(ctx context.Context, key *garage.Key, buckets []*cosiproto.DriverGrantBucketAccessRequest_AccessedBucket, cluster *garagev1beta1.GarageCluster) (*cosiproto.DriverGrantBucketAccessResponse, error) {
-	if key.SecretAccessKey == "" {
-		return nil, status.Errorf(codes.Internal, "key secret is not available (was showSecretKey=true used?)")
-	}
-
-	endpoint := s.getS3Endpoint(cluster)
-	region := s.getS3Region(cluster)
-
-	bucketInfos := make([]*cosiproto.DriverGrantBucketAccessResponse_BucketInfo, 0, len(buckets))
-	for _, b := range buckets {
-		globalAlias, err := s.shadowManager.GetShadowBucketGlobalAliasByID(ctx, b.BucketId)
-		if err != nil {
-			return nil, status.Errorf(codes.NotFound, "global alias for bucket %s not found", b.BucketId)
+	if _, err := p.shadowManager.CreateShadowKeyWithID(ctx, accountName, key.AccessKeyID, params.ClusterRef, params.ClusterNamespace, bucketPerms, serviceAccountName); err != nil && !apierrors.IsAlreadyExists(err) {
+		if createdKey {
+			for _, slot := range slots {
+				_, _ = gc.DenyBucketKey(ctx, garage.DenyBucketKeyRequest{
+					BucketID:    slot.BucketID,
+					AccessKeyID: key.AccessKeyID,
+				})
+			}
+			_ = gc.DeleteKey(ctx, key.AccessKeyID)
 		}
-
-		bucketInfos = append(bucketInfos, &cosiproto.DriverGrantBucketAccessResponse_BucketInfo{
-			BucketId: b.BucketId,
-			BucketInfo: &cosiproto.ObjectProtocolAndBucketInfo{
-				S3: &cosiproto.S3BucketInfo{
-					BucketId: globalAlias,
-					Endpoint: endpoint,
-					Region:   region,
-					AddressingStyle: &cosiproto.S3AddressingStyle{
-						Style: cosiproto.S3AddressingStyle_PATH,
-					},
-				},
-			},
-		})
+		return nil, fmt.Errorf("create shadow key: %w", err)
 	}
 
-	return &cosiproto.DriverGrantBucketAccessResponse{
-		AccountId: key.AccessKeyID,
-		Buckets:   bucketInfos,
-		Credentials: &cosiproto.CredentialInfo{
-			S3: &cosiproto.S3CredentialInfo{
-				AccessKeyId:     key.AccessKeyID,
-				AccessSecretKey: key.SecretAccessKey,
-			},
-		},
+	if key.SecretAccessKey == "" {
+		return nil, fmt.Errorf("garage key %s has no secret available", key.AccessKeyID)
+	}
+
+	results, err := p.buildPerBucketResults(ctx, slots, cluster)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Info("access granted", "accountId", key.AccessKeyID, "buckets", len(slots))
+	return &AccessResult{
+		AccountID:       key.AccessKeyID,
+		AccessKeyID:     key.AccessKeyID,
+		SecretAccessKey: key.SecretAccessKey,
+		PerBucket:       results,
 	}, nil
 }
 
-// DriverRevokeBucketAccess revokes access to a bucket
-func (s *ProvisionerServer) DriverRevokeBucketAccess(ctx context.Context, req *cosiproto.DriverRevokeBucketAccessRequest) (*cosiproto.DriverRevokeBucketAccessResponse, error) {
-	log.Info("DriverRevokeBucketAccess called", "accountId", req.AccountId, "buckets", len(req.Buckets))
-
-	if req.AccountId == "" {
-		return nil, status.Errorf(codes.InvalidArgument, "account_id is required")
+// RevokeAccess removes bucket permissions and deletes the Garage key.
+func (p *Provisioner) RevokeAccess(ctx context.Context, accountID string, bucketIDs []string, params *BucketAccessClassParameters) error {
+	if accountID == "" {
+		return fmt.Errorf("accountID is required")
 	}
 
-	// The COSI sidecar does not always send Parameters in revoke requests.
-	// Try Parameters first; fall back to the cluster ref stored on the shadow key.
-	clusterRef, clusterNS := "", s.namespace
-	if params, err := ParseBucketAccessClassParameters(req.Parameters, s.namespace); err == nil {
-		warnUnknownParams(ctx, params.UnknownParams)
-		clusterRef = params.ClusterRef
-		clusterNS = params.ClusterNamespace
+	clusterRef, clusterNS := "", p.namespace
+	if params != nil {
+		clusterRef, clusterNS = params.ClusterRef, params.ClusterNamespace
 	}
 	if clusterRef == "" {
 		var lookupErr error
-		clusterRef, clusterNS, lookupErr = s.shadowManager.GetShadowKeyClusterRef(ctx, req.AccountId)
+		clusterRef, clusterNS, lookupErr = p.shadowManager.GetShadowKeyClusterRef(ctx, accountID)
 		if lookupErr != nil {
-			log.Info("Cluster ref not in parameters and shadow key not found; cleaning up shadow only", "accountId", req.AccountId)
-			if cleanupErr := s.shadowManager.DeleteShadowKeyByID(ctx, req.AccountId); cleanupErr != nil {
-				log.Error(cleanupErr, "Failed to delete shadow key", "accountId", req.AccountId)
-			}
-			return &cosiproto.DriverRevokeBucketAccessResponse{}, nil
+			log.Info("cluster ref not found in params or shadow; cleaning up shadow only", "accountId", accountID)
+			_ = p.shadowManager.DeleteShadowKeyByID(ctx, accountID)
+			return nil
 		}
 	}
 
-	// Get the GarageCluster
 	cluster := &garagev1beta1.GarageCluster{}
-	if err := s.client.Get(ctx, types.NamespacedName{Name: clusterRef, Namespace: clusterNS}, cluster); err != nil {
+	if err := p.client.Get(ctx, types.NamespacedName{Name: clusterRef, Namespace: clusterNS}, cluster); err != nil {
 		if client.IgnoreNotFound(err) == nil {
-			log.Info("Cluster not found, cleaning up shadow resources only", "cluster", clusterRef)
-			if cleanupErr := s.shadowManager.DeleteShadowKeyByID(ctx, req.AccountId); cleanupErr != nil {
-				log.Error(cleanupErr, "Failed to delete shadow key by ID", "accountId", req.AccountId)
-			}
-			return &cosiproto.DriverRevokeBucketAccessResponse{}, nil
+			log.Info("cluster not found, cleaning up shadow only", "cluster", clusterRef)
+			_ = p.shadowManager.DeleteShadowKeyByID(ctx, accountID)
+			return nil
 		}
-		return nil, status.Errorf(codes.Unavailable, "failed to get cluster: %v", err)
+		return fmt.Errorf("get cluster: %w", err)
 	}
 
-	// Get Garage client
-	garageClient, err := s.garageClientFactory(ctx, s.client, cluster)
+	gc, err := p.garageClientFactory(ctx, p.client, cluster)
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "failed to create garage client: %v", err)
+		return fmt.Errorf("garage client: %w", err)
 	}
 
-	// Revoke access from all requested buckets
-	for _, b := range req.Buckets {
-		denyReq := garage.DenyBucketKeyRequest{
-			BucketID:    b.BucketId,
-			AccessKeyID: req.AccountId,
-		}
-		if _, err := garageClient.DenyBucketKey(ctx, denyReq); err != nil {
+	for _, bid := range bucketIDs {
+		if _, err := gc.DenyBucketKey(ctx, garage.DenyBucketKeyRequest{BucketID: bid, AccessKeyID: accountID}); err != nil {
 			if !garage.IsNotFound(err) {
-				return nil, MapGarageErrorToCOSI(err)
+				return err
 			}
 		}
 	}
 
-	// Delete the key from Garage
-	if err := garageClient.DeleteKey(ctx, req.AccountId); err != nil {
-		if !garage.IsNotFound(err) {
-			return nil, MapGarageErrorToCOSI(err)
-		}
+	if err := gc.DeleteKey(ctx, accountID); err != nil && !garage.IsNotFound(err) {
+		return err
 	}
 
-	// Delete shadow GarageKey resource by accountId
-	if err := s.shadowManager.DeleteShadowKeyByID(ctx, req.AccountId); err != nil {
-		log.Error(err, "Failed to delete shadow GarageKey", "accountId", req.AccountId)
-	}
-
-	log.Info("Bucket access revoked successfully", "accountId", req.AccountId, "buckets", len(req.Buckets))
-	return &cosiproto.DriverRevokeBucketAccessResponse{}, nil
+	_ = p.shadowManager.DeleteShadowKeyByID(ctx, accountID)
+	log.Info("access revoked", "accountId", accountID)
+	return nil
 }
 
-func (s *ProvisionerServer) buildCreateBucketResponse(ctx context.Context, bucketID string, cluster *garagev1beta1.GarageCluster) (*cosiproto.DriverCreateBucketResponse, error) {
-	globalAlias, err := s.shadowManager.GetShadowBucketGlobalAliasByID(ctx, bucketID)
-	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "global alias for bucket %s not found", bucketID)
+func (p *Provisioner) getCluster(ctx context.Context, name, namespace string) (*garagev1beta1.GarageCluster, error) {
+	cluster := &garagev1beta1.GarageCluster{}
+	if err := p.client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, cluster); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			return nil, fmt.Errorf("cluster %s/%s not found", namespace, name)
+		}
+		return nil, fmt.Errorf("get cluster: %w", err)
 	}
+	if cluster.Status.Phase != garagev1beta1.PhaseRunning {
+		return nil, fmt.Errorf("cluster %s/%s not ready (phase=%s)", namespace, name, cluster.Status.Phase)
+	}
+	return cluster, nil
+}
 
-	return &cosiproto.DriverCreateBucketResponse{
-		BucketId: bucketID,
-		Protocols: &cosiproto.ObjectProtocolAndBucketInfo{
-			S3: &cosiproto.S3BucketInfo{
-				BucketId: globalAlias,
-				Endpoint: s.getS3Endpoint(cluster),
-				Region:   s.getS3Region(cluster),
-				AddressingStyle: &cosiproto.S3AddressingStyle{
-					Style: cosiproto.S3AddressingStyle_PATH,
-				},
-			},
-		},
+func (p *Provisioner) buildBucketResult(ctx context.Context, bucketID string, cluster *garagev1beta1.GarageCluster) (*BucketResult, error) {
+	alias, err := p.shadowManager.GetShadowBucketGlobalAliasByID(ctx, bucketID)
+	if err != nil {
+		return nil, fmt.Errorf("global alias for %s not found: %w", bucketID, err)
+	}
+	return &BucketResult{
+		BucketID:    bucketID,
+		GlobalAlias: alias,
+		Endpoint:    p.getS3Endpoint(cluster),
+		Region:      p.getS3Region(cluster),
 	}, nil
 }
 
-func (s *ProvisionerServer) getS3Endpoint(cluster *garagev1beta1.GarageCluster) string {
+func (p *Provisioner) buildPerBucketResults(ctx context.Context, slots []BucketAccessSlot, cluster *garagev1beta1.GarageCluster) ([]BucketResult, error) {
+	results := make([]BucketResult, 0, len(slots))
+	for _, slot := range slots {
+		br, err := p.buildBucketResult(ctx, slot.BucketID, cluster)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, *br)
+	}
+	return results, nil
+}
+
+func (p *Provisioner) getS3Endpoint(cluster *garagev1beta1.GarageCluster) string {
 	if cluster.Status.Endpoints != nil && cluster.Status.Endpoints.S3 != "" {
 		return cluster.Status.Endpoints.S3
 	}
-	// Fallback to constructing from service
 	port := int32(3900)
 	if cluster.Spec.S3API != nil && cluster.Spec.S3API.BindPort > 0 {
 		port = cluster.Spec.S3API.BindPort
 	}
-	return fmt.Sprintf("%s.%s.svc.%s:%d", cluster.Name, cluster.Namespace, s.clusterDomain, port)
+	return fmt.Sprintf("%s.%s.svc.%s:%d", cluster.Name, cluster.Namespace, p.clusterDomain, port)
 }
 
-func (s *ProvisionerServer) getS3Region(cluster *garagev1beta1.GarageCluster) string {
+func (p *Provisioner) getS3Region(cluster *garagev1beta1.GarageCluster) string {
 	if cluster.Spec.S3API != nil && cluster.Spec.S3API.Region != "" {
 		return cluster.Spec.S3API.Region
 	}
@@ -657,21 +486,6 @@ func sanitizeKeyName(name string) string {
 	return name[:115] + "-" + suffix
 }
 
-// mapAccessMode converts a COSI AccessMode to Garage BucketKeyPerms
-func mapAccessMode(mode *cosiproto.AccessMode) garage.BucketKeyPerms {
-	if mode == nil {
-		return garage.BucketKeyPerms{Read: true, Write: true}
-	}
-	switch mode.Mode {
-	case cosiproto.AccessMode_READ_ONLY:
-		return garage.BucketKeyPerms{Read: true}
-	case cosiproto.AccessMode_WRITE_ONLY:
-		return garage.BucketKeyPerms{Write: true}
-	default: // READ_WRITE, UNKNOWN
-		return garage.BucketKeyPerms{Read: true, Write: true}
-	}
-}
-
 // bucketQuotasMatch checks if existing bucket quotas match the requested params
 func bucketQuotasMatch(existing *garage.BucketQuotas, params *BucketClassParameters) bool {
 	wantMaxSize := uint64(0)
@@ -689,7 +503,6 @@ func bucketQuotasMatch(existing *garage.BucketQuotas, params *BucketClassParamet
 	}
 
 	if existing == nil {
-		// No quotas on existing bucket - matches only if none requested
 		return !hasWantSize && !hasWantObjects
 	}
 

@@ -174,19 +174,20 @@ collect_debug_info() {
 # Test Functions
 # ============================================================================
 
-test_cosi_sidecar_running() {
-    log_test "Testing COSI sidecar is running..."
+test_cosi_reconcilers_loaded() {
+    log_test "Testing operator runs COSI reconcilers natively (no sidecar)..."
 
-    # The operator pod should have 2 containers: manager + cosi-sidecar
+    # Post-refactor: the operator handles Bucket/BucketAccess directly in a
+    # single container. The cosi-sidecar container must NOT be present.
     local container_count
     container_count=$(kubectl get pod -l app.kubernetes.io/name=garage-operator -n "$NAMESPACE" \
         -o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null | wc -w | tr -d ' ')
 
-    if [ "$container_count" -ge "2" ]; then
-        test_pass "COSI sidecar running (operator pod has $container_count containers)"
+    if [ "$container_count" -eq "1" ]; then
+        test_pass "Operator runs single container (COSI sidecar removed)"
         return 0
     fi
-    test_fail "COSI sidecar not found (operator pod has $container_count containers)"
+    test_fail "Unexpected container count $container_count (expected 1; sidecar should be gone)"
     return 1
 }
 
@@ -282,14 +283,10 @@ test_shadow_key_created() {
 
 test_bucket_access_cleanup() {
     log_test "Testing BucketAccess cleanup..."
-    # The upstream COSI sidecar predicate only fires on full DeleteEvent (object gone), not on
-    # the UpdateEvent that sets DeletionTimestamp. The sidecar never triggers reconcileDelete,
-    # so it never calls DriverRevokeBucketAccess or sets SidecarCleanupFinishedAnnotation.
-    # Without that annotation, the controller (which would then remove the finalizer) also skips
-    # the object. Deletion is deadlocked. The controller code has an explicit TODO:
-    #   // TODO: deletion logic
-    #   return cosierr.NonRetryableError("deletion is not yet implemented")
-    test_skip "BucketAccess cleanup: upstream COSI sidecar deletion not yet implemented"
+    # The upstream COSI controller still has a "TODO: deletion logic" path for
+    # BucketAccess. Without the controller cascading a DeletionTimestamp onto
+    # the BucketAccess, our reconciler never sees the delete event.
+    test_skip "BucketAccess cleanup: upstream COSI controller deletion not yet implemented"
     return 0
 }
 
@@ -325,12 +322,6 @@ fi
 
 log_info "Loading operator image into kind..."
 kind load docker-image garage-operator:cosi-e2e --name "$CLUSTER_NAME"
-
-# Load COSI sidecar image
-# Pull for linux/amd64 explicitly to avoid multi-arch issues with kind load
-log_info "Pulling and loading COSI sidecar image..."
-docker pull --platform linux/amd64 gcr.io/k8s-staging-sig-storage/objectstorage-sidecar:latest || true
-kind load docker-image gcr.io/k8s-staging-sig-storage/objectstorage-sidecar:latest --name "$CLUSTER_NAME" || log_warn "Failed to preload sidecar image, kind will pull it"
 
 # Install COSI CRDs
 log_info "Installing COSI CRDs..."
@@ -395,7 +386,7 @@ echo "============================================"
 echo ""
 
 # Run tests
-test_cosi_sidecar_running || true
+test_cosi_reconcilers_loaded || true
 test_garage_cluster_ready || true
 test_bucket_claim_bound || true
 test_shadow_bucket_created || true
