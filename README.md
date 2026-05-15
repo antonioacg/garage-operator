@@ -962,16 +962,30 @@ The operator includes an optional COSI (Container Object Storage Interface) driv
 
 ### Enabling COSI
 
-1. Install the COSI CRDs:
+> [!IMPORTANT]
+> The COSI v1alpha2 API requires `spec.bucketClaimRef` on `Bucket` resources. This
+> field is populated by the cluster-wide COSI **controller** — a separate deployment
+> from `kubernetes-sigs/container-object-storage-interface`, installed once per
+> cluster. Pin the install below to a ref that contains the `BucketClaimRef`-setting
+> logic — older builds create `Bucket` objects without it and the operator rejects them.
+>
+> **Architecture:** The cluster-wide COSI controller reconciles `BucketClaim` →
+> `Bucket` and `BucketAccessClaim` → `BucketAccess`. The garage-operator watches the
+> resulting `Bucket` and `BucketAccess` objects directly (filtered by `driverName`)
+> and translates them into Garage Admin API calls. There is no per-driver sidecar
+> container — this was previously the upstream `objectstorage-sidecar`'s role.
+
+1. Install the COSI CRDs (pinned to a known-good ref):
    ```bash
+   COSI_REF=bf23a024f511482856f047525f732f26c61e2b85
    for crd in bucketclaims bucketaccesses bucketclasses bucketaccessclasses buckets; do
-     kubectl apply -f "https://raw.githubusercontent.com/kubernetes-sigs/container-object-storage-interface/main/client/config/crd/objectstorage.k8s.io_${crd}.yaml"
+     kubectl apply -f "https://raw.githubusercontent.com/kubernetes-sigs/container-object-storage-interface/${COSI_REF}/client/config/crd/objectstorage.k8s.io_${crd}.yaml"
    done
    ```
 
-2. Deploy the COSI controller:
+2. Deploy the COSI controller (pinned — required for `bucketClaimRef` to be populated):
    ```bash
-   kubectl apply -k "github.com/kubernetes-sigs/container-object-storage-interface/controller?ref=main"
+   kubectl apply -k "github.com/kubernetes-sigs/container-object-storage-interface/controller?ref=${COSI_REF}"
    ```
 
 3. Install the operator with COSI enabled:

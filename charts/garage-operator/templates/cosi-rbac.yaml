@@ -44,6 +44,14 @@ rules:
   - update
   - patch
   - delete
+# Finalizers for Bucket and BucketAccess
+- apiGroups:
+  - objectstorage.k8s.io
+  resources:
+  - buckets/finalizers
+  - bucketaccesses/finalizers
+  verbs:
+  - update
 # Events
 - apiGroups:
   - ""
@@ -52,19 +60,6 @@ rules:
   verbs:
   - create
   - patch
-# Leader election for COSI sidecar
-- apiGroups:
-  - coordination.k8s.io
-  resources:
-  - leases
-  verbs:
-  - get
-  - list
-  - watch
-  - create
-  - update
-  - patch
-  - delete
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

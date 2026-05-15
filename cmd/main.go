@@ -17,7 +17,6 @@ limitations under the License.
 package main
 
 import (
-	"context"
 	"crypto/tls"
 	"flag"
 	"os"
@@ -36,7 +35,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -45,6 +43,7 @@ import (
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	"github.com/rajsinghtech/garage-operator/internal/controller"
 	"github.com/rajsinghtech/garage-operator/internal/cosi"
+	cosiv1alpha2 "sigs.k8s.io/container-object-storage-interface/client/apis/objectstorage/v1alpha2"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -62,6 +61,7 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(monitoringv1.AddToScheme(scheme))
 	utilruntime.Must(garagev1beta1.AddToScheme(scheme))
+	utilruntime.Must(cosiv1alpha2.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -118,11 +118,9 @@ func main() {
 
 	// COSI driver flags
 	var enableCOSI bool
-	var cosiEndpoint string
 	var cosiDriverName string
 	var cosiNamespace string
 	flag.BoolVar(&enableCOSI, "enable-cosi", false, "Enable COSI driver for Kubernetes-native object storage provisioning")
-	flag.StringVar(&cosiEndpoint, "cosi-endpoint", "unix:///var/lib/cosi/cosi.sock", "COSI socket endpoint")
 	flag.StringVar(&cosiDriverName, "cosi-driver-name", "garage.rajsingh.info", "COSI driver name")
 	flag.StringVar(&cosiNamespace, "cosi-namespace", "garage-operator-system", "Namespace for COSI shadow resources")
 
@@ -346,22 +344,27 @@ func main() {
 	// Setup signal handler once (can only be called once per process)
 	ctx := ctrl.SetupSignalHandler()
 
-	// Start COSI driver if enabled
+	// Register COSI reconcilers if enabled
 	if enableCOSI {
-		cosiDriver := cosi.NewDriver(cosi.DriverConfig{
-			DriverName:    cosiDriverName,
-			Endpoint:      cosiEndpoint,
-			Namespace:     cosiNamespace,
-			ClusterDomain: clusterDomain,
-		}, mgr.GetClient())
-
-		// Add COSI driver as a Runnable to the manager
-		// This ensures the driver lifecycle is tied to the manager
-		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
-			setupLog.Info("Starting COSI driver", "endpoint", cosiEndpoint, "driver", cosiDriverName)
-			return cosiDriver.Run(ctx)
-		})); err != nil {
-			setupLog.Error(err, "unable to add COSI driver to manager")
+		provisioner := cosi.NewProvisioner(mgr.GetClient(), cosiNamespace, clusterDomain)
+		if err := (&cosi.BucketReconciler{
+			Client:      mgr.GetClient(),
+			Scheme:      mgr.GetScheme(),
+			DriverName:  cosiDriverName,
+			Namespace:   cosiNamespace,
+			Provisioner: provisioner,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to set up BucketReconciler")
+			os.Exit(1)
+		}
+		if err := (&cosi.BucketAccessReconciler{
+			Client:      mgr.GetClient(),
+			Scheme:      mgr.GetScheme(),
+			DriverName:  cosiDriverName,
+			Namespace:   cosiNamespace,
+			Provisioner: provisioner,
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to set up BucketAccessReconciler")
 			os.Exit(1)
 		}
 	}

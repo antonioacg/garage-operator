@@ -112,6 +112,41 @@ rules:
   - update
   - watch
 - apiGroups:
+  - objectstorage.k8s.io
+  resources:
+  - bucketaccesses
+  - buckets
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - objectstorage.k8s.io
+  resources:
+  - bucketaccesses/finalizers
+  - buckets/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - objectstorage.k8s.io
+  resources:
+  - bucketaccesses/status
+  - buckets/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - objectstorage.k8s.io
+  resources:
+  - bucketclaims
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - policy
   resources:
   - poddisruptionbudgets
