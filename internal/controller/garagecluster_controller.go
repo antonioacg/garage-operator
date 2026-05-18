@@ -2920,10 +2920,19 @@ func assignNewNodesToLayout(ctx context.Context, garageClient *garage.Client, no
 
 	effectiveCapacity := calculateEffectiveCapacity(cfg.capacity, cfg.capacityReservePercent)
 
-	// Validate minimum capacity - Garage requires at least 1024 bytes (1 KB)
+	// Validate minimum capacity - Garage requires at least 1024 bytes (1 KB).
+	// Only enforce when there's any storage-tier pod in this batch; pure
+	// gateway-only clusters legitimately have no capacity.
 	// See: src/api/admin/layout.rs - "Capacity should be at least 1K (1024)"
 	const minCapacity uint64 = 1024
-	if !cfg.isGateway && effectiveCapacity < minCapacity {
+	hasStorageNode := false
+	for _, n := range nodes {
+		if n.tier == tierStorage {
+			hasStorageNode = true
+			break
+		}
+	}
+	if hasStorageNode && effectiveCapacity < minCapacity {
 		return fmt.Errorf("effective capacity %d bytes is below minimum of %d bytes (1 KB); "+
 			"check storage.data.size and capacityReservePercent settings", effectiveCapacity, minCapacity)
 	}
@@ -2939,8 +2948,12 @@ func assignNewNodesToLayout(ctx context.Context, garageClient *garage.Client, no
 	for _, node := range nodes {
 		// Build desired tags for this node
 		desiredTags := buildNodeTags(cfg.clusterName, cfg.namespace, node.tier, cfg.tags, node.podName)
+		// Capacity is per-tier: storage pods own real data, gateways do not.
+		// The cluster-wide cfg.isGateway flag is only correct for pure gateway-only
+		// clusters; for unified storage+gateway CRs we must look at each pod's tier
+		// so gateway pods never enter storage_sets with phantom capacity.
 		var desiredCapacity *uint64
-		if !cfg.isGateway {
+		if node.tier == tierStorage || (node.tier == "" && !cfg.isGateway) {
 			cap := effectiveCapacity
 			desiredCapacity = &cap
 		}
