@@ -17,9 +17,24 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 
+V1ALPHA1_STUB = ROOT / "config/crd/compat/v1alpha1_stub_version.yaml"
+
+# CRDs that need legacy version entries preserved so Kubernetes accepts an upgrade
+# when the cluster still has those versions listed in status.storedVersions.
+#
+# The garagebucket compat entry retains the full historical schema with
+# served=true because older clients may still read v1alpha1 objects.
+# The other CRDs use a minimal served=false/storage=false stub — v1alpha1
+# was never a storage version for them, so no decoding is required, but
+# Kubernetes' invariant "every entry in status.storedVersions must still
+# appear in spec.versions" forces us to keep the entry around.
 COMPAT_VERSIONS = {
     "garage.rajsingh.info_garagebuckets.yaml": ROOT
     / "config/crd/compat/garagebucket_v1alpha1_version.yaml",
+    "garage.rajsingh.info_garageadmintokens.yaml": V1ALPHA1_STUB,
+    "garage.rajsingh.info_garageclusters.yaml": V1ALPHA1_STUB,
+    "garage.rajsingh.info_garagekeys.yaml": V1ALPHA1_STUB,
+    "garage.rajsingh.info_garagenodes.yaml": V1ALPHA1_STUB,
 }
 
 # CRDs that need a conversion webhook (multi-version with non-identical schemas).

@@ -1,22 +1,33 @@
 {{- if .Values.crds.install }}
 {{- range $path, $_ := .Files.Glob "crd-bases/**.yaml" }}
 {{- $crd := $.Files.Get $path | fromYaml }}
-{{- /* When the chart deploys webhooks, point any CRD conversion webhook at the release-scoped service.
-       When webhooks are disabled the CRD must only serve a single version, so strip the conversion stanza
-       AND any non-storage versions from spec.versions so the API server doesn't try to convert. */}}
+{{- /* Handle CRDs that declare a conversion webhook.
+
+       When .Values.webhooks.enabled is true: rewire the conversion webhook clientConfig
+       at the release-scoped service so cert-manager can inject the CA.
+
+       When .Values.webhooks.enabled is false: drop the conversion stanza (no service to
+       point at) and mark every non-storage version as served=false. We deliberately keep
+       these version entries in spec.versions — removing them would violate Kubernetes'
+       invariant "every entry in status.storedVersions must still appear in spec.versions",
+       which breaks upgrades for any cluster that previously stored objects in a legacy
+       version. Marking them unserved means clients cannot request them at runtime, so the
+       API server never needs the conversion webhook to translate them. Existing stored
+       objects remain decodable via the version entry's schema. */}}
 {{- if hasKey $crd.spec "conversion" }}
 {{- if $.Values.webhooks.enabled }}
 {{- $_ := set $crd.spec.conversion.webhook.clientConfig.service "name" (include "garage-operator.webhookServiceName" $) }}
 {{- $_ := set $crd.spec.conversion.webhook.clientConfig.service "namespace" $.Release.Namespace }}
 {{- else }}
 {{- $_ := unset $crd.spec "conversion" }}
-{{- $storageOnly := list }}
+{{- $patched := list }}
 {{- range $v := $crd.spec.versions }}
-{{- if $v.storage }}
-{{- $storageOnly = append $storageOnly $v }}
+{{- if not $v.storage }}
+{{- $_ := set $v "served" false }}
 {{- end }}
+{{- $patched = append $patched $v }}
 {{- end }}
-{{- $_ := set $crd.spec "versions" $storageOnly }}
+{{- $_ := set $crd.spec "versions" $patched }}
 {{- end }}
 {{- end }}
 ---

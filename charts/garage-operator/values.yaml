@@ -152,9 +152,14 @@ networkPolicy:
       metrics: enabled
 
 # Webhook configuration (requires cert-manager)
+# The operator declares multiple API versions (e.g. v1beta1 + v1beta2 for GarageCluster)
+# and ships a conversion webhook. Disabling webhooks marks non-storage served versions
+# as unserved in the rendered CRDs, but their entries are kept in spec.versions so
+# Kubernetes' storedVersions invariant is preserved.
 webhooks:
-  # -- Enable admission webhooks
-  enabled: false
+  # -- Enable admission and conversion webhooks. Required when multiple API versions
+  # are in use. cert-manager must be installed.
+  enabled: true
   # -- Failure policy for webhooks (Fail or Ignore)
   failurePolicy: Fail
   # Certificate configuration for webhooks
