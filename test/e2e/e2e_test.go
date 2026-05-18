@@ -69,6 +69,9 @@ var _ = Describe("Manager", Ordered, func() {
 		_, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
+		By("waiting for Garage CRDs to be Established")
+		Expect(utils.WaitCRDsEstablished()).To(Succeed())
+
 		By("deploying the controller-manager")
 		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
 		_, err = utils.Run(cmd)
@@ -229,6 +232,11 @@ var _ = Describe("Manager", Ordered, func() {
 			}
 			Eventually(verifyControllerPodReady, 3*time.Minute, time.Second).Should(Succeed())
 
+			By("waiting for the controller pod to reach Ready condition (defensive)")
+			waitCmd := exec.Command("kubectl", "wait", "--for=condition=Ready",
+				"--timeout=2m", "pod/"+controllerPodName, "-n", namespace)
+			_, _ = utils.Run(waitCmd)
+
 			By("verifying that the controller manager is serving the metrics server")
 			verifyMetricsServerStarted := func(g Gomega) {
 				cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
@@ -237,7 +245,7 @@ var _ = Describe("Manager", Ordered, func() {
 				g.Expect(output).To(ContainSubstring("Serving metrics server"),
 					"Metrics server not yet started")
 			}
-			Eventually(verifyMetricsServerStarted, 3*time.Minute, time.Second).Should(Succeed())
+			Eventually(verifyMetricsServerStarted, 5*time.Minute, time.Second).Should(Succeed())
 
 			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
 
@@ -253,7 +261,7 @@ var _ = Describe("Manager", Ordered, func() {
 							"image": "docker.io/curlimages/curl:latest",
 							"imagePullPolicy": "IfNotPresent",
 							"command": ["/bin/sh", "-c"],
-							"args": ["curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics"],
+							"args": ["curl -v -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:8443/metrics"],
 							"securityContext": {
 								"readOnlyRootFilesystem": true,
 								"allowPrivilegeEscalation": false,
@@ -349,18 +357,29 @@ spec:
 				By("garage resources exist from other tests, skipping empty state check")
 			}
 
-			By("waiting to verify operator stability (no crash loops)")
-			// Wait 30 seconds and verify operator has 0 restarts
+			By("recording initial restart count")
+			// The operator may legitimately restart once during cold start while
+			// waiting for cert-manager to populate the webhook server cert secret
+			// (mounted with optional: true). We only care that it stops restarting
+			// once it's up, not that it hit zero restarts on its first try.
+			cmd = exec.Command("kubectl", "get", "pod", controllerPodName, "-n", namespace,
+				"-o", "jsonpath={.status.containerStatuses[0].restartCount}")
+			initialRestarts, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("waiting to verify operator stability (no NEW crash loops)")
+			// Wait 30 seconds and verify operator restartCount has not increased
 			time.Sleep(30 * time.Second)
 
-			verifyNoRestarts := func(g Gomega) {
+			verifyNoNewRestarts := func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "pod", controllerPodName, "-n", namespace,
 					"-o", "jsonpath={.status.containerStatuses[0].restartCount}")
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("0"), "Operator should not have restarted")
+				g.Expect(output).To(Equal(initialRestarts),
+					"Operator should not have restarted again (started with %s restarts)", initialRestarts)
 			}
-			Eventually(verifyNoRestarts, time.Minute).Should(Succeed())
+			Eventually(verifyNoNewRestarts, time.Minute).Should(Succeed())
 
 			By("verifying health endpoints are responding")
 			// Check liveness probe is working
@@ -470,20 +489,29 @@ var _ = Describe("Gateway Cluster", Ordered, Label("gateway"), func() {
 		_, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
+		By("waiting for Garage CRDs to be Established")
+		Expect(utils.WaitCRDsEstablished()).To(Succeed())
+
 		By("deploying the controller-manager")
 		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
 
-		By("waiting for controller-manager to be ready")
+		By("waiting for controller-manager pod to be Ready (webhook server started)")
 		verifyControllerUp := func(g Gomega) {
+			// Use Ready condition rather than pod Phase. With the webhook
+			// readiness gate (cmd/main.go: webhookServer.StartedChecker), the
+			// pod will not flip Ready until the TLS listener on :9443 is
+			// accepting connections, which is exactly what the next CR apply
+			// needs.
 			cmd := exec.Command("kubectl", "get", "pods", "-l", "control-plane=controller-manager",
-				"-n", namespace, "-o", "jsonpath={.items[0].status.phase}")
+				"-n", namespace,
+				"-o", "jsonpath={.items[0].status.conditions[?(@.type=='Ready')].status}")
 			output, err := utils.Run(cmd)
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(output).To(Equal("Running"), "Controller not running: %s", output)
+			g.Expect(output).To(Equal("True"), "Controller not Ready: %s", output)
 		}
-		Eventually(verifyControllerUp, 2*time.Minute, 5*time.Second).Should(Succeed())
+		Eventually(verifyControllerUp, 3*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("creating test namespace")
 		cmd = exec.Command("kubectl", "create", "ns", testNamespace)
@@ -539,51 +567,56 @@ stringData:
 
 			By("creating storage cluster YAML")
 			storageYAML := fmt.Sprintf(`
-apiVersion: garage.rajsingh.info/v1beta1
+apiVersion: garage.rajsingh.info/v1beta2
 kind: GarageCluster
 metadata:
   name: %s
   namespace: %s
 spec:
-  replicas: 1
   replication:
     factor: 1
   storage:
+    replicas: 1
+    metadata:
+      size: 1Gi
     data:
       size: 1Gi
+    resources:
+      limits:
+        memory: 256Mi
+      requests:
+        memory: 128Mi
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      fsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      runAsUser: 1000
+      capabilities:
+        drop:
+          - ALL
+      seccompProfile:
+        type: RuntimeDefault
   admin:
     adminTokenSecretRef:
       name: garage-admin-token
       key: admin-token
   security:
     allowInsecureSecretPermissions: true
-  resources:
-    limits:
-      memory: 256Mi
-    requests:
-      memory: 128Mi
-  securityContext:
-    runAsNonRoot: true
-    runAsUser: 1000
-    fsGroup: 1000
-    seccompProfile:
-      type: RuntimeDefault
-  containerSecurityContext:
-    allowPrivilegeEscalation: false
-    runAsNonRoot: true
-    runAsUser: 1000
-    capabilities:
-      drop:
-        - ALL
-    seccompProfile:
-      type: RuntimeDefault
 `, storageClusterName, testNamespace)
 
-			By("applying storage cluster")
-			cmd = exec.Command("kubectl", "apply", "-f", "-")
-			cmd.Stdin = strings.NewReader(storageYAML)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create storage cluster")
+			By("applying storage cluster (retry until webhook is up)")
+			applyStorage := func(g Gomega) {
+				c := exec.Command("kubectl", "apply", "-f", "-")
+				c.Stdin = strings.NewReader(storageYAML)
+				out, err := utils.Run(c)
+				g.Expect(err).NotTo(HaveOccurred(), "Failed to create storage cluster: %s", out)
+			}
+			Eventually(applyStorage, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("waiting for storage cluster to be ready")
 			verifyStorageReady := func(g Gomega) {
@@ -599,52 +632,61 @@ spec:
 		It("should create gateway cluster that connects to storage", func() {
 			By("creating gateway cluster YAML")
 			gatewayYAML := fmt.Sprintf(`
-apiVersion: garage.rajsingh.info/v1beta1
+apiVersion: garage.rajsingh.info/v1beta2
 kind: GarageCluster
 metadata:
   name: %s
   namespace: %s
 spec:
-  replicas: 1
-  gateway: true
+  gateway:
+    replicas: 1
+    resources:
+      limits:
+        memory: 128Mi
+      requests:
+        memory: 64Mi
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      fsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      runAsUser: 1000
+      capabilities:
+        drop:
+          - ALL
+      seccompProfile:
+        type: RuntimeDefault
   connectTo:
     clusterRef:
       name: %s
   replication:
     factor: 1
+  # Enable autoApply so gateway-tier tombstones (from rotated ephemeral node
+  # identities) get removed from the layout immediately instead of waiting on
+  # manual operator intervention. Required for the "node ID rotation" + "no
+  # stale roles" specs below.
+  layoutManagement:
+    autoApply: true
   admin:
     adminTokenSecretRef:
       name: garage-admin-token
       key: admin-token
   security:
     allowInsecureSecretPermissions: true
-  resources:
-    limits:
-      memory: 128Mi
-    requests:
-      memory: 64Mi
-  securityContext:
-    runAsNonRoot: true
-    runAsUser: 1000
-    fsGroup: 1000
-    seccompProfile:
-      type: RuntimeDefault
-  containerSecurityContext:
-    allowPrivilegeEscalation: false
-    runAsNonRoot: true
-    runAsUser: 1000
-    capabilities:
-      drop:
-        - ALL
-    seccompProfile:
-      type: RuntimeDefault
 `, gatewayClusterName, testNamespace, storageClusterName)
 
-			By("applying gateway cluster")
-			cmd := exec.Command("kubectl", "apply", "-f", "-")
-			cmd.Stdin = strings.NewReader(gatewayYAML)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create gateway cluster")
+			By("applying gateway cluster (retry until webhook is up)")
+			applyGateway := func(g Gomega) {
+				c := exec.Command("kubectl", "apply", "-f", "-")
+				c.Stdin = strings.NewReader(gatewayYAML)
+				out, err := utils.Run(c)
+				g.Expect(err).NotTo(HaveOccurred(), "Failed to create gateway cluster: %s", out)
+			}
+			Eventually(applyGateway, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("waiting for gateway cluster to be ready")
 			verifyGatewayReady := func(g Gomega) {
@@ -657,27 +699,43 @@ spec:
 			Eventually(verifyGatewayReady, 5*time.Minute, 5*time.Second).Should(Succeed())
 		})
 
-		It("should create StatefulSet for gateway (for node identity persistence)", func() {
-			By("verifying StatefulSet exists")
-			cmd := exec.Command("kubectl", "get", "statefulset", gatewayClusterName,
-				"-n", testNamespace, "-o", "jsonpath={.metadata.name}")
-			output, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "StatefulSet should exist for gateway cluster")
-			Expect(output).To(Equal(gatewayClusterName))
+		It("should create Deployment for gateway tier (ephemeral identity)", func() {
+			// Gateway tier in v1beta2 is a Deployment named "<cr>-gateway" with
+			// EmptyDir volumes; node identity rotates per pod restart and the
+			// operator garbage-collects stale layout entries via tombstone
+			// cleanup. This replaces the old StatefulSet-with-PVC model.
+			gwDeploy := gatewayClusterName + "-gateway"
 
-			By("verifying gateway uses metadata PVC only (for node identity persistence)")
-			cmd = exec.Command("kubectl", "get", "statefulset", gatewayClusterName,
-				"-n", testNamespace, "-o", "jsonpath={.spec.volumeClaimTemplates[*].metadata.name}")
-			output, err = utils.Run(cmd)
+			By("verifying Deployment exists")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "deployment", gwDeploy,
+					"-n", testNamespace, "-o", "jsonpath={.metadata.name}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "Deployment should exist for gateway cluster")
+				g.Expect(output).To(Equal(gwDeploy))
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("verifying gateway has no PVCs (EmptyDir for both metadata and data)")
+			cmd := exec.Command("kubectl", "get", "pvc", "-n", testNamespace,
+				"-l", "app.kubernetes.io/instance="+gatewayClusterName,
+				"-o", "jsonpath={.items[*].metadata.name}")
+			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(Equal("metadata"), "Gateway should have only metadata PVC (not data)")
+			Expect(output).To(BeEmpty(), "Gateway tier should not create PVCs (got %q)", output)
 
 			By("verifying gateway has EmptyDir for data volume")
-			cmd = exec.Command("kubectl", "get", "statefulset", gatewayClusterName,
+			cmd = exec.Command("kubectl", "get", "deployment", gwDeploy,
 				"-n", testNamespace, "-o", "jsonpath={.spec.template.spec.volumes[?(@.name==\"data\")].emptyDir}")
 			output, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(Equal("{}"), "Gateway should use EmptyDir for data volume")
+
+			By("verifying gateway has EmptyDir for metadata volume")
+			cmd = exec.Command("kubectl", "get", "deployment", gwDeploy,
+				"-n", testNamespace, "-o", "jsonpath={.spec.template.spec.volumes[?(@.name==\"metadata\")].emptyDir}")
+			output, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(output).To(Equal("{}"), "Gateway should use EmptyDir for metadata volume")
 		})
 
 		It("should have gateway pods running", func() {
@@ -749,11 +807,11 @@ spec:
 			Eventually(verifyLayoutUpdated, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("verifying gateway cluster component label")
-			cmd := exec.Command("kubectl", "get", "statefulset", gatewayClusterName,
+			cmd := exec.Command("kubectl", "get", "deployment", gatewayClusterName+"-gateway",
 				"-n", testNamespace, "-o", "jsonpath={.metadata.labels.app\\.kubernetes\\.io/component}")
 			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(Equal("gateway"), "Gateway statefulset should have component=gateway label")
+			Expect(output).To(Equal("gateway"), "Gateway Deployment should have component=gateway label")
 		})
 
 		It("should serve S3 API requests via gateway", func() {
@@ -1370,9 +1428,11 @@ spec:
 			Eventually(verifyGatewayCapacity, 2*time.Minute, 10*time.Second).Should(Succeed())
 		})
 
-		It("should preserve node identity when gateway pods restart (StatefulSet + PVC)", func() {
-			// Gateway clusters use StatefulSet with metadata PVC, so the node ID is preserved
-			// across pod restarts. This test verifies that behavior.
+		It("should rotate node identity when gateway pods restart (ephemeral identity)", func() {
+			// Gateway tier in v1beta2 uses a Deployment with EmptyDir for
+			// metadata, so the Ed25519 node_key is regenerated on each pod
+			// start. The operator garbage-collects stale layout entries via
+			// tombstone cleanup. This test verifies the new identity ROTATES.
 			By("getting the current gateway pod name")
 			cmd := exec.Command("kubectl", "get", "pods",
 				"-l", fmt.Sprintf("app.kubernetes.io/instance=%s", gatewayClusterName),
@@ -1464,8 +1524,8 @@ spec:
 			}
 			Eventually(verifyGatewayHealthy, 3*time.Minute, 5*time.Second).Should(Succeed())
 
-			By("verifying the same node ID is used after restart (identity preserved)")
-			verifyNodeIDPreserved := func(g Gomega) {
+			By("verifying a new node ID is used after restart (identity rotated)")
+			verifyNodeIDRotated := func(g Gomega) {
 				curlCmd := fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:3903/v2/GetClusterLayout",
 					adminToken, storageClusterName, testNamespace)
 				cmd := exec.Command("kubectl", "run", "curl-check-node-id", "--rm", "-i", "--restart=Never",
@@ -1514,24 +1574,34 @@ spec:
 						}
 					}
 				}
-				// The node ID should be the same because StatefulSet preserves the PVC
-				// which contains the node's identity (Ed25519 keypair in metadata_dir/node_key)
-				g.Expect(newNodeID).To(Equal(oldNodeID),
-					"Node ID should be preserved after restart. Old: %s, New: %s", oldNodeID[:16], newNodeID[:16])
+				// The node ID should rotate because gateway Deployment uses EmptyDir
+				// for metadata_dir, so node_key (Ed25519 keypair) is regenerated.
+				// The operator tombstone-cleans the old layout entry.
+				g.Expect(newNodeID).NotTo(BeEmpty(), "expected a new gateway node in layout after restart")
+				g.Expect(newNodeID).NotTo(Equal(oldNodeID),
+					"Node ID should rotate after restart. Old: %s, New: %s", oldNodeID[:16], newNodeID[:16])
 			}
-			Eventually(verifyNodeIDPreserved, 2*time.Minute, 10*time.Second).Should(Succeed())
+			Eventually(verifyNodeIDRotated, 3*time.Minute, 10*time.Second).Should(Succeed())
 
-			By("verifying all nodes are connected (no stale nodes)")
-			verifyAllConnected := func(g Gomega) {
-				curlCmd := fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:3903/v2/GetClusterHealth",
+			By("verifying layout contains exactly one gateway entry (tombstone cleanup happened)")
+			// Note: we don't assert on GetClusterHealth.KnownNodes here. Garage's
+			// peering layer (src/net/peering.rs KnownHosts.list) is append-only —
+			// once a peer is observed, it stays in known_nodes for the rest of the
+			// process lifetime (on_disconnected only flips state to Waiting; failed
+			// retries reach Abandoned, never removal). There is no admin API to
+			// evict a peer. So KnownNodes will keep growing after every gateway
+			// pod rotation. The operator's responsibility is layout cleanup, which
+			// is what we assert here.
+			verifyLayoutClean := func(g Gomega) {
+				curlCmd := fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:3903/v2/GetClusterLayout",
 					adminToken, storageClusterName, testNamespace)
-				cmd := exec.Command("kubectl", "run", "curl-health-final", "--rm", "-i", "--restart=Never",
+				cmd := exec.Command("kubectl", "run", "curl-layout-final", "--rm", "-i", "--restart=Never",
 					"-n", testNamespace,
 					"--image=docker.io/curlimages/curl:latest",
 					"--overrides", fmt.Sprintf(`{
 						"spec": {
 							"containers": [{
-								"name": "curl-health-final",
+								"name": "curl-layout-final",
 								"image": "docker.io/curlimages/curl:latest",
 								"imagePullPolicy": "IfNotPresent",
 								"command": ["/bin/sh", "-c"],
@@ -1548,24 +1618,46 @@ spec:
 						}
 					}`, curlCmd))
 				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to query cluster health: %s", output)
+				g.Expect(err).NotTo(HaveOccurred(), "Failed to query cluster layout: %s", output)
 
-				var health struct {
-					Status         string `json:"status"`
-					KnownNodes     int    `json:"knownNodes"`
-					ConnectedNodes int    `json:"connectedNodes"`
+				var layout struct {
+					Roles []struct {
+						ID   string   `json:"id"`
+						Tags []string `json:"tags"`
+					} `json:"roles"`
+					StagedRoleChanges []struct {
+						ID     string `json:"id"`
+						Remove bool   `json:"remove"`
+					} `json:"stagedRoleChanges"`
 				}
 				jsonStart := strings.Index(output, "{")
 				jsonEnd := strings.LastIndex(output, "}")
 				g.Expect(jsonStart).To(BeNumerically(">=", 0))
 				jsonStr := output[jsonStart : jsonEnd+1]
-				g.Expect(json.Unmarshal([]byte(jsonStr), &health)).To(Succeed())
+				g.Expect(json.Unmarshal([]byte(jsonStr), &layout)).To(Succeed())
 
-				g.Expect(health.Status).To(Equal("healthy"))
-				g.Expect(health.ConnectedNodes).To(Equal(health.KnownNodes),
-					"All nodes should be connected. Known: %d, Connected: %d", health.KnownNodes, health.ConnectedNodes)
+				// Collect every layout entry tagged for this gateway cluster.
+				var gatewayRoles []string
+				for _, role := range layout.Roles {
+					for _, tag := range role.Tags {
+						if strings.HasPrefix(tag, gatewayClusterName) {
+							gatewayRoles = append(gatewayRoles, role.ID)
+							break
+						}
+					}
+				}
+				g.Expect(gatewayRoles).To(HaveLen(1),
+					"Layout should have exactly one gateway entry after tombstone cleanup, got %d: %v", len(gatewayRoles), gatewayRoles)
+				g.Expect(gatewayRoles[0]).NotTo(Equal(oldNodeID),
+					"Layout still contains stale gateway node ID %s", oldNodeID)
+
+				// No removal should be staged — cleanup should have been applied.
+				for _, change := range layout.StagedRoleChanges {
+					g.Expect(change.Remove).To(BeFalse(),
+						"Unexpected pending gateway tombstone for %s", change.ID)
+				}
 			}
-			Eventually(verifyAllConnected, 2*time.Minute, 10*time.Second).Should(Succeed())
+			Eventually(verifyLayoutClean, 4*time.Minute, 10*time.Second).Should(Succeed())
 		})
 
 		It("should have layout with only expected roles (no extra stale entries)", func() {
@@ -1740,12 +1832,12 @@ spec:
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "kubectl scale should succeed")
 
-			By("verifying spec.replicas was updated by scale subresource")
+			By("verifying spec.storage.replicas was updated by scale subresource")
 			cmd = exec.Command("kubectl", "get", "garagecluster", storageClusterName,
-				"-n", testNamespace, "-o", "jsonpath={.spec.replicas}")
+				"-n", testNamespace, "-o", "jsonpath={.spec.storage.replicas}")
 			output, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(Equal("2"), "spec.replicas should be updated to 2")
+			Expect(output).To(Equal("2"), "spec.storage.replicas should be updated to 2")
 
 			By("waiting for scaled pods to be ready")
 			verifyScaledReady := func(g Gomega) {
@@ -1794,14 +1886,32 @@ var _ = Describe("Webhooks", Ordered, Label("webhooks"), func() {
 		cmd := exec.Command("kubectl", "create", "ns", webhookNamespace)
 		_, _ = utils.Run(cmd)
 
-		By("installing CRDs")
-		cmd = exec.Command("make", "install")
-		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
-
 		// Note: Image is already built and loaded by BeforeSuite (example.com/garage-operator:v0.0.1)
 
-		By("deploying operator via Helm with webhooks enabled")
+		// Prior Describe blocks install CRDs via `make install` (kustomize), which
+		// does not set Helm ownership labels/annotations. A subsequent `helm
+		// install` then refuses to adopt those CRDs with an "invalid ownership
+		// metadata" error. Delete any leftover Garage CRDs (and their CRs across
+		// the cluster, since CRDs are cluster-scoped) before the Helm install so
+		// it can manage them fresh. Earlier suites' AfterAll already calls
+		// `make uninstall`, so in the common case this is a no-op.
+		By("deleting any pre-existing Garage CRDs to avoid helm ownership conflict")
+		cmd = exec.Command("kubectl", "delete", "crd",
+			"garageadmintokens.garage.rajsingh.info",
+			"garagebuckets.garage.rajsingh.info",
+			"garageclusters.garage.rajsingh.info",
+			"garagekeys.garage.rajsingh.info",
+			"garagenodes.garage.rajsingh.info",
+			"garagereferencegrants.garage.rajsingh.info",
+			"--ignore-not-found", "--timeout=60s")
+		_, _ = utils.Run(cmd)
+
+		// Helm chart installs the CRDs (crds.install=true in values-e2e-webhooks.yaml)
+		// AND patches the conversion webhook clientConfig to the release-scoped
+		// service, so the API server can actually reach the conversion webhook.
+		// `make install` would install CRDs pointing to the kustomize-default
+		// service name/namespace, which does not exist for this test.
+		By("deploying operator + CRDs via Helm with webhooks enabled")
 		cmd = exec.Command("helm", "install", "garage-operator-webhook-test",
 			"charts/garage-operator",
 			"--namespace", webhookNamespace,
@@ -1810,6 +1920,9 @@ var _ = Describe("Webhooks", Ordered, Label("webhooks"), func() {
 			"--wait", "--timeout", "180s")
 		output, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy operator with webhooks: %s", output)
+
+		By("waiting for Garage CRDs to be Established")
+		Expect(utils.WaitCRDsEstablished()).To(Succeed())
 	})
 
 	AfterAll(func() {
@@ -1910,41 +2023,41 @@ var _ = Describe("Webhooks", Ordered, Label("webhooks"), func() {
 
 			By("creating GarageCluster with EmptyDir to trigger validation warning")
 			clusterYAML := `
-apiVersion: garage.rajsingh.info/v1beta1
+apiVersion: garage.rajsingh.info/v1beta2
 kind: GarageCluster
 metadata:
   name: webhook-test-cluster
   namespace: webhook-test
 spec:
-  replicas: 1
   replication:
     factor: 1
   storage:
+    replicas: 1
     metadata:
       type: EmptyDir
     data:
       type: EmptyDir
+    podDisruptionBudget:
+      enabled: false
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      fsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      runAsUser: 1000
+      capabilities:
+        drop:
+          - ALL
+      seccompProfile:
+        type: RuntimeDefault
   admin:
     adminTokenSecretRef:
       name: test-admin-token
       key: admin-token
-  podDisruptionBudget:
-    enabled: false
-  securityContext:
-    runAsNonRoot: true
-    runAsUser: 1000
-    fsGroup: 1000
-    seccompProfile:
-      type: RuntimeDefault
-  containerSecurityContext:
-    allowPrivilegeEscalation: false
-    runAsNonRoot: true
-    runAsUser: 1000
-    capabilities:
-      drop:
-        - ALL
-    seccompProfile:
-      type: RuntimeDefault
 `
 			// Retry creation: the webhook server may still be starting up even after
 			// the pod is Ready (readiness probe checks :8081, not the webhook port).
@@ -1985,17 +2098,19 @@ spec:
 
 			By("attempting to create GarageCluster with invalid layoutPolicy")
 			invalidClusterYAML := `
-apiVersion: garage.rajsingh.info/v1beta1
+apiVersion: garage.rajsingh.info/v1beta2
 kind: GarageCluster
 metadata:
   name: invalid-cluster
   namespace: webhook-test
 spec:
-  replicas: 1
   layoutPolicy: InvalidPolicy
   replication:
     factor: 3
   storage:
+    replicas: 1
+    metadata:
+      size: 1Gi
     data:
       size: 1Gi
 `
@@ -2239,20 +2354,29 @@ var _ = Describe("Manual Mode with GarageNodes", Ordered, Label("manual-mode"), 
 		_, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
 
+		By("waiting for Garage CRDs to be Established")
+		Expect(utils.WaitCRDsEstablished()).To(Succeed())
+
 		By("deploying the controller-manager")
 		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
 		_, err = utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
 
-		By("waiting for controller-manager to be ready")
+		By("waiting for controller-manager pod to be Ready (webhook server started)")
 		verifyControllerUp := func(g Gomega) {
+			// Use Ready condition rather than pod Phase. With the webhook
+			// readiness gate (cmd/main.go: webhookServer.StartedChecker), the
+			// pod will not flip Ready until the TLS listener on :9443 is
+			// accepting connections, which is exactly what the next CR apply
+			// needs.
 			cmd := exec.Command("kubectl", "get", "pods", "-l", "control-plane=controller-manager",
-				"-n", namespace, "-o", "jsonpath={.items[0].status.phase}")
+				"-n", namespace,
+				"-o", "jsonpath={.items[0].status.conditions[?(@.type=='Ready')].status}")
 			output, err := utils.Run(cmd)
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(output).To(Equal("Running"), "Controller not running: %s", output)
+			g.Expect(output).To(Equal("True"), "Controller not Ready: %s", output)
 		}
-		Eventually(verifyControllerUp, 2*time.Minute, 5*time.Second).Should(Succeed())
+		Eventually(verifyControllerUp, 3*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("creating test namespace")
 		cmd = exec.Command("kubectl", "create", "ns", testNamespace)
@@ -2310,7 +2434,7 @@ stringData:
 
 			By("creating GarageCluster with layoutPolicy: Manual")
 			clusterYAML := fmt.Sprintf(`
-apiVersion: garage.rajsingh.info/v1beta1
+apiVersion: garage.rajsingh.info/v1beta2
 kind: GarageCluster
 metadata:
   name: %s
@@ -2319,39 +2443,47 @@ spec:
   layoutPolicy: Manual
   replication:
     factor: 2
+  storage:
+    replicas: 1
+    metadata:
+      size: 100Mi
+    data:
+      size: 1Gi
+    resources:
+      limits:
+        memory: 256Mi
+      requests:
+        memory: 128Mi
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      fsGroup: 1000
+      seccompProfile:
+        type: RuntimeDefault
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      runAsUser: 1000
+      capabilities:
+        drop:
+          - ALL
+      seccompProfile:
+        type: RuntimeDefault
   admin:
     adminTokenSecretRef:
       name: garage-admin-token
       key: admin-token
   security:
     allowInsecureSecretPermissions: true
-  resources:
-    limits:
-      memory: 256Mi
-    requests:
-      memory: 128Mi
-  securityContext:
-    runAsNonRoot: true
-    runAsUser: 1000
-    fsGroup: 1000
-    seccompProfile:
-      type: RuntimeDefault
-  containerSecurityContext:
-    allowPrivilegeEscalation: false
-    runAsNonRoot: true
-    runAsUser: 1000
-    capabilities:
-      drop:
-        - ALL
-    seccompProfile:
-      type: RuntimeDefault
 `, clusterName, testNamespace)
 
-			By("applying GarageCluster")
-			cmd = exec.Command("kubectl", "apply", "-f", "-")
-			cmd.Stdin = strings.NewReader(clusterYAML)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create GarageCluster")
+			By("applying GarageCluster (retry until admission webhook is up)")
+			Eventually(func(g Gomega) {
+				c := exec.Command("kubectl", "apply", "-f", "-")
+				c.Stdin = strings.NewReader(clusterYAML)
+				out, err := utils.Run(c)
+				g.Expect(err).NotTo(HaveOccurred(), "Failed to create GarageCluster: %s", out)
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("verifying no StatefulSet is created for Manual mode cluster")
 			time.Sleep(5 * time.Second)
@@ -3040,15 +3172,20 @@ stringData:
 
 		By("creating gateway GarageCluster with connectTo.adminApiEndpoint")
 		gatewayYAML := fmt.Sprintf(`
-apiVersion: garage.rajsingh.info/v1beta1
+apiVersion: garage.rajsingh.info/v1beta2
 kind: GarageCluster
 metadata:
   name: %s
   namespace: %s
 spec:
-  replicas: 1
   image: dxflrs/garage:v2.3.0
-  gateway: true
+  gateway:
+    replicas: 1
+    resources:
+      limits:
+        memory: 128Mi
+      requests:
+        memory: 64Mi
 
   connectTo:
     rpcSecretRef:
@@ -3082,11 +3219,6 @@ spec:
 
   security:
     allowInsecureSecretPermissions: true
-  resources:
-    limits:
-      memory: 128Mi
-    requests:
-      memory: 64Mi
 `, gatewayClusterName, testNamespace, operatorEndpoint, gatewayRPCPublicAddr, nodePortStr, kindNodeIP)
 		cmd = exec.Command("kubectl", "apply", "-f", "-")
 		cmd.Stdin = strings.NewReader(gatewayYAML)

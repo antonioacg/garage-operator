@@ -24,6 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
+	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
 
@@ -51,6 +52,7 @@ const (
 	testSecretValue        = "secret123"
 	testOperatorImage      = "registry.example.com/garage:v2.0.0"
 	testPortNameRPC        = "rpc"
+	teamLabelKey           = "team"
 )
 
 func TestResolveSecretConfig(t *testing.T) {
@@ -187,7 +189,7 @@ func TestBuildSecretData(t *testing.T) {
 		name            string
 		cfg             secretConfig
 		key             *garagev1beta1.GarageKey
-		cluster         *garagev1beta1.GarageCluster
+		cluster         *garagev1beta2.GarageCluster
 		secretAccessKey string
 		wantKeys        []string
 		wantValues      map[string]string
@@ -209,9 +211,9 @@ func TestBuildSecretData(t *testing.T) {
 					AccessKeyID: testAccessKeyID,
 				},
 			},
-			cluster: &garagev1beta1.GarageCluster{
-				Spec: garagev1beta1.GarageClusterSpec{
-					S3API: &garagev1beta1.S3APIConfig{
+			cluster: &garagev1beta2.GarageCluster{
+				Spec: garagev1beta2.GarageClusterSpec{
+					S3API: &garagev1beta2.S3APIConfig{
 						Region: "us-west-2",
 					},
 				},
@@ -242,7 +244,7 @@ func TestBuildSecretData(t *testing.T) {
 					AccessKeyID: testAccessKeyID,
 				},
 			},
-			cluster:         &garagev1beta1.GarageCluster{},
+			cluster:         &garagev1beta2.GarageCluster{},
 			secretAccessKey: testSecretValue,
 			wantKeys:        []string{"access-key-id", "secret-access-key"},
 		},
@@ -260,7 +262,7 @@ func TestBuildSecretData(t *testing.T) {
 					AccessKeyID: testAccessKeyID,
 				},
 			},
-			cluster:         &garagev1beta1.GarageCluster{},
+			cluster:         &garagev1beta2.GarageCluster{},
 			secretAccessKey: testSecretValue,
 			wantValues: map[string]string{
 				testRegionKey: defaultS3Region,
@@ -282,7 +284,7 @@ func TestBuildSecretData(t *testing.T) {
 					AccessKeyID: testAccessKeyID,
 				},
 			},
-			cluster:         &garagev1beta1.GarageCluster{},
+			cluster:         &garagev1beta2.GarageCluster{},
 			secretAccessKey: testSecretValue,
 			wantKeys:        []string{"access-key-id", "secret-access-key", "custom-key"},
 			wantValues: map[string]string{
@@ -442,14 +444,14 @@ func TestMergeNodeImage(t *testing.T) {
 func TestBuildContainerPorts(t *testing.T) {
 	tests := []struct {
 		name        string
-		cluster     *garagev1beta1.GarageCluster
+		cluster     *garagev1beta2.GarageCluster
 		wantMinPort int
 		wantPorts   []string
 	}{
 		{
 			name: "default ports",
-			cluster: &garagev1beta1.GarageCluster{
-				Spec: garagev1beta1.GarageClusterSpec{},
+			cluster: &garagev1beta2.GarageCluster{
+				Spec: garagev1beta2.GarageClusterSpec{},
 			},
 			wantMinPort: 3, // RPC, Admin, S3
 			wantPorts:   []string{testPortNameRPC, "s3", adminPortName},
@@ -457,17 +459,17 @@ func TestBuildContainerPorts(t *testing.T) {
 		// S3 API is always enabled - Garage requires the [s3_api] section
 		{
 			name: "with Admin API disabled",
-			cluster: &garagev1beta1.GarageCluster{
-				Spec: garagev1beta1.GarageClusterSpec{},
+			cluster: &garagev1beta2.GarageCluster{
+				Spec: garagev1beta2.GarageClusterSpec{},
 			},
 			wantMinPort: 2, // RPC, S3 only
 			wantPorts:   []string{testPortNameRPC, "s3"},
 		},
 		{
 			name: "custom RPC port",
-			cluster: &garagev1beta1.GarageCluster{
-				Spec: garagev1beta1.GarageClusterSpec{
-					Network: garagev1beta1.NetworkConfig{
+			cluster: &garagev1beta2.GarageCluster{
+				Spec: garagev1beta2.GarageClusterSpec{
+					Network: garagev1beta2.NetworkConfig{
 						RPCBindPort: 4901,
 					},
 				},
@@ -503,11 +505,11 @@ func TestBuildVolumeClaimTemplates(t *testing.T) {
 	dataSize := resource.MustParse("10Gi")
 
 	t.Run("storage cluster - default sizes", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Storage: garagev1beta1.StorageConfig{
-					Metadata: &garagev1beta1.VolumeConfig{},
-					Data:     &garagev1beta1.VolumeConfig{},
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{Replicas: 1,
+					Metadata: &garagev1beta2.VolumeConfig{},
+					Data:     &garagev1beta2.VolumeConfig{},
 				},
 			},
 		}
@@ -533,13 +535,13 @@ func TestBuildVolumeClaimTemplates(t *testing.T) {
 	})
 
 	t.Run("storage cluster - custom sizes and storage class", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Storage: garagev1beta1.StorageConfig{
-					Metadata: &garagev1beta1.VolumeConfig{
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{Replicas: 1,
+					Metadata: &garagev1beta2.VolumeConfig{
 						Size: ptrQuantity(resource.MustParse("1Gi")),
 					},
-					Data: &garagev1beta1.VolumeConfig{
+					Data: &garagev1beta2.VolumeConfig{
 						Size:             &dataSize,
 						StorageClassName: &storageClass,
 					},
@@ -564,49 +566,33 @@ func TestBuildVolumeClaimTemplates(t *testing.T) {
 		}
 	})
 
-	t.Run("gateway cluster - only metadata PVC (1Gi default)", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Gateway: true,
+	t.Run("gateway-only cluster - no PVCs (EmptyDir for both)", func(t *testing.T) {
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Gateway:   &garagev1beta2.GatewaySpec{Replicas: 1},
+				ConnectTo: &garagev1beta2.ConnectToConfig{ClusterRef: &garagev1beta2.ClusterReference{Name: "storage"}},
 			},
 		}
 		pvcs := buildVolumeClaimTemplates(cluster)
-		if len(pvcs) != 1 {
-			t.Errorf("gateway cluster: got %d PVCs, want 1 (metadata only)", len(pvcs))
-			return
-		}
-		if pvcs[0].Name != metadataVolumeName {
-			t.Errorf("PVC[0] name = %q, want %q", pvcs[0].Name, metadataVolumeName)
-		}
-		gotMetadataSize := pvcs[0].Spec.Resources.Requests[corev1.ResourceStorage]
-		if gotMetadataSize.String() != "1Gi" {
-			t.Errorf("Gateway metadata size = %q, want %q (default for gateway)", gotMetadataSize.String(), "1Gi")
+		if len(pvcs) != 0 {
+			t.Errorf("gateway-only cluster: got %d PVCs, want 0 (gateway tier uses EmptyDir)", len(pvcs))
 		}
 	})
 
-	t.Run("gateway cluster - custom metadata size", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Gateway: true,
-				Storage: garagev1beta1.StorageConfig{
-					Metadata: &garagev1beta1.VolumeConfig{
-						Size:             ptrQuantity(resource.MustParse("2Gi")),
-						StorageClassName: &storageClass,
-					},
+	t.Run("unified cluster (storage + gateway) - only storage PVCs", func(t *testing.T) {
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{
+					Replicas: 1,
+					Metadata: &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("2Gi"))},
+					Data:     &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("50Gi"))},
 				},
+				Gateway: &garagev1beta2.GatewaySpec{Replicas: 1},
 			},
 		}
 		pvcs := buildVolumeClaimTemplates(cluster)
-		if len(pvcs) != 1 {
-			t.Errorf("gateway cluster: got %d PVCs, want 1", len(pvcs))
-			return
-		}
-		gotMetadataSize := pvcs[0].Spec.Resources.Requests[corev1.ResourceStorage]
-		if gotMetadataSize.String() != "2Gi" {
-			t.Errorf("Gateway metadata size = %q, want %q", gotMetadataSize.String(), "2Gi")
-		}
-		if pvcs[0].Spec.StorageClassName == nil || *pvcs[0].Spec.StorageClassName != storageClass {
-			t.Errorf("Gateway metadata StorageClassName = %v, want %q", pvcs[0].Spec.StorageClassName, storageClass)
+		if len(pvcs) != 2 {
+			t.Errorf("unified cluster: got %d PVCs, want 2 (gateway never gets PVCs)", len(pvcs))
 		}
 	})
 }
@@ -617,10 +603,10 @@ func TestBuildDataPVC_PathVolumeConfig(t *testing.T) {
 	fastSC := testStorageClass
 
 	t.Run("storageClassName set on data volume directly", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Storage: garagev1beta1.StorageConfig{
-					Data: &garagev1beta1.VolumeConfig{
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{Replicas: 1,
+					Data: &garagev1beta2.VolumeConfig{
 						Size:             ptrQuantity(resource.MustParse("100Gi")),
 						StorageClassName: &encryptedSC,
 					},
@@ -634,15 +620,15 @@ func TestBuildDataPVC_PathVolumeConfig(t *testing.T) {
 	})
 
 	t.Run("top-level storageClassName takes precedence over paths", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Storage: garagev1beta1.StorageConfig{
-					Data: &garagev1beta1.VolumeConfig{
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{Replicas: 1,
+					Data: &garagev1beta2.VolumeConfig{
 						StorageClassName: &fastSC,
-						Paths: []garagev1beta1.DataPath{
+						Paths: []garagev1beta2.DataPath{
 							{
 								Path: dataPath,
-								Volume: &garagev1beta1.DataPathVolumeConfig{
+								Volume: &garagev1beta2.DataPathVolumeConfig{
 									StorageClassName: &encryptedSC,
 								},
 							},
@@ -658,10 +644,10 @@ func TestBuildDataPVC_PathVolumeConfig(t *testing.T) {
 	})
 
 	t.Run("accessModes set on data volume directly", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Storage: garagev1beta1.StorageConfig{
-					Data: &garagev1beta1.VolumeConfig{
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{Replicas: 1,
+					Data: &garagev1beta2.VolumeConfig{
 						AccessModes: []corev1.PersistentVolumeAccessMode{
 							corev1.ReadWriteMany,
 						},
@@ -676,10 +662,10 @@ func TestBuildDataPVC_PathVolumeConfig(t *testing.T) {
 	})
 
 	t.Run("selector set on data volume directly", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Storage: garagev1beta1.StorageConfig{
-					Data: &garagev1beta1.VolumeConfig{
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{Replicas: 1,
+					Data: &garagev1beta2.VolumeConfig{
 						Selector: &metav1.LabelSelector{
 							MatchLabels: map[string]string{"tier": fastTier},
 						},
@@ -697,10 +683,10 @@ func TestBuildDataPVC_PathVolumeConfig(t *testing.T) {
 	})
 
 	t.Run("no paths - defaults unchanged", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Storage: garagev1beta1.StorageConfig{
-					Data: &garagev1beta1.VolumeConfig{},
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{Replicas: 1,
+					Data: &garagev1beta2.VolumeConfig{},
 				},
 			},
 		}
@@ -717,11 +703,11 @@ func TestBuildDataPVC_PathVolumeConfig(t *testing.T) {
 	})
 
 	t.Run("paths with no volume config - defaults unchanged", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Storage: garagev1beta1.StorageConfig{
-					Data: &garagev1beta1.VolumeConfig{
-						Paths: []garagev1beta1.DataPath{
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{Replicas: 1,
+					Data: &garagev1beta2.VolumeConfig{
+						Paths: []garagev1beta2.DataPath{
 							{Path: dataPath, Capacity: ptrQuantity(resource.MustParse("50Gi"))},
 						},
 					},
@@ -738,12 +724,12 @@ func TestBuildDataPVC_PathVolumeConfig(t *testing.T) {
 	})
 
 	t.Run("top-level storageClassName used when paths present but no volume-level override", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Storage: garagev1beta1.StorageConfig{
-					Data: &garagev1beta1.VolumeConfig{
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{Replicas: 1,
+					Data: &garagev1beta2.VolumeConfig{
 						StorageClassName: &encryptedSC,
-						Paths: []garagev1beta1.DataPath{
+						Paths: []garagev1beta2.DataPath{
 							{Path: "/data/a", Capacity: ptrQuantity(resource.MustParse("50Gi"))},
 							{Path: "/data/b", Capacity: ptrQuantity(resource.MustParse("50Gi"))},
 						},
@@ -758,15 +744,15 @@ func TestBuildDataPVC_PathVolumeConfig(t *testing.T) {
 	})
 
 	t.Run("paths[].volume.storageClassName applied when top-level unset (issue #162)", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Storage: garagev1beta1.StorageConfig{
-					Data: &garagev1beta1.VolumeConfig{
-						Paths: []garagev1beta1.DataPath{
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{Replicas: 1,
+					Data: &garagev1beta2.VolumeConfig{
+						Paths: []garagev1beta2.DataPath{
 							{
 								Path:     dataPath,
 								Capacity: ptrQuantity(resource.MustParse("50Gi")),
-								Volume: &garagev1beta1.DataPathVolumeConfig{
+								Volume: &garagev1beta2.DataPathVolumeConfig{
 									StorageClassName: &encryptedSC,
 								},
 							},
@@ -782,14 +768,14 @@ func TestBuildDataPVC_PathVolumeConfig(t *testing.T) {
 	})
 
 	t.Run("paths[].volume.accessModes applied when top-level unset", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Storage: garagev1beta1.StorageConfig{
-					Data: &garagev1beta1.VolumeConfig{
-						Paths: []garagev1beta1.DataPath{
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{Replicas: 1,
+					Data: &garagev1beta2.VolumeConfig{
+						Paths: []garagev1beta2.DataPath{
 							{
 								Path: dataPath,
-								Volume: &garagev1beta1.DataPathVolumeConfig{
+								Volume: &garagev1beta2.DataPathVolumeConfig{
 									AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
 								},
 							},
@@ -805,14 +791,14 @@ func TestBuildDataPVC_PathVolumeConfig(t *testing.T) {
 	})
 
 	t.Run("paths[].volume.selector applied when top-level unset", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Storage: garagev1beta1.StorageConfig{
-					Data: &garagev1beta1.VolumeConfig{
-						Paths: []garagev1beta1.DataPath{
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{Replicas: 1,
+					Data: &garagev1beta2.VolumeConfig{
+						Paths: []garagev1beta2.DataPath{
 							{
 								Path: dataPath,
-								Volume: &garagev1beta1.DataPathVolumeConfig{
+								Volume: &garagev1beta2.DataPathVolumeConfig{
 									Selector: &metav1.LabelSelector{
 										MatchLabels: map[string]string{"tier": fastTier},
 									},
@@ -830,14 +816,14 @@ func TestBuildDataPVC_PathVolumeConfig(t *testing.T) {
 	})
 
 	t.Run("paths[].volume.size applied when top-level size unset", func(t *testing.T) {
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Storage: garagev1beta1.StorageConfig{
-					Data: &garagev1beta1.VolumeConfig{
-						Paths: []garagev1beta1.DataPath{
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{Replicas: 1,
+					Data: &garagev1beta2.VolumeConfig{
+						Paths: []garagev1beta2.DataPath{
 							{
 								Path: dataPath,
-								Volume: &garagev1beta1.DataPathVolumeConfig{
+								Volume: &garagev1beta2.DataPathVolumeConfig{
 									Size: ptrQuantity(resource.MustParse("250Gi")),
 								},
 							},
@@ -855,21 +841,21 @@ func TestBuildDataPVC_PathVolumeConfig(t *testing.T) {
 
 	t.Run("first path with volume wins when multiple paths present", func(t *testing.T) {
 		other := "other-sc"
-		cluster := &garagev1beta1.GarageCluster{
-			Spec: garagev1beta1.GarageClusterSpec{
-				Storage: garagev1beta1.StorageConfig{
-					Data: &garagev1beta1.VolumeConfig{
-						Paths: []garagev1beta1.DataPath{
+		cluster := &garagev1beta2.GarageCluster{
+			Spec: garagev1beta2.GarageClusterSpec{
+				Storage: &garagev1beta2.StorageSpec{Replicas: 1,
+					Data: &garagev1beta2.VolumeConfig{
+						Paths: []garagev1beta2.DataPath{
 							{Path: "/data/a", Capacity: ptrQuantity(resource.MustParse("50Gi"))},
 							{
 								Path: "/data/b",
-								Volume: &garagev1beta1.DataPathVolumeConfig{
+								Volume: &garagev1beta2.DataPathVolumeConfig{
 									StorageClassName: &encryptedSC,
 								},
 							},
 							{
 								Path: "/data/c",
-								Volume: &garagev1beta1.DataPathVolumeConfig{
+								Volume: &garagev1beta2.DataPathVolumeConfig{
 									StorageClassName: &other,
 								},
 							},
@@ -1042,17 +1028,17 @@ func boolPtr(b bool) *bool {
 func TestEffectiveWebAPI(t *testing.T) {
 	tests := []struct {
 		name               string
-		cluster            *garagev1beta1.GarageCluster
+		cluster            *garagev1beta2.GarageCluster
 		expectNonNil       bool
 		expectedRootDomain string
 		wantURL            string
 	}{
 		{
 			name: "returns_config_when_WebAPI_enabled_is_true",
-			cluster: &garagev1beta1.GarageCluster{
+			cluster: &garagev1beta2.GarageCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: defaultS3Region, Namespace: testNamespace},
-				Spec: garagev1beta1.GarageClusterSpec{
-					WebAPI: &garagev1beta1.WebAPIConfig{Enabled: boolPtr(true), RootDomain: ".test.svc"},
+				Spec: garagev1beta2.GarageClusterSpec{
+					WebAPI: &garagev1beta2.WebAPIConfig{Enabled: boolPtr(true), RootDomain: ".test.svc"},
 				},
 			},
 			expectNonNil:       true,
@@ -1061,20 +1047,20 @@ func TestEffectiveWebAPI(t *testing.T) {
 		},
 		{
 			name: "returns nil when web API disabled",
-			cluster: &garagev1beta1.GarageCluster{
+			cluster: &garagev1beta2.GarageCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: defaultS3Region, Namespace: testNamespace},
-				Spec: garagev1beta1.GarageClusterSpec{
-					WebAPI: &garagev1beta1.WebAPIConfig{Enabled: boolPtr(false)},
+				Spec: garagev1beta2.GarageClusterSpec{
+					WebAPI: &garagev1beta2.WebAPIConfig{Enabled: boolPtr(false)},
 				},
 			},
 			expectNonNil: false,
 		},
 		{
 			name: "uses custom rootDomain when set",
-			cluster: &garagev1beta1.GarageCluster{
+			cluster: &garagev1beta2.GarageCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: defaultS3Region, Namespace: testNamespace},
-				Spec: garagev1beta1.GarageClusterSpec{
-					WebAPI: &garagev1beta1.WebAPIConfig{RootDomain: ".web.example.com"},
+				Spec: garagev1beta2.GarageClusterSpec{
+					WebAPI: &garagev1beta2.WebAPIConfig{RootDomain: ".web.example.com"},
 				},
 			},
 			expectNonNil:       true,
@@ -1083,10 +1069,10 @@ func TestEffectiveWebAPI(t *testing.T) {
 		},
 		{
 			name: "explicit Disabled: false with custom domain",
-			cluster: &garagev1beta1.GarageCluster{
+			cluster: &garagev1beta2.GarageCluster{
 				ObjectMeta: metav1.ObjectMeta{Name: "mygarage", Namespace: "myns"},
-				Spec: garagev1beta1.GarageClusterSpec{
-					WebAPI: &garagev1beta1.WebAPIConfig{
+				Spec: garagev1beta2.GarageClusterSpec{
+					WebAPI: &garagev1beta2.WebAPIConfig{
 						RootDomain: ".custom.local",
 					},
 				},
@@ -1178,4 +1164,170 @@ func TestMergeLabels(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestBuildNodeTags_TierTag verifies the tier:<tier> tag is emitted when a
+// non-empty tier is provided. reconcileGatewayTombstones depends on this tag
+// to distinguish gateway-tier layout entries (whose Ed25519 identity rotates
+// per pod restart) from storage-tier entries (whose identity is pinned to a
+// metadata PVC).
+func TestBuildNodeTags_TierTag(t *testing.T) {
+	tests := []struct {
+		name      string
+		tier      string
+		wantTier  bool
+		wantValue string
+	}{
+		{name: "gateway tier emits tier:gateway", tier: tierGateway, wantTier: true, wantValue: "tier:" + tierGateway},
+		{name: "storage tier emits tier:storage", tier: tierStorage, wantTier: true, wantValue: "tier:" + tierStorage},
+		{name: "empty tier omits tier tag", tier: "", wantTier: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tags := buildNodeTags("my-cluster", "my-ns", tt.tier, nil, "pod-0")
+			gotTier := false
+			for _, tag := range tags {
+				if tag == tt.wantValue {
+					gotTier = true
+				}
+				if len(tag) > 5 && tag[:5] == "tier:" {
+					if !tt.wantTier {
+						t.Errorf("unexpected tier tag %q in %v", tag, tags)
+					}
+				}
+			}
+			if tt.wantTier && !gotTier {
+				t.Errorf("missing tier tag %q in %v", tt.wantValue, tags)
+			}
+			// Always expect the ownership tag.
+			ownership := "cluster:my-cluster/my-ns"
+			gotOwnership := false
+			for _, tag := range tags {
+				if tag == ownership {
+					gotOwnership = true
+				}
+			}
+			if !gotOwnership {
+				t.Errorf("missing ownership tag %q in %v", ownership, tags)
+			}
+		})
+	}
+}
+
+func TestCountTotalNodesAfterApply(t *testing.T) {
+	role := func(id string) garage.LayoutNodeRole { return garage.LayoutNodeRole{ID: id, Zone: "z"} }
+	add := func(id string) garage.NodeRoleChange { return garage.NodeRoleChange{ID: id, Zone: "z"} }
+	remove := func(id string) garage.NodeRoleChange { return garage.NodeRoleChange{ID: id, Remove: true} }
+
+	tests := []struct {
+		name   string
+		layout garage.ClusterLayout
+		want   int
+	}{
+		{
+			name: "three real roles, three stale removes (issue #171)",
+			layout: garage.ClusterLayout{
+				Roles:             []garage.LayoutNodeRole{role("a"), role("b"), role("c")},
+				StagedRoleChanges: []garage.NodeRoleChange{remove("stale1"), remove("stale2"), remove("stale3")},
+			},
+			want: 3,
+		},
+		{
+			name: "three real roles, one real remove",
+			layout: garage.ClusterLayout{
+				Roles:             []garage.LayoutNodeRole{role("a"), role("b"), role("c")},
+				StagedRoleChanges: []garage.NodeRoleChange{remove("a")},
+			},
+			want: 2,
+		},
+		{
+			name: "zero roles, three adds",
+			layout: garage.ClusterLayout{
+				Roles:             nil,
+				StagedRoleChanges: []garage.NodeRoleChange{add("a"), add("b"), add("c")},
+			},
+			want: 3,
+		},
+		{
+			name: "three roles, one add matching existing (drift fix)",
+			layout: garage.ClusterLayout{
+				Roles:             []garage.LayoutNodeRole{role("a"), role("b"), role("c")},
+				StagedRoleChanges: []garage.NodeRoleChange{add("a")},
+			},
+			want: 3,
+		},
+		{
+			name: "mixed: 2 real roles, 1 real remove, 1 stale remove, 1 new add",
+			layout: garage.ClusterLayout{
+				Roles:             []garage.LayoutNodeRole{role("a"), role("b")},
+				StagedRoleChanges: []garage.NodeRoleChange{remove("a"), remove("ghost"), add("c")},
+			},
+			want: 2, // 2 - 1 (real) + 1 (new) = 2
+		},
+		{
+			name:   "empty layout",
+			layout: garage.ClusterLayout{},
+			want:   0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := countTotalNodesAfterApply(&tt.layout); got != tt.want {
+				t.Errorf("countTotalNodesAfterApply() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestComputePodSpecHash(t *testing.T) {
+	spec := corev1.PodSpec{
+		Containers: []corev1.Container{{Name: "garage", Image: "dxflrs/garage:v2.3.0"}},
+	}
+
+	baseHash := computePodSpecHash(spec, nil, nil)
+
+	t.Run("same input is deterministic across calls", func(t *testing.T) {
+		for i := 0; i < 5; i++ {
+			if got := computePodSpecHash(spec, nil, nil); got != baseHash {
+				t.Errorf("non-deterministic hash: iter %d got %q, want %q", i, got, baseHash)
+			}
+		}
+	})
+
+	t.Run("different podAnnotations produce different hash", func(t *testing.T) {
+		h := computePodSpecHash(spec, map[string]string{teamLabelKey: "platform"}, nil)
+		if h == baseHash {
+			t.Errorf("expected different hash when annotations added, got same %q", h)
+		}
+	})
+
+	t.Run("different podLabels produce different hash", func(t *testing.T) {
+		h := computePodSpecHash(spec, nil, map[string]string{"role": "hot"})
+		if h == baseHash {
+			t.Errorf("expected different hash when labels added, got same %q", h)
+		}
+	})
+
+	t.Run("same annotations produce same hash (map ordering)", func(t *testing.T) {
+		a := map[string]string{"a": "1", "b": "2", "c": "3"}
+		b := map[string]string{"c": "3", "a": "1", "b": "2"}
+		if computePodSpecHash(spec, a, nil) != computePodSpecHash(spec, b, nil) {
+			t.Errorf("expected same hash for equivalent annotation maps")
+		}
+	})
+
+	t.Run("annotation value change produces different hash", func(t *testing.T) {
+		a := computePodSpecHash(spec, map[string]string{teamLabelKey: "platform"}, nil)
+		b := computePodSpecHash(spec, map[string]string{teamLabelKey: "infra"}, nil)
+		if a == b {
+			t.Errorf("expected different hashes for different annotation values")
+		}
+	})
+
+	t.Run("hash is 16 hex chars", func(t *testing.T) {
+		if len(baseHash) != 16 {
+			t.Errorf("hash length = %d, want 16", len(baseHash))
+		}
+	})
 }
