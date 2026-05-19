@@ -1026,6 +1026,7 @@ test_operator_restart() {
     # Restart operator
     kubectl rollout restart deployment/garage-operator -n "$NAMESPACE"
     kubectl rollout status deployment/garage-operator -n "$NAMESPACE" --timeout=60s
+    NAMESPACE="$NAMESPACE" "$ROOT_DIR/hack/wait-for-operator-webhook.sh"
 
     # Wait for cluster to become healthy (operator reconciles after restart)
     # This may take longer if the cluster was recovering from a previous test
