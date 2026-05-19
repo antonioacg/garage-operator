@@ -561,15 +561,13 @@ func buildGaragePodSpec(
 		container.SecurityContext = cfg.ContainerSecurityContext
 	}
 
-	// Readiness probe on the gateway tier only. Garage's /health endpoint is
-	// @special (no auth) and returns 200 when status is Healthy or Degraded
-	// (i.e. the pod has joined and at least one quorum-capable peer is
-	// reachable). Without this, gateway pods land in the tier-scoped API
-	// Service the moment the container is Running — before Garage has bound
-	// :3900 — and surge pods during a rollout serve connection-refused for
-	// the first ~1–3 seconds. Storage pods intentionally don't get a probe
-	// here: the headless RPC Service sets PublishNotReadyAddresses=true to
-	// keep federation bootstrap working before any peer is reachable.
+	// Readiness probe on the gateway tier only. The gateway Service should not
+	// receive S3 traffic until Garage has bound :3900, but readiness must not
+	// depend on cluster health: edge gateways need to be routable before
+	// bidirectional RPC connectivity can converge. Storage pods intentionally
+	// don't get a probe here: the headless RPC Service sets
+	// PublishNotReadyAddresses=true to keep federation bootstrap working before
+	// any peer is reachable.
 	//
 	// preStop is intentionally absent: the upstream `dxflrs/garage` image is
 	// distroless (no `sh`, no `sleep`), so an exec preStop can't delay
@@ -581,9 +579,8 @@ func buildGaragePodSpec(
 	if cfg.IsGateway {
 		container.ReadinessProbe = &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
-				HTTPGet: &corev1.HTTPGetAction{
-					Path: "/health",
-					Port: intstr.FromString(adminPortName),
+				TCPSocket: &corev1.TCPSocketAction{
+					Port: intstr.FromString(s3PortName),
 				},
 			},
 			InitialDelaySeconds: 2,

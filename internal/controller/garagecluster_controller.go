@@ -1290,7 +1290,7 @@ func apiServicePorts(cluster *garagev1beta2.GarageCluster) []corev1.ServicePort 
 		s3Port = cluster.Spec.S3API.BindPort
 	}
 	ports = append(ports, corev1.ServicePort{
-		Name:       "s3",
+		Name:       s3PortName,
 		Port:       s3Port,
 		TargetPort: intstr.FromInt32(s3Port),
 		Protocol:   corev1.ProtocolTCP,
@@ -1716,7 +1716,7 @@ func buildContainerPorts(cluster *garagev1beta2.GarageCluster) []corev1.Containe
 	if cluster.Spec.S3API != nil && cluster.Spec.S3API.BindPort != 0 {
 		s3Port = cluster.Spec.S3API.BindPort
 	}
-	ports = append(ports, corev1.ContainerPort{Name: "s3", ContainerPort: s3Port})
+	ports = append(ports, corev1.ContainerPort{Name: s3PortName, ContainerPort: s3Port})
 
 	{
 		adminPort := int32(3903)
