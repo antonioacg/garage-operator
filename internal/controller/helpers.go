@@ -33,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -558,6 +559,35 @@ func buildGaragePodSpec(
 	}
 	if cfg.ContainerSecurityContext != nil {
 		container.SecurityContext = cfg.ContainerSecurityContext
+	}
+
+	// Readiness probe on the gateway tier only. The gateway Service should not
+	// receive S3 traffic until Garage has bound :3900, but readiness must not
+	// depend on cluster health: edge gateways need to be routable before
+	// bidirectional RPC connectivity can converge. Storage pods intentionally
+	// don't get a probe here: the headless RPC Service sets
+	// PublishNotReadyAddresses=true to keep federation bootstrap working before
+	// any peer is reachable.
+	//
+	// preStop is intentionally absent: the upstream `dxflrs/garage` image is
+	// distroless (no `sh`, no `sleep`), so an exec preStop can't delay
+	// SIGTERM. The default terminationGracePeriodSeconds of 30 is acceptable
+	// for typical rollouts; in-flight requests on a terminating gateway pod
+	// can still see RSTs if endpoint-slice propagation lags SIGTERM, but
+	// that's a documented edge case requiring a non-distroless base image
+	// to fix properly.
+	if cfg.IsGateway {
+		container.ReadinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{
+					Port: intstr.FromString(s3PortName),
+				},
+			},
+			InitialDelaySeconds: 2,
+			PeriodSeconds:       5,
+			TimeoutSeconds:      3,
+			FailureThreshold:    6,
+		}
 	}
 
 	podSpec := corev1.PodSpec{

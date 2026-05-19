@@ -19,6 +19,7 @@ import (
 
 const (
 	adminPortName   = "admin"
+	s3PortName      = "s3"
 	metricsPath     = "/metrics"
 	metricsTokenKey = "metrics-token"
 	labelCluster    = "garage.rajsingh.info/cluster"
