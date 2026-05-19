@@ -827,7 +827,7 @@ func TestGarageCluster_RPCTimeout_DurationField(t *testing.T) {
 func TestGarageCluster_ZoneRedundancy_AtLeast_RequiresMinZones(t *testing.T) {
 	cluster := &GarageCluster{
 		Spec: GarageClusterSpec{
-			Replication: &ReplicationConfig{Factor: 3, ZoneRedundancyMode: "AtLeast"},
+			Replication: &ReplicationConfig{Factor: 3, ZoneRedundancyMode: zoneRedundancyAtLeast},
 			// ZoneRedundancyMinZones intentionally absent
 		},
 	}
@@ -843,7 +843,7 @@ func TestGarageCluster_ZoneRedundancy_AtLeast_CannotExceedFactor(t *testing.T) {
 		Spec: GarageClusterSpec{
 			Replication: &ReplicationConfig{
 				Factor:                 3,
-				ZoneRedundancyMode:     "AtLeast",
+				ZoneRedundancyMode:     zoneRedundancyAtLeast,
 				ZoneRedundancyMinZones: &minZones,
 			},
 		},
