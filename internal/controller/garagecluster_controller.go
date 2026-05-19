@@ -148,9 +148,23 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return r.updateStatus(ctx, cluster, PhaseFailed, err)
 	}
 
-	// Create or update API Service
+	// Create or update API Service (primary <cr>, scoped to storage tier when
+	// present, else to the gateway tier for edge-gateway clusters)
 	if err := r.reconcileAPIService(ctx, cluster); err != nil {
 		return r.updateStatus(ctx, cluster, PhaseFailed, err)
+	}
+
+	// Per-tier gateway Service is created only for unified clusters (both
+	// storage + gateway). Without a storage tier the primary <cr> already
+	// targets the gateway pods, so a sibling Service would be redundant.
+	if cluster.HasStorageTier() && cluster.HasGatewayTier() {
+		if err := r.reconcileGatewayAPIService(ctx, cluster); err != nil {
+			return r.updateStatus(ctx, cluster, PhaseFailed, err)
+		}
+	} else {
+		if err := r.deleteGatewayAPIService(ctx, cluster); err != nil {
+			return r.updateStatus(ctx, cluster, PhaseFailed, err)
+		}
 	}
 
 	// Create, update, or delete the dedicated external RPC service for publicEndpoint
@@ -271,15 +285,17 @@ func (r *GarageClusterReconciler) finalize(ctx context.Context, cluster *garagev
 		return err
 	}
 
-	// Delete API Service
-	apiSvc := &corev1.Service{}
-	if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, apiSvc); err == nil {
-		log.Info("Deleting API Service", "name", apiSvc.Name)
-		if err := r.Delete(ctx, apiSvc); err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete API Service: %w", err)
+	// Delete API Services (primary + per-tier gateway sibling)
+	for _, svcName := range []string{cluster.Name, cluster.Name + "-gateway"} {
+		apiSvc := &corev1.Service{}
+		if err := r.Get(ctx, types.NamespacedName{Name: svcName, Namespace: cluster.Namespace}, apiSvc); err == nil {
+			log.Info("Deleting API Service", "name", apiSvc.Name)
+			if err := r.Delete(ctx, apiSvc); err != nil && !errors.IsNotFound(err) {
+				return fmt.Errorf("failed to delete API Service: %w", err)
+			}
+		} else if !errors.IsNotFound(err) {
+			return err
 		}
-	} else if !errors.IsNotFound(err) {
-		return err
 	}
 
 	// Delete Headless Service
@@ -1262,11 +1278,11 @@ func (r *GarageClusterReconciler) reconcileHeadlessService(ctx context.Context, 
 	return reconcileService(ctx, r.Client, svc, cluster, r.Scheme)
 }
 
-func (r *GarageClusterReconciler) reconcileAPIService(ctx context.Context, cluster *garagev1beta2.GarageCluster) error {
-	log := logf.FromContext(ctx)
-	serviceName := cluster.Name
-
-	ports := []corev1.ServicePort{}
+// apiServicePorts returns the S3 / Admin / K2V / Web ServicePort set shared by
+// both the primary (<cr>) and gateway (<cr>-gateway) in-cluster API Services.
+// The port set is identical across tiers — only the selector differs.
+func apiServicePorts(cluster *garagev1beta2.GarageCluster) []corev1.ServicePort {
+	ports := make([]corev1.ServicePort, 0, 4)
 
 	// S3 API port (always enabled - Garage requires the [s3_api] section)
 	s3Port := int32(3900)
@@ -1281,20 +1297,18 @@ func (r *GarageClusterReconciler) reconcileAPIService(ctx context.Context, clust
 	})
 
 	// Admin API port
-	{
-		adminPort := int32(3903)
-		if cluster.Spec.Admin != nil && cluster.Spec.Admin.BindPort != 0 {
-			adminPort = cluster.Spec.Admin.BindPort
-		}
-		ports = append(ports, corev1.ServicePort{
-			Name:       adminPortName,
-			Port:       adminPort,
-			TargetPort: intstr.FromInt32(adminPort),
-			Protocol:   corev1.ProtocolTCP,
-		})
+	adminPort := int32(3903)
+	if cluster.Spec.Admin != nil && cluster.Spec.Admin.BindPort != 0 {
+		adminPort = cluster.Spec.Admin.BindPort
 	}
+	ports = append(ports, corev1.ServicePort{
+		Name:       adminPortName,
+		Port:       adminPort,
+		TargetPort: intstr.FromInt32(adminPort),
+		Protocol:   corev1.ProtocolTCP,
+	})
 
-	// K2V API port
+	// K2V API port (only when enabled)
 	if cluster.Spec.K2VAPI != nil {
 		k2vPort := int32(3904)
 		if cluster.Spec.K2VAPI.BindPort != 0 {
@@ -1308,7 +1322,7 @@ func (r *GarageClusterReconciler) reconcileAPIService(ctx context.Context, clust
 		})
 	}
 
-	// Web API port
+	// Web API port (when not explicitly disabled)
 	if w := effectiveWebAPI(cluster); w != nil {
 		webPort := int32(3902)
 		if w.BindPort != 0 {
@@ -1320,6 +1334,42 @@ func (r *GarageClusterReconciler) reconcileAPIService(ctx context.Context, clust
 			TargetPort: intstr.FromInt32(webPort),
 			Protocol:   corev1.ProtocolTCP,
 		})
+	}
+
+	return ports
+}
+
+// apiServiceSelector returns the pod-selector used by the in-cluster API
+// Service for the given cluster shape.
+//
+//   - Manual layout: GarageNode pods don't carry the unified instance label, so
+//     the historical Manual selector ({labelCluster: cluster.Name}) is preserved
+//     — a tier filter would silently match zero pods.
+//   - Otherwise: scope to the requested tier (storage or gateway). The bare
+//     "instance" selector matches both StatefulSet and Deployment pods and
+//     would round-robin in-cluster admin/S3 traffic across mixed tiers; the
+//     tier label removes that ambiguity.
+func (r *GarageClusterReconciler) apiServiceSelector(cluster *garagev1beta2.GarageCluster, tier string) map[string]string {
+	if cluster.Spec.LayoutPolicy == LayoutPolicyManual {
+		return r.selectorLabelsForCluster(cluster)
+	}
+	return r.selectorLabelsForTier(cluster, tier)
+}
+
+// reconcileAPIService reconciles the primary in-cluster API Service (<cr>).
+//
+// Selector targets the storage tier when one is declared, otherwise the gateway
+// tier (edge-gateway clusters). The gateway-tier Deployment gets its own
+// dedicated Service via reconcileGatewayAPIService.
+func (r *GarageClusterReconciler) reconcileAPIService(ctx context.Context, cluster *garagev1beta2.GarageCluster) error {
+	log := logf.FromContext(ctx)
+	serviceName := cluster.Name
+
+	// Primary Service prefers the storage tier; falls back to gateway for
+	// edge-gateway clusters (no local storage).
+	primaryTier := tierStorage
+	if !cluster.HasStorageTier() {
+		primaryTier = tierGateway
 	}
 
 	serviceType := corev1.ServiceTypeClusterIP
@@ -1341,16 +1391,61 @@ func (r *GarageClusterReconciler) reconcileAPIService(ctx context.Context, clust
 		},
 		Spec: corev1.ServiceSpec{
 			Type:     serviceType,
-			Selector: r.selectorLabelsForCluster(cluster),
-			Ports:    ports,
+			Selector: r.apiServiceSelector(cluster, primaryTier),
+			Ports:    apiServicePorts(cluster),
 			// Enable routing to pods even when not ready, essential for multi-cluster
 			// federation during bootstrap when pods are waiting for the cluster to be healthy
 			PublishNotReadyAddresses: true,
 		},
 	}
 
-	log.Info("Reconciling API Service", "name", serviceName)
+	log.Info("Reconciling API Service", "name", serviceName, "tier", primaryTier)
 	return reconcileService(ctx, r.Client, svc, cluster, r.Scheme)
+}
+
+// reconcileGatewayAPIService reconciles a tier-scoped <cr>-gateway Service so
+// in-cluster clients (operator's bucket/key controllers, WebUI, …) can target
+// either tier explicitly. Created only when the cluster has both a storage tier
+// AND a gateway tier — i.e. a unified cluster. For storage-only and
+// edge-gateway shapes the primary <cr> Service already points at the correct
+// (only) tier and a sibling gateway Service would be redundant.
+func (r *GarageClusterReconciler) reconcileGatewayAPIService(ctx context.Context, cluster *garagev1beta2.GarageCluster) error {
+	log := logf.FromContext(ctx)
+	serviceName := cluster.Name + "-gateway"
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceName,
+			Namespace: cluster.Namespace,
+			Labels:    r.labelsForTier(cluster, tierGateway),
+		},
+		Spec: corev1.ServiceSpec{
+			Type:                     corev1.ServiceTypeClusterIP,
+			Selector:                 r.selectorLabelsForTier(cluster, tierGateway),
+			Ports:                    apiServicePorts(cluster),
+			PublishNotReadyAddresses: true,
+		},
+	}
+
+	log.Info("Reconciling gateway API Service", "name", serviceName)
+	return reconcileService(ctx, r.Client, svc, cluster, r.Scheme)
+}
+
+// deleteGatewayAPIService removes the <cr>-gateway Service when the gateway
+// tier is no longer declared (e.g. user removed spec.gateway from a unified
+// CR, or the cluster never had a gateway tier).
+func (r *GarageClusterReconciler) deleteGatewayAPIService(ctx context.Context, cluster *garagev1beta2.GarageCluster) error {
+	log := logf.FromContext(ctx)
+	name := cluster.Name + "-gateway"
+	existing := &corev1.Service{}
+	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: cluster.Namespace}, existing); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	log.Info("Removing gateway API Service (gateway tier no longer declared)", "name", name)
+	return r.Delete(ctx, existing)
 }
 
 // reconcilePublicEndpointService manages a dedicated RPC service (<name>-rpc) used to expose
