@@ -190,6 +190,19 @@ var _ = Describe("GarageCluster Controller", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-gateway", Namespace: testNamespace}, deploy)).To(Succeed())
 			Expect(deploy.Spec.Replicas).NotTo(BeNil())
 			Expect(*deploy.Spec.Replicas).To(Equal(int32(0)))
+
+			// Gateway pods must carry a readiness probe — they're behind the
+			// tier-scoped <cr>-gateway Service whose PublishNotReadyAddresses
+			// is false, so the probe is what keeps surge pods out of the
+			// endpoint slice until Garage has bound :3900 and joined the
+			// cluster (preventing connection-refused on the first S3
+			// request after a rollout).
+			Expect(deploy.Spec.Template.Spec.Containers).To(HaveLen(1))
+			probe := deploy.Spec.Template.Spec.Containers[0].ReadinessProbe
+			Expect(probe).NotTo(BeNil(), "gateway pod must have a readiness probe")
+			Expect(probe.HTTPGet).NotTo(BeNil())
+			Expect(probe.HTTPGet.Path).To(Equal("/health"))
+			Expect(probe.HTTPGet.Port.StrVal).To(Equal(adminPortName))
 		})
 
 		It("should publish the GarageNode selector in Manual layout mode status", func() {

@@ -33,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -558,6 +559,38 @@ func buildGaragePodSpec(
 	}
 	if cfg.ContainerSecurityContext != nil {
 		container.SecurityContext = cfg.ContainerSecurityContext
+	}
+
+	// Readiness probe on the gateway tier only. Garage's /health endpoint is
+	// @special (no auth) and returns 200 when status is Healthy or Degraded
+	// (i.e. the pod has joined and at least one quorum-capable peer is
+	// reachable). Without this, gateway pods land in the tier-scoped API
+	// Service the moment the container is Running — before Garage has bound
+	// :3900 — and surge pods during a rollout serve connection-refused for
+	// the first ~1–3 seconds. Storage pods intentionally don't get a probe
+	// here: the headless RPC Service sets PublishNotReadyAddresses=true to
+	// keep federation bootstrap working before any peer is reachable.
+	//
+	// preStop is intentionally absent: the upstream `dxflrs/garage` image is
+	// distroless (no `sh`, no `sleep`), so an exec preStop can't delay
+	// SIGTERM. The default terminationGracePeriodSeconds of 30 is acceptable
+	// for typical rollouts; in-flight requests on a terminating gateway pod
+	// can still see RSTs if endpoint-slice propagation lags SIGTERM, but
+	// that's a documented edge case requiring a non-distroless base image
+	// to fix properly.
+	if cfg.IsGateway {
+		container.ReadinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{
+					Path: "/health",
+					Port: intstr.FromString(adminPortName),
+				},
+			},
+			InitialDelaySeconds: 2,
+			PeriodSeconds:       5,
+			TimeoutSeconds:      3,
+			FailureThreshold:    6,
+		}
 	}
 
 	podSpec := corev1.PodSpec{
