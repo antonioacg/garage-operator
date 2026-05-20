@@ -812,20 +812,20 @@ spec:
 			Eventually(verifyGatewayConnected, 3*time.Minute, 5*time.Second).Should(Succeed())
 		})
 
-		It("should register gateway as gateway node in layout", func() {
-			By("checking storage cluster layout version increased after gateway joined")
-			verifyLayoutUpdated := func(g Gomega) {
-				// The layout version should be > 1 if gateway node was added
-				// (version 1 is initial storage cluster, version 2+ means gateway was added)
+		It("should not bump storage cluster layout version when gateway joins (v0.5.7+: gateway not in layout)", func() {
+			By("checking storage cluster layout version stays at 1 (gateway joins via ConnectClusterNodes, not the layout)")
+			verifyLayoutStable := func(g Gomega) {
+				// v0.5.7+: gateway pods do not participate in the layout, so
+				// the storage cluster's layout version should remain at 1
+				// (initial storage assignment) even after the gateway joins.
 				cmd := exec.Command("kubectl", "get", "garagecluster", storageClusterName,
 					"-n", testNamespace, "-o", "jsonpath={.status.layoutVersion}")
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
-				// Layout version should be 2 or higher (gateway node added)
-				g.Expect(output).To(SatisfyAny(Equal("2"), Equal("3"), Equal("4"), Equal("5")),
-					"Layout version should be >= 2 after gateway joins, got %s", output)
+				g.Expect(output).To(Equal("1"),
+					"Storage layout version must not be bumped by gateway joining (got %s)", output)
 			}
-			Eventually(verifyLayoutUpdated, 2*time.Minute, 5*time.Second).Should(Succeed())
+			Eventually(verifyLayoutStable, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("verifying gateway cluster component label")
 			cmd := exec.Command("kubectl", "get", "statefulset", gatewayClusterName+"-gateway",
