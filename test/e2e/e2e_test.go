@@ -704,43 +704,59 @@ spec:
 			Eventually(verifyGatewayReady, 5*time.Minute, 5*time.Second).Should(Succeed())
 		})
 
-		It("should create Deployment for gateway tier (ephemeral identity)", func() {
-			// Gateway tier in v1beta2 is a Deployment named "<cr>-gateway" with
-			// EmptyDir volumes; node identity rotates per pod restart and the
-			// operator garbage-collects stale layout entries via tombstone
-			// cleanup. This replaces the old StatefulSet-with-PVC model.
-			gwDeploy := gatewayClusterName + "-gateway"
+		It("should create StatefulSet for gateway tier (persistent identity)", func() {
+			// Gateway tier (v0.5.6+) is a StatefulSet named "<cr>-gateway" with
+			// a small metadata PVC and EmptyDir for data. The metadata PVC
+			// preserves the Ed25519 node identity across pod restarts so a
+			// routine rollout doesn't churn the cluster layout. Data dir
+			// stays EmptyDir because gateways don't store object blocks.
+			gwSts := gatewayClusterName + "-gateway"
 
-			By("verifying Deployment exists")
+			By("verifying StatefulSet exists")
 			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "deployment", gwDeploy,
+				cmd := exec.Command("kubectl", "get", "statefulset", gwSts,
 					"-n", testNamespace, "-o", "jsonpath={.metadata.name}")
 				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Deployment should exist for gateway cluster")
-				g.Expect(output).To(Equal(gwDeploy))
+				g.Expect(err).NotTo(HaveOccurred(), "StatefulSet should exist for gateway cluster")
+				g.Expect(output).To(Equal(gwSts))
 			}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
-			By("verifying gateway has no PVCs (EmptyDir for both metadata and data)")
-			cmd := exec.Command("kubectl", "get", "pvc", "-n", testNamespace,
-				"-l", "app.kubernetes.io/instance="+gatewayClusterName,
-				"-o", "jsonpath={.items[*].metadata.name}")
+			By("verifying pre-upgrade Deployment is absent")
+			cmd := exec.Command("kubectl", "get", "deployment", gwSts, "-n", testNamespace)
+			_, err := utils.Run(cmd)
+			Expect(err).To(HaveOccurred(), "pre-v0.5.6 gateway Deployment should not exist")
+
+			By("verifying gateway StatefulSet has a metadata volumeClaimTemplate")
+			cmd = exec.Command("kubectl", "get", "statefulset", gwSts,
+				"-n", testNamespace, "-o", "jsonpath={.spec.volumeClaimTemplates[*].metadata.name}")
 			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(BeEmpty(), "Gateway tier should not create PVCs (got %q)", output)
+			Expect(output).To(Equal("metadata"), "gateway StatefulSet must have a single 'metadata' VCT (got %q)", output)
+
+			By("verifying gateway PVCs are provisioned (one per replica)")
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "pvc", "-n", testNamespace,
+					"-l", "app.kubernetes.io/instance="+gatewayClusterName,
+					"-o", "jsonpath={.items[*].metadata.name}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(output).NotTo(BeEmpty(), "expected gateway metadata PVCs")
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("verifying gateway has EmptyDir for data volume")
-			cmd = exec.Command("kubectl", "get", "deployment", gwDeploy,
+			cmd = exec.Command("kubectl", "get", "statefulset", gwSts,
 				"-n", testNamespace, "-o", "jsonpath={.spec.template.spec.volumes[?(@.name==\"data\")].emptyDir}")
 			output, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(Equal("{}"), "Gateway should use EmptyDir for data volume")
 
-			By("verifying gateway has EmptyDir for metadata volume")
-			cmd = exec.Command("kubectl", "get", "deployment", gwDeploy,
-				"-n", testNamespace, "-o", "jsonpath={.spec.template.spec.volumes[?(@.name==\"metadata\")].emptyDir}")
+			By("verifying gateway PVC retention policy is Delete/Delete")
+			cmd = exec.Command("kubectl", "get", "statefulset", gwSts,
+				"-n", testNamespace,
+				"-o", "jsonpath={.spec.persistentVolumeClaimRetentionPolicy.whenScaled}/{.spec.persistentVolumeClaimRetentionPolicy.whenDeleted}")
 			output, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(Equal("{}"), "Gateway should use EmptyDir for metadata volume")
+			Expect(output).To(Equal("Delete/Delete"), "gateway PVC retention policy must be Delete/Delete")
 		})
 
 		It("should have gateway pods running", func() {
