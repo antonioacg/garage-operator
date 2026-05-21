@@ -61,6 +61,10 @@ const (
 	defaultS3Region        = "garage"
 	defaultAppName         = "garage"
 
+	// envGarageNodeHost is the name of the env var Garage reads at startup to
+	// learn its own externally-routable host (set from the pod IP via downward API).
+	envGarageNodeHost = "GARAGE_NODE_HOST"
+
 	// Health status constants
 	healthStatusHealthy  = "healthy"
 	healthStatusDegraded = "degraded"
@@ -2143,6 +2147,8 @@ func (r *GarageClusterReconciler) reconcileStatefulSet(ctx context.Context, clus
 		TopologySpreadConstraints: st.TopologySpreadConstraints,
 		IsGateway:                 false,
 		Logging:                   cluster.Spec.Logging,
+		Env:                       st.Env,
+		EnvFrom:                   st.EnvFrom,
 	}, volumes, volumeMounts, containerPorts)
 
 	podLabels := r.selectorLabelsForTier(cluster, tierStorage)

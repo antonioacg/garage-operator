@@ -1329,3 +1329,66 @@ func TestComputePodSpecHash(t *testing.T) {
 		}
 	})
 }
+
+func TestBuildGaragePodSpec_UserEnv(t *testing.T) {
+	userEnv := []corev1.EnvVar{
+		{Name: "GARAGE_ALLOW_WORLD_READABLE_SECRETS", Value: "true"},
+		{Name: "MY_EXTRA", Value: "foo"},
+		// Intentional override: user re-declares GARAGE_NODE_HOST. Since user env
+		// is appended AFTER the built-in, this entry must appear after the
+		// built-in in the resulting container.Env slice.
+		{Name: envGarageNodeHost, Value: "overridden.example"},
+	}
+	userEnvFrom := []corev1.EnvFromSource{
+		{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "my-secret"}}},
+	}
+
+	spec := buildGaragePodSpec(PodSpecConfig{
+		Image:   defaultGarageImage,
+		Env:     userEnv,
+		EnvFrom: userEnvFrom,
+	}, nil, nil, nil)
+	if len(spec.Containers) != 1 {
+		t.Fatalf("expected 1 container, got %d", len(spec.Containers))
+	}
+	c := spec.Containers[0]
+
+	// EnvFrom passes through verbatim.
+	if len(c.EnvFrom) != 1 || c.EnvFrom[0].SecretRef == nil || c.EnvFrom[0].SecretRef.Name != "my-secret" {
+		t.Errorf("envFrom not propagated: %+v", c.EnvFrom)
+	}
+
+	// Custom env var must be present.
+	got := map[string][]string{}
+	for _, e := range c.Env {
+		got[e.Name] = append(got[e.Name], e.Value)
+	}
+	if vs, ok := got["GARAGE_ALLOW_WORLD_READABLE_SECRETS"]; !ok || vs[0] != "true" {
+		t.Errorf("expected GARAGE_ALLOW_WORLD_READABLE_SECRETS=true, got %v", vs)
+	}
+	if vs, ok := got["MY_EXTRA"]; !ok || vs[0] != "foo" {
+		t.Errorf("expected MY_EXTRA=foo, got %v", vs)
+	}
+
+	// Built-in must still be present, and the user override must appear AFTER
+	// the built-in so the runtime resolves to the user value.
+	var builtInIdx, overrideIdx = -1, -1
+	for i, e := range c.Env {
+		if e.Name == envGarageNodeHost {
+			if e.ValueFrom != nil && builtInIdx == -1 {
+				builtInIdx = i
+			} else if e.Value == "overridden.example" {
+				overrideIdx = i
+			}
+		}
+	}
+	if builtInIdx == -1 {
+		t.Errorf("built-in GARAGE_NODE_HOST (fieldRef) missing")
+	}
+	if overrideIdx == -1 {
+		t.Errorf("user override GARAGE_NODE_HOST missing")
+	}
+	if builtInIdx != -1 && overrideIdx != -1 && overrideIdx <= builtInIdx {
+		t.Errorf("user override at index %d must appear AFTER built-in at index %d", overrideIdx, builtInIdx)
+	}
+}
