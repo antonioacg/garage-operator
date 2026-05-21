@@ -1392,3 +1392,189 @@ func TestBuildGaragePodSpec_UserEnv(t *testing.T) {
 		t.Errorf("user override at index %d must appear AFTER built-in at index %d", overrideIdx, builtInIdx)
 	}
 }
+
+const (
+	multiPathDataPath0 = "/data/data0"
+	multiPathDataPath1 = "/data/data1"
+	dataPathPVC0       = "data-0"
+)
+
+// TestBuildVolumeClaimTemplates_MultiPath asserts that issue #188 is fixed:
+// when storage.data.paths[] declares multiple data directories, the operator
+// must emit one PVC per path so each disk gets a separate volume — not a
+// single PVC with a multi-mount overlap.
+func TestBuildVolumeClaimTemplates_MultiPath(t *testing.T) {
+	fastSC := "fast-ssd"
+	slowSC := "bulk-hdd"
+	size1 := resource.MustParse("500Gi")
+	size2 := resource.MustParse("2Ti")
+
+	cluster := &garagev1beta2.GarageCluster{
+		Spec: garagev1beta2.GarageClusterSpec{
+			Storage: &garagev1beta2.StorageSpec{
+				Replicas: 3,
+				Metadata: &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("5Gi"))},
+				Data: &garagev1beta2.VolumeConfig{
+					// top-level storageClass acts as fallback for paths
+					// that don't override it
+					StorageClassName: &slowSC,
+					Paths: []garagev1beta2.DataPath{
+						{
+							Path:     multiPathDataPath0,
+							Capacity: &size1,
+							Volume: &garagev1beta2.DataPathVolumeConfig{
+								Size:             &size1,
+								StorageClassName: &fastSC,
+							},
+						},
+						{
+							Path:     multiPathDataPath1,
+							Capacity: &size2,
+							// no per-path volume — inherits top-level slowSC,
+							// size falls back to Capacity
+						},
+					},
+				},
+			},
+		},
+	}
+
+	pvcs := buildVolumeClaimTemplates(cluster)
+	if len(pvcs) != 3 {
+		t.Fatalf("got %d PVCs, want 3 (metadata + 2 data paths)", len(pvcs))
+	}
+
+	if pvcs[0].Name != metadataVolumeName {
+		t.Errorf("PVC[0] name = %q, want %q", pvcs[0].Name, metadataVolumeName)
+	}
+	if pvcs[1].Name != dataPathPVC0 {
+		t.Errorf("PVC[1] name = %q, want %q", pvcs[1].Name, dataPathPVC0)
+	}
+	if pvcs[2].Name != "data-1" {
+		t.Errorf("PVC[2] name = %q, want %q", pvcs[2].Name, "data-1")
+	}
+
+	// Per-path volume config wins (fastSC, size1).
+	if got := pvcs[1].Spec.Resources.Requests[corev1.ResourceStorage]; got.Cmp(size1) != 0 {
+		t.Errorf("data-0 size = %s, want %s", got.String(), size1.String())
+	}
+	if pvcs[1].Spec.StorageClassName == nil || *pvcs[1].Spec.StorageClassName != fastSC {
+		t.Errorf("data-0 storageClass = %v, want %q", pvcs[1].Spec.StorageClassName, fastSC)
+	}
+
+	// Path with no per-path volume — falls back to top-level storageClass,
+	// size derived from the path's Capacity.
+	if got := pvcs[2].Spec.Resources.Requests[corev1.ResourceStorage]; got.Cmp(size2) != 0 {
+		t.Errorf("data-1 size = %s, want %s (from Capacity)", got.String(), size2.String())
+	}
+	if pvcs[2].Spec.StorageClassName == nil || *pvcs[2].Spec.StorageClassName != slowSC {
+		t.Errorf("data-1 storageClass = %v, want %q (top-level fallback)", pvcs[2].Spec.StorageClassName, slowSC)
+	}
+}
+
+// TestBuildVolumeClaimTemplates_SinglePathBackwardCompat ensures that the
+// legacy (no-paths) layout still produces a single `data` PVC. Existing
+// clusters must not see a PVC rename.
+func TestBuildVolumeClaimTemplates_SinglePathBackwardCompat(t *testing.T) {
+	cluster := &garagev1beta2.GarageCluster{
+		Spec: garagev1beta2.GarageClusterSpec{
+			Storage: &garagev1beta2.StorageSpec{
+				Replicas: 1,
+				Metadata: &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("5Gi"))},
+				Data:     &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("100Gi"))},
+			},
+		},
+	}
+	pvcs := buildVolumeClaimTemplates(cluster)
+	if len(pvcs) != 2 {
+		t.Fatalf("got %d PVCs, want 2", len(pvcs))
+	}
+	if pvcs[1].Name != dataVolumeName {
+		t.Errorf("data PVC name = %q, want %q (legacy backward-compat)", pvcs[1].Name, dataVolumeName)
+	}
+}
+
+// TestBuildVolumesAndMounts_MultiPath verifies one volumeMount per data path
+// is emitted at the user-supplied path, and that read-only flags propagate.
+func TestBuildVolumesAndMounts_MultiPath(t *testing.T) {
+	cluster := &garagev1beta2.GarageCluster{
+		Spec: garagev1beta2.GarageClusterSpec{
+			Storage: &garagev1beta2.StorageSpec{
+				Replicas: 1,
+				Metadata: &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("5Gi"))},
+				Data: &garagev1beta2.VolumeConfig{
+					Paths: []garagev1beta2.DataPath{
+						{Path: multiPathDataPath0, Capacity: ptrQuantity(resource.MustParse("1Ti"))},
+						{Path: multiPathDataPath1, Capacity: ptrQuantity(resource.MustParse("1Ti"))},
+						{Path: "/data/legacy", ReadOnly: true},
+					},
+				},
+			},
+		},
+	}
+	_, mounts := buildVolumesAndMounts(cluster)
+
+	want := map[string]struct {
+		path     string
+		readOnly bool
+	}{
+		dataPathPVC0: {path: multiPathDataPath0, readOnly: false},
+		"data-1":     {path: multiPathDataPath1, readOnly: false},
+		"data-2":     {path: "/data/legacy", readOnly: true},
+	}
+	got := map[string]corev1.VolumeMount{}
+	for _, m := range mounts {
+		got[m.Name] = m
+	}
+	for name, expect := range want {
+		m, ok := got[name]
+		if !ok {
+			t.Errorf("missing volumeMount %q", name)
+			continue
+		}
+		if m.MountPath != expect.path {
+			t.Errorf("%s mountPath = %q, want %q", name, m.MountPath, expect.path)
+		}
+		if m.ReadOnly != expect.readOnly {
+			t.Errorf("%s readOnly = %v, want %v", name, m.ReadOnly, expect.readOnly)
+		}
+	}
+	// The legacy single `data` mount must NOT appear in multi-path mode.
+	if _, ok := got[dataVolumeName]; ok {
+		t.Errorf("legacy %q mount must not appear when paths[] is set", dataVolumeName)
+	}
+}
+
+// TestBuildVolumesAndMounts_SinglePathBackwardCompat ensures the legacy
+// single-mount layout at /data/data is preserved when paths[] is not set.
+func TestBuildVolumesAndMounts_SinglePathBackwardCompat(t *testing.T) {
+	cluster := &garagev1beta2.GarageCluster{
+		Spec: garagev1beta2.GarageClusterSpec{
+			Storage: &garagev1beta2.StorageSpec{
+				Replicas: 1,
+				Metadata: &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("5Gi"))},
+				Data:     &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("100Gi"))},
+			},
+		},
+	}
+	_, mounts := buildVolumesAndMounts(cluster)
+
+	var found bool
+	for _, m := range mounts {
+		if m.Name == dataVolumeName {
+			found = true
+			if m.MountPath != "/data/data" {
+				t.Errorf("data mountPath = %q, want %q", m.MountPath, "/data/data")
+			}
+			if m.ReadOnly {
+				t.Errorf("data mount unexpectedly readOnly")
+			}
+		}
+		if m.Name == dataPathPVC0 {
+			t.Errorf("unexpected %q mount in single-path mode", dataPathPVC0)
+		}
+	}
+	if !found {
+		t.Errorf("missing legacy %q volumeMount", dataVolumeName)
+	}
+}

@@ -1757,6 +1757,25 @@ func buildContainerPorts(cluster *garagev1beta2.GarageCluster) []corev1.Containe
 	return ports
 }
 
+// dataPathPVCName returns the deterministic PVC template name for the i-th
+// data path in a multi-HDD configuration (issue #188). Naming is
+// `data-<index>` so existing single-path clusters keep using the legacy
+// `data` PVC name and don't see a destructive rename.
+func dataPathPVCName(i int) string {
+	return fmt.Sprintf("%s-%d", dataVolName, i)
+}
+
+// hasMultipleDataPaths reports whether the cluster declares an explicit
+// list of data paths (`storage.data.paths[]`). When true, the operator emits
+// one PVC + one volumeMount per path; otherwise it falls back to the legacy
+// single-PVC layout mounted at /data/data.
+func hasMultipleDataPaths(cluster *garagev1beta2.GarageCluster) bool {
+	if !cluster.HasStorageTier() {
+		return false
+	}
+	return cluster.Spec.Storage.Data != nil && len(cluster.Spec.Storage.Data.Paths) > 0
+}
+
 // buildVolumesAndMounts returns volumes and volume mounts for the Garage StatefulSet.
 // For gateway clusters, data volume is EmptyDir since gateways don't store blocks.
 // Metadata volume comes from PVC (via VolumeClaimTemplates) for both gateway and storage.
@@ -1765,7 +1784,21 @@ func buildVolumesAndMounts(cluster *garagev1beta2.GarageCluster) ([]corev1.Volum
 		{Name: configVolumeName, MountPath: configMountPath, ReadOnly: true},
 		{Name: RPCSecretKey, MountPath: rpcSecretMountPath, ReadOnly: true},
 		{Name: metadataVolName, MountPath: metadataPath},
-		{Name: dataVolName, MountPath: dataPath},
+	}
+
+	// Data mounts: one per declared path when paths[] is set, otherwise the
+	// legacy single mount at /data/data. EmptyDir clusters still get exactly
+	// one mount (paths[] is rejected by the webhook with type=EmptyDir).
+	if hasMultipleDataPaths(cluster) && !isDataEmptyDir(cluster) {
+		for i, p := range cluster.Spec.Storage.Data.Paths {
+			volumeMounts = append(volumeMounts, corev1.VolumeMount{
+				Name:      dataPathPVCName(i),
+				MountPath: p.Path,
+				ReadOnly:  p.ReadOnly,
+			})
+		}
+	} else {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: dataVolName, MountPath: dataPath})
 	}
 
 	rpcSecretName := cluster.Name + "-rpc-secret"
@@ -1979,10 +2012,90 @@ func buildVolumeClaimTemplates(cluster *garagev1beta2.GarageCluster) []corev1.Pe
 		templates = append(templates, buildMetadataPVC(cluster))
 	}
 	if !isDataEmptyDir(cluster) {
-		templates = append(templates, buildDataPVC(cluster))
+		if hasMultipleDataPaths(cluster) {
+			// Issue #188: when paths[] is declared, emit one PVC per path so
+			// each disk gets its own mount. Per-path Volume config (size,
+			// storageClass, etc.) wins; top-level data.* is the fallback.
+			for i, p := range cluster.Spec.Storage.Data.Paths {
+				templates = append(templates, buildDataPathPVC(cluster, i, p))
+			}
+		} else {
+			templates = append(templates, buildDataPVC(cluster))
+		}
 	}
 
 	return templates
+}
+
+// buildDataPathPVC creates the PVC template for one entry in
+// `spec.storage.data.paths[]`. Per-path `volume.*` settings take precedence;
+// missing fields fall back to the top-level `spec.storage.data.*` so that a
+// user can specify e.g. a single storageClassName once and have every per-path
+// PVC inherit it.
+func buildDataPathPVC(cluster *garagev1beta2.GarageCluster, idx int, path garagev1beta2.DataPath) corev1.PersistentVolumeClaim {
+	size := resource.MustParse("100Gi")
+	topLevel := cluster.Spec.Storage.Data // never nil — caller guards
+	pathVol := path.Volume
+
+	// Capacity declared on the DataPath itself feeds Garage's data_dir but is
+	// also a sensible default for the underlying PVC size when no explicit
+	// volume.size is set, so callers don't have to repeat themselves.
+	switch {
+	case pathVol != nil && pathVol.Size != nil && !pathVol.Size.IsZero():
+		size = *pathVol.Size
+	case path.Capacity != nil && !path.Capacity.IsZero():
+		size = *path.Capacity
+	case topLevel != nil && topLevel.Size != nil && !topLevel.Size.IsZero():
+		size = *topLevel.Size
+	}
+
+	var sc *string
+	if pathVol != nil && pathVol.StorageClassName != nil {
+		sc = pathVol.StorageClassName
+	} else if topLevel != nil {
+		sc = topLevel.StorageClassName
+	}
+
+	var accessModes []corev1.PersistentVolumeAccessMode
+	if pathVol != nil && len(pathVol.AccessModes) > 0 {
+		accessModes = pathVol.AccessModes
+	} else if topLevel != nil {
+		accessModes = topLevel.AccessModes
+	}
+
+	pvc := buildBasePVC(dataPathPVCName(idx), size, sc, accessModes)
+
+	var selector *metav1.LabelSelector
+	if pathVol != nil && pathVol.Selector != nil {
+		selector = pathVol.Selector
+	} else if topLevel != nil {
+		selector = topLevel.Selector
+	}
+	if selector != nil {
+		pvc.Spec.Selector = selector
+	}
+
+	labels := map[string]string(nil)
+	if pathVol != nil && len(pathVol.Labels) > 0 {
+		labels = pathVol.Labels
+	} else if topLevel != nil && len(topLevel.Labels) > 0 {
+		labels = topLevel.Labels
+	}
+	if len(labels) > 0 {
+		pvc.Labels = labels
+	}
+
+	annotations := map[string]string(nil)
+	if pathVol != nil && len(pathVol.Annotations) > 0 {
+		annotations = pathVol.Annotations
+	} else if topLevel != nil && len(topLevel.Annotations) > 0 {
+		annotations = topLevel.Annotations
+	}
+	if len(annotations) > 0 {
+		pvc.Annotations = annotations
+	}
+
+	return pvc
 }
 
 // buildMetadataPVC creates the metadata PVC template for the storage tier.
@@ -2304,11 +2417,25 @@ func (r *GarageClusterReconciler) reconcilePVCExpansion(ctx context.Context, clu
 	}
 
 	if !isDataEmptyDir(cluster) {
-		desiredSize := buildDataPVC(cluster).Spec.Resources.Requests[corev1.ResourceStorage]
-		for i := int32(0); i < replicas; i++ {
-			pvcName := fmt.Sprintf("data-%s-%d", cluster.Name, i)
-			if err := r.maybeExpandPVC(ctx, log, cluster.Namespace, pvcName, desiredSize); err != nil {
-				return err
+		if hasMultipleDataPaths(cluster) {
+			// Multi-path layout: PVC templates are named data-0, data-1, …
+			// so the per-replica PVC names are data-<idx>-<cluster>-<ord>.
+			for idx, p := range cluster.Spec.Storage.Data.Paths {
+				desiredSize := buildDataPathPVC(cluster, idx, p).Spec.Resources.Requests[corev1.ResourceStorage]
+				for i := int32(0); i < replicas; i++ {
+					pvcName := fmt.Sprintf("%s-%s-%d", dataPathPVCName(idx), cluster.Name, i)
+					if err := r.maybeExpandPVC(ctx, log, cluster.Namespace, pvcName, desiredSize); err != nil {
+						return err
+					}
+				}
+			}
+		} else {
+			desiredSize := buildDataPVC(cluster).Spec.Resources.Requests[corev1.ResourceStorage]
+			for i := int32(0); i < replicas; i++ {
+				pvcName := fmt.Sprintf("data-%s-%d", cluster.Name, i)
+				if err := r.maybeExpandPVC(ctx, log, cluster.Namespace, pvcName, desiredSize); err != nil {
+					return err
+				}
 			}
 		}
 	}
