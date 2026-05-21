@@ -461,6 +461,8 @@ spec:
 
 PVCs are named `data-<index>-<cluster>-<ord>` (e.g. `data-0-garage-0`). The Garage `data_dir` `capacity` value is taken from `path.capacity` if set, otherwise from `volume.size`. A `readOnly: true` path is mounted read-only and emits `read_only = true` in `data_dir` — capacity is not required.
 
+> **Note:** Garage uses `capacity` as a *striping weight* — blocks are assigned to paths proportionally to each path's capacity. The filesystem enforces the actual size limit, not Garage. Because every storage pod shares one ConfigMap, all replicas get identical paths and capacities; asymmetric per-node disk layouts (e.g. one node with 2×4T, another with 1×8T+1×2T) aren't expressible this way.
+
 > **Migration from a single-path cluster:** `StatefulSet.spec.volumeClaimTemplates` is immutable, so switching an existing cluster to `paths[]` requires `kubectl delete sts <cluster> --cascade=orphan -n <ns>` then deleting the orphan `data-<cluster>-*` PVC before re-applying. Node identity lives in the metadata PVC and is preserved.
 
 ## Custom Container Environment Variables
