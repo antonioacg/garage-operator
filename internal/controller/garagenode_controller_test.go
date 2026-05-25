@@ -1188,4 +1188,81 @@ var _ = Describe("GarageNode labelsForNode tier label", func() {
 		Expect(labels).To(HaveKeyWithValue(labelTier, tierGateway))
 		Expect(labels).To(HaveKeyWithValue(labelCluster, clusterName))
 	})
+
+	// v0.6.1: storage pods carry the cluster-shared {app.kubernetes.io/name=garage,
+	// app.kubernetes.io/instance=<cluster-name>} pair so user-defined Services
+	// (Tailscale LBs, etc.) that select on the pre-#190 convention keep matching.
+	// Regression guard for the v0.6.0 cross-cluster outage where storage pods
+	// carried {name=garagenode, instance=<node-name>} and silently broke
+	// externally-defined LoadBalancers.
+	It("stamps storage pods with cluster-shared name+instance labels (legacy-compat)", func() {
+		node := &garagev1beta1.GarageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-storage-0", Namespace: nsName},
+			Spec:       garagev1beta1.GarageNodeSpec{},
+		}
+		labels := r.labelsForNode(node, cluster)
+		Expect(labels).To(HaveKeyWithValue(labelAppName, defaultAppName))
+		Expect(labels).To(HaveKeyWithValue(labelAppInstance, clusterName))
+		Expect(labels).To(HaveKeyWithValue(labelGarageNode, clusterName+"-storage-0"))
+	})
+
+	// The STS selector must be unique per GarageNode (so each per-node STS
+	// owns exactly its own pod) AND must NOT contain labelAppName/Instance
+	// (whose values are cluster-shared and would conflict with the immutable
+	// per-STS selector contract).
+	It("emits a per-node selector that omits cluster-shared app.kubernetes.io labels", func() {
+		node := &garagev1beta1.GarageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-storage-0", Namespace: nsName},
+		}
+		sel := r.selectorLabelsForNode(node)
+		Expect(sel).To(HaveKeyWithValue(labelGarageNode, clusterName+"-storage-0"))
+		Expect(sel).To(HaveKeyWithValue(labelAppManagedBy, operatorName))
+		Expect(sel).NotTo(HaveKey(labelAppName))
+		Expect(sel).NotTo(HaveKey(labelAppInstance))
+	})
+})
+
+var _ = Describe("hasLegacyStorageSelector", func() {
+	// Regression guard for the v0.6.0 → v0.6.1 STS-selector migration.
+	// v0.6.0 STSes shipped with {app.kubernetes.io/name=garagenode} in the
+	// (immutable) selector. v0.6.1 needs to detect those so reconcileStatefulSet
+	// can orphan-delete and recreate them with the new selector.
+	const nodeName = "cluster-storage-0"
+
+	It("returns true for a v0.6.0 per-node STS selector", func() {
+		sts := &appsv1.StatefulSet{
+			Spec: appsv1.StatefulSetSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
+					labelAppName:     "garagenode",
+					labelAppInstance: nodeName,
+					labelGarageNode:  nodeName,
+				}},
+			},
+		}
+		Expect(hasLegacyStorageSelector(sts)).To(BeTrue())
+	})
+
+	It("returns false for a v0.6.1 per-node STS selector", func() {
+		sts := &appsv1.StatefulSet{
+			Spec: appsv1.StatefulSetSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
+					labelAppManagedBy: operatorName,
+					labelGarageNode:   nodeName,
+				}},
+			},
+		}
+		Expect(hasLegacyStorageSelector(sts)).To(BeFalse())
+	})
+
+	It("returns false for a gateway STS (labelAppName=garage, not garagenode)", func() {
+		sts := &appsv1.StatefulSet{
+			Spec: appsv1.StatefulSetSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
+					labelAppName:     defaultAppName,
+					labelAppInstance: "cluster",
+				}},
+			},
+		}
+		Expect(hasLegacyStorageSelector(sts)).To(BeFalse())
+	})
 })

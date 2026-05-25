@@ -436,6 +436,28 @@ func (r *GarageNodeReconciler) reconcileStatefulSet(ctx context.Context, node *g
 		return err
 	}
 
+	// v0.6.0 → v0.6.1 selector migration. v0.6.0 STSes were stamped with
+	// {labelAppName=garagenode, labelAppInstance=<node-name>, labelGarageNode}
+	// in their immutable selector. v0.6.1 swaps the storage-pod labels to the
+	// cluster-shared {labelAppName=garage, labelAppInstance=<cluster-name>}
+	// pair so user-defined Services (Tailscale LBs in particular) keep matching
+	// the pre-#190 convention. The new selector drops labelAppName/Instance and
+	// uses {labelAppManagedBy, labelGarageNode}, which is unique-per-STS.
+	//
+	// StatefulSet selectors are immutable, so we orphan-delete the old STS,
+	// kill the old pod (its labels don't match the new selector), and let the
+	// next reconcile recreate the STS with the new selector. PVCs are RWO and
+	// retained, the new pod adopts them. A single-replica STS owns one pod, so
+	// the disruption window is one pod restart per GarageNode.
+	if hasLegacyStorageSelector(existing) {
+		log.Info("Migration: per-node STS uses v0.6.0 selector, orphan-deleting for relabel", "name", stsName)
+		if err := r.relabelLegacyV060STS(ctx, existing, node.Name); err != nil {
+			return fmt.Errorf("relabel v0.6.0 STS: %w", err)
+		}
+		// STS gone — next reconcile creates the new one with v0.6.1 labels.
+		return nil
+	}
+
 	// Check if update is needed
 	needsUpdate := false
 	existingPodSpecHash := existing.Spec.Template.Annotations["garage.rajsingh.info/pod-spec-hash"]
@@ -460,6 +482,44 @@ func (r *GarageNodeReconciler) reconcileStatefulSet(ctx context.Context, node *g
 	existing.Spec.Template = sts.Spec.Template
 	log.Info("Updating StatefulSet for GarageNode", "name", stsName)
 	return r.Update(ctx, existing)
+}
+
+// hasLegacyStorageSelector returns true if the StatefulSet's selector
+// matches the v0.6.0 storage-pod selector convention
+// ({app.kubernetes.io/name=garagenode}). v0.6.1+ STSes use
+// {labelAppManagedBy, labelGarageNode} and never carry app.kubernetes.io/name
+// in the selector. Gateway STSes use {labelAppName=garage} so this only
+// matches v0.6.0 per-node STSes that need relabeling.
+func hasLegacyStorageSelector(sts *appsv1.StatefulSet) bool {
+	if sts.Spec.Selector == nil {
+		return false
+	}
+	return sts.Spec.Selector.MatchLabels[labelAppName] == "garagenode"
+}
+
+// relabelLegacyV060STS orphan-deletes a v0.6.0 per-node StatefulSet (and its
+// pod) so the next reconcile can recreate it with v0.6.1 selectors and the
+// cluster-shared {labelAppName=garage, labelAppInstance=<cluster>} pod labels.
+// The PVCs are retained because the GarageNode's spec.storage uses
+// existingClaim (single-HDD) or volumeClaimTemplates (whose PVCs are not
+// garbage-collected on STS delete by default).
+func (r *GarageNodeReconciler) relabelLegacyV060STS(ctx context.Context, sts *appsv1.StatefulSet, nodeName string) error {
+	log := logf.FromContext(ctx)
+	orphan := metav1.DeletePropagationOrphan
+	if err := r.Delete(ctx, sts, &client.DeleteOptions{PropagationPolicy: &orphan}); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("orphan-deleting v0.6.0 STS %s: %w", sts.Name, err)
+	}
+	// The orphaned pod carries v0.6.0 labels (app.kubernetes.io/name=garagenode),
+	// which won't satisfy the v0.6.1 selector. Delete it explicitly so the new
+	// STS creates a fresh pod with the new labels — adopting it would otherwise
+	// silently fail and leave the new STS perpetually unready.
+	podName := nodeName + "-0"
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podName, Namespace: sts.Namespace}}
+	if err := r.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("deleting v0.6.0 pod %s: %w", podName, err)
+	}
+	log.Info("v0.6.0 STS + pod orphan-deleted; next reconcile will recreate with v0.6.1 labels", "name", sts.Name)
+	return nil
 }
 
 // nodeMultiHDDDataPath returns the mount path for the i-th data volume on a
@@ -779,14 +839,20 @@ func (r *GarageNodeReconciler) buildNodeVolumeClaimTemplates(node *garagev1beta1
 // The tier label is critical: post-#190 the cluster-level API Service selects
 // storage pods via {labelCluster, labelTier=storage}. Without it, the Service
 // has no endpoints and admin/S3 traffic to <cluster>.<ns>.svc fails.
+//
+// Storage pods carry the cluster-level {labelAppName=garage, labelAppInstance=<cluster>}
+// pair so externally-defined Services (Tailscale LBs, etc.) selecting on the
+// pre-#190 convention {name=garage, instance=<cluster>, tier=storage} keep
+// matching after the per-node refactor. The unique-per-STS identity comes from
+// labelGarageNode, not from labelAppName/Instance.
 func (r *GarageNodeReconciler) labelsForNode(node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster) map[string]string {
 	tier := tierStorage
 	if node.Spec.Gateway {
 		tier = tierGateway
 	}
 	return map[string]string{
-		labelAppName:      "garagenode",
-		labelAppInstance:  node.Name,
+		labelAppName:      defaultAppName,
+		labelAppInstance:  cluster.Name,
 		labelAppComponent: "node",
 		labelAppManagedBy: operatorName,
 		labelCluster:      cluster.Name,
@@ -795,12 +861,17 @@ func (r *GarageNodeReconciler) labelsForNode(node *garagev1beta1.GarageNode, clu
 	}
 }
 
-// selectorLabelsForNode returns selector labels for a GarageNode's pods.
+// selectorLabelsForNode returns the per-STS selector. It must be unique per
+// GarageNode (so each per-node STS owns exactly its own pod) and immutable for
+// the lifetime of the STS. labelGarageNode is unique per node by construction;
+// labelAppManagedBy is added as a defense-in-depth scope so the selector never
+// matches a pod from an unrelated workload that happens to reuse the same node
+// name. labelAppName/Instance are deliberately omitted — they carry
+// cluster-shared values for external Service compatibility (see labelsForNode).
 func (r *GarageNodeReconciler) selectorLabelsForNode(node *garagev1beta1.GarageNode) map[string]string {
 	return map[string]string{
-		labelAppName:     "garagenode",
-		labelAppInstance: node.Name,
-		labelGarageNode:  node.Name,
+		labelAppManagedBy: operatorName,
+		labelGarageNode:   node.Name,
 	}
 }
 

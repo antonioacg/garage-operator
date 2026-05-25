@@ -496,7 +496,17 @@ func (r *GarageClusterReconciler) migrateLegacyStorageSTSIfNeeded(ctx context.Co
 	stsKey := types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}
 	err := r.Get(ctx, stsKey, legacySTS)
 	if errors.IsNotFound(err) {
-		// Fresh cluster (or already-migrated, STS gone) — mark complete.
+		// Legacy STS is gone, but a prior migration run may have orphan-deleted
+		// the STS and then failed to terminate the (now orphan) legacy pods. If
+		// any pod matching the legacy naming `<cluster>-<N>` is still around,
+		// it'll multi-mount the RWO PVCs along with the new per-node STSes
+		// (local-path / hostPath bypasses RWO enforcement), producing
+		// concurrent LMDB writers, EAGAIN errors, and divergent node identities.
+		// Sweep them up here before claiming Completed so the function is
+		// idempotently safe across restarts.
+		if err := r.deleteOrphanLegacyStoragePods(ctx, cluster); err != nil {
+			return fmt.Errorf("sweeping orphan legacy storage pods: %w", err)
+		}
 		return r.setMigrationCondition(ctx, cluster, metav1.ConditionTrue, migrationReasonCompleted, "no legacy StatefulSet detected")
 	}
 	if err != nil {
@@ -596,6 +606,51 @@ func (r *GarageClusterReconciler) migrateLegacyStorageSTSIfNeeded(ctx context.Co
 	}
 
 	return r.setMigrationCondition(ctx, cluster, metav1.ConditionTrue, migrationReasonCompleted, fmt.Sprintf("migrated %d ordinals from legacy StatefulSet to per-node GarageNodes", replicas))
+}
+
+// deleteOrphanLegacyStoragePods reaps pods whose names match the legacy
+// per-ordinal naming `<cluster>-<N>` and which carry no controllerRef. They
+// originate from the pre-#190 cluster-level StatefulSet that an earlier
+// migration run orphan-deleted; if the subsequent pod-delete step failed to
+// terminate them (timing, finalizer, kubelet busy), they keep running
+// forever and dual-mount the RWO metadata/data PVCs alongside the new
+// per-node STS pods. On local-path / hostPath PVs (where RWO is not enforced
+// at the kernel) that produces concurrent LMDB writers, EAGAIN errors, and
+// in the worst case mismatched node identities between the in-memory and
+// on-disk node_key. Idempotent: NotFound is fine.
+func (r *GarageClusterReconciler) deleteOrphanLegacyStoragePods(ctx context.Context, cluster *garagev1beta2.GarageCluster) error {
+	log := logf.FromContext(ctx)
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(cluster.Namespace)); err != nil {
+		return fmt.Errorf("listing pods: %w", err)
+	}
+	prefix := cluster.Name + "-"
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		name := pod.Name
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		// Ordinal suffix must be a non-negative integer (`<cluster>-0`,
+		// `<cluster>-1`, ...). This avoids matching `<cluster>-storage-0-0`
+		// and other valid per-node STS pods.
+		suffix := name[len(prefix):]
+		if _, err := strconv.Atoi(suffix); err != nil {
+			continue
+		}
+		// Only sweep orphan pods (no controllerRef). A live cluster-level STS
+		// is impossible at this point — the caller already verified it's
+		// absent — but be defensive: never delete a pod that another
+		// controller still owns.
+		if metav1.GetControllerOf(pod) != nil {
+			continue
+		}
+		log.Info("Migration: sweeping orphan legacy storage pod", "pod", name)
+		if err := r.Delete(ctx, pod); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("deleting orphan legacy pod %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // bucketLegacyDataPVCs scans a list of PVCs and returns a map of ordinal to
