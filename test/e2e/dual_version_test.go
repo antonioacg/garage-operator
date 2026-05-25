@@ -173,21 +173,21 @@ spec:
 		}
 		Eventually(applyV1Storage, 2*time.Minute, 5*time.Second).Should(Succeed())
 
-		By("expecting the operator to reconcile a StatefulSet (storage tier)")
+		By("expecting the operator to reconcile a per-node StatefulSet (Auto mode → <cluster>-storage-0)")
 		Eventually(func(g Gomega) {
-			get := exec.Command("kubectl", "get", "statefulset", v1Storage, "-n", testNS, "-o", "jsonpath={.spec.replicas}")
+			get := exec.Command("kubectl", "get", "statefulset", v1Storage+"-storage-0", "-n", testNS, "-o", "jsonpath={.spec.replicas}")
 			o, err := utils.Run(get)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(o).To(Equal("1"))
 		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
-		By("expecting PVCs to be provisioned for metadata+data")
+		By("expecting PVCs to be provisioned for metadata+data on the per-node STS")
 		Eventually(func(g Gomega) {
 			get := exec.Command("kubectl", "get", "pvc", "-n", testNS,
-				"-l", "app.kubernetes.io/instance="+v1Storage, "-o", "jsonpath={.items[*].metadata.name}")
+				"-l", "app.kubernetes.io/instance="+v1Storage+"-storage-0", "-o", "jsonpath={.items[*].metadata.name}")
 			o, err := utils.Run(get)
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(o).NotTo(BeEmpty(), "expected at least one PVC for v1beta1 storage cluster")
+			g.Expect(o).NotTo(BeEmpty(), "expected at least one PVC for v1beta1 storage cluster's per-node STS")
 		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("expecting the cluster to expose its storage replicas under status.storageReplicas (v1beta2 view)")
@@ -276,9 +276,11 @@ spec:
 		out, err := utils.Run(apply)
 		Expect(err).NotTo(HaveOccurred(), "apply v1beta2 unified: %s", out)
 
-		By("expecting both a storage StatefulSet and a gateway StatefulSet")
+		By("expecting per-node storage StatefulSets and a gateway StatefulSet")
+		// Post-#190: storage tier is per-GarageNode (named <cluster>-storage-N), not
+		// a single STS named <cluster>. Gateway tier is unchanged.
 		Eventually(func(g Gomega) {
-			get := exec.Command("kubectl", "get", "statefulset", v2Unified, "-n", testNS)
+			get := exec.Command("kubectl", "get", "statefulset", v2Unified+"-storage-0", "-n", testNS)
 			_, err := utils.Run(get)
 			g.Expect(err).NotTo(HaveOccurred())
 		}, 3*time.Minute, 5*time.Second).Should(Succeed())
@@ -436,8 +438,9 @@ spec:
 		Expect(err).NotTo(HaveOccurred())
 
 		By("verifying both CRs reconcile to expected workloads")
+		// Post-#190: storage tier reconciles to per-node STS named <cluster>-storage-N.
 		Eventually(func(g Gomega) {
-			_, err := utils.Run(exec.Command("kubectl", "get", "statefulset", v1MigrateStorage, "-n", testNS))
+			_, err := utils.Run(exec.Command("kubectl", "get", "statefulset", v1MigrateStorage+"-storage-0", "-n", testNS))
 			g.Expect(err).NotTo(HaveOccurred())
 		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 		Eventually(func(g Gomega) {

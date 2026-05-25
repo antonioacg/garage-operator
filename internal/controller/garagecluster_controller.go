@@ -32,8 +32,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
-	storagev1 "k8s.io/api/storage/v1"
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -73,8 +71,7 @@ const (
 	garageConfigFileLocation = configMountPath + "/" + configFileName
 
 	// Health status constants
-	healthStatusHealthy  = "healthy"
-	healthStatusDegraded = "degraded"
+	healthStatusHealthy = "healthy"
 
 	// connectErrUnknown is the fallback message when ConnectClusterNodes
 	// returns Success=false without an explicit error string.
@@ -153,7 +150,12 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Create or update ConfigMap(s) and get config hashes for pod restart triggering.
 	// Storage and gateway tiers may use different rpc_public_addr values when both
 	// are declared with a gateway-specific spec.gateway.rpcPublicAddr.
-	storageConfigHash, gatewayConfigHash, err := r.reconcileConfigMap(ctx, cluster)
+	//
+	// storageConfigHash is consumed by per-node GarageNode reconciles (operator-
+	// owned in Auto mode, user-owned in Manual mode). The cluster-level Reconcile
+	// no longer drives a storage STS directly, but the ConfigMap must still be
+	// reconciled here so the per-node STSes pick it up.
+	_, gatewayConfigHash, err := r.reconcileConfigMap(ctx, cluster)
 	if err != nil {
 		return r.updateStatus(ctx, cluster, PhaseFailed, err)
 	}
@@ -188,22 +190,34 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Reconcile workloads for each declared tier.
-	// Manual layout policy delegates to GarageNode resources, which manage their own
-	// StatefulSets; in that mode we skip the tier reconcilers here.
+	//
+	// Layout policy semantics (post-#190):
+	//   - Manual: user-managed GarageNode CRs own each node's StatefulSet; the
+	//     operator skips storage-tier workload reconciliation entirely.
+	//   - Auto:   operator-managed GarageNode CRs (one per storage replica) own
+	//     each node's StatefulSet. Existing pre-#190 single-STS clusters are
+	//     migrated automatically on first reconcile.
+	//
+	// In both cases the cluster-level storage StatefulSet (`<name>`) is no
+	// longer created post-#190. The gateway tier is untouched and continues to
+	// use a single Deployment with EmptyDir.
 	if cluster.Spec.LayoutPolicy != LayoutPolicyManual {
+		// Auto mode: migrate any pre-#190 legacy storage STS, then reconcile
+		// the per-node GarageNodes that replace it.
 		if cluster.HasStorageTier() {
-			if err := r.reconcileStatefulSet(ctx, cluster, storageConfigHash); err != nil {
-				return r.updateStatus(ctx, cluster, PhaseFailed, err)
+			if err := r.migrateLegacyStorageSTSIfNeeded(ctx, cluster); err != nil {
+				return r.updateStatus(ctx, cluster, PhaseFailed, fmt.Errorf("legacy STS migration: %w", err))
 			}
-			if err := r.reconcilePDB(ctx, cluster); err != nil {
-				return r.updateStatus(ctx, cluster, PhaseFailed, err)
-			}
-			if err := r.reconcilePVCExpansion(ctx, cluster); err != nil {
+			if err := r.reconcileAutoModeStorageNodes(ctx, cluster); err != nil {
 				return r.updateStatus(ctx, cluster, PhaseFailed, err)
 			}
 		} else {
-			// No storage tier declared — make sure no leftover storage StatefulSet exists.
+			// No storage tier declared — clean up any leftover legacy STS plus
+			// operator-owned child GarageNodes.
 			if err := r.deleteStorageStatefulSet(ctx, cluster); err != nil {
+				return r.updateStatus(ctx, cluster, PhaseFailed, err)
+			}
+			if err := r.deleteAutoModeStorageNodes(ctx, cluster); err != nil {
 				return r.updateStatus(ctx, cluster, PhaseFailed, err)
 			}
 		}
@@ -217,11 +231,19 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				return r.updateStatus(ctx, cluster, PhaseFailed, err)
 			}
 		}
+	} else {
+		// Manual mode: if the previous policy was Auto and operator-owned
+		// GarageNodes still exist, eject them so the user can take over.
+		if err := r.ejectAutoModeStorageNodes(ctx, cluster); err != nil {
+			return r.updateStatus(ctx, cluster, PhaseFailed, fmt.Errorf("ejecting Auto-mode GarageNodes: %w", err))
+		}
 	}
 
-	// Bootstrap cluster nodes if pods are running but cluster isn't formed
-	// Skip for Manual layout policy - GarageNode controller handles layout
-	if cluster.Spec.LayoutPolicy != LayoutPolicyManual {
+	// Bootstrap cluster nodes if pods are running but cluster isn't formed.
+	// Both Manual and Auto mode delegate node layout management to the
+	// GarageNode controller, so the cluster-level bootstrap path only runs for
+	// the gateway tier (storage tier is bootstrapped via per-node reconciles).
+	if cluster.Spec.LayoutPolicy != LayoutPolicyManual && !cluster.HasStorageTier() {
 		if err := r.bootstrapCluster(ctx, cluster); err != nil {
 			log.Error(err, "Failed to bootstrap cluster (will retry)")
 			// Don't fail reconciliation, just log and continue
@@ -289,6 +311,27 @@ func (r *GarageClusterReconciler) finalize(ctx context.Context, cluster *garagev
 		}
 	} else if !errors.IsNotFound(err) {
 		return err
+	}
+
+	// Delete operator-owned child GarageNodes (Auto-mode per-node CRs).
+	// They'd also be cascade-deleted via ownerRef, but explicit Delete ensures
+	// the GarageNode finalizer fires in a predictable order with respect to
+	// the cluster-level layout cleanup above.
+	gnList := &garagev1beta1.GarageNodeList{}
+	if err := r.List(ctx, gnList,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels(map[string]string{
+			labelCluster:      cluster.Name,
+			labelAppManagedBy: managedByOperatorValue,
+		}),
+	); err == nil {
+		for i := range gnList.Items {
+			n := &gnList.Items[i]
+			log.Info("Deleting child GarageNode", "name", n.Name)
+			if err := r.Delete(ctx, n); err != nil && !errors.IsNotFound(err) {
+				return fmt.Errorf("failed to delete child GarageNode %s: %w", n.Name, err)
+			}
+		}
 	}
 
 	// Delete Deployment (for gateway clusters)
@@ -726,6 +769,23 @@ type configContext struct {
 	// address — gateways otherwise advertise the storage LB hostname, which routes
 	// peers to the wrong node ID on RPC and breaks the handshake.
 	TierRPCPublicAddrOverride string
+	// NodeDataDirPaths, when non-empty, replaces the cluster-level data_dir with a
+	// per-node TOML array (one entry per mount). Used by the GarageNode controller
+	// for multi-HDD nodes. Capacity (e.g. "100Gi") is optional; when set it is
+	// emitted as the per-path `capacity` so Garage knows the disk size.
+	NodeDataDirPaths []NodeDataDirPath
+	// NodeMetadataSnapshotsDir overrides storage.metadataSnapshotsDir for this node's
+	// garage.toml. Empty means inherit from cluster spec.
+	NodeMetadataSnapshotsDir string
+	// NodeMetadataAutoSnapshotInterval overrides storage.metadataAutoSnapshotInterval
+	// for this node's garage.toml. Empty means inherit from cluster spec.
+	NodeMetadataAutoSnapshotInterval string
+}
+
+// NodeDataDirPath is one mount path in a per-node multi-HDD garage.toml data_dir array.
+type NodeDataDirPath struct {
+	Path     string
+	Capacity string // optional; if empty, the entry is emitted without a capacity attribute
 }
 
 // buildConfigContext creates a configContext by resolving secrets referenced in the cluster spec.
@@ -806,7 +866,7 @@ func generateGarageConfig(cluster *garagev1beta2.GarageCluster, cfgCtx *configCo
 	// Gateway clusters use StatefulSet with metadata PVC (for node identity persistence)
 	// and EmptyDir for data (since gateways don't store blocks).
 	config.WriteString("metadata_dir = \"/data/metadata\"\n")
-	writeDataDirConfig(&config, cluster)
+	writeDataDirConfig(&config, cluster, cfgCtx)
 	config.WriteString("\n")
 
 	writeDBConfig(&config, cluster)
@@ -828,7 +888,24 @@ func generateGarageConfig(cluster *garagev1beta2.GarageCluster, cfgCtx *configCo
 // writeDataDirConfig writes the data_dir configuration, supporting both single path
 // and multi-path configurations. Garage supports multiple data directories since v0.9.0
 // with format: data_dir = [{ path = "/path", capacity = "2T" }, ...]
-func writeDataDirConfig(config *strings.Builder, cluster *garagev1beta2.GarageCluster) {
+func writeDataDirConfig(config *strings.Builder, cluster *garagev1beta2.GarageCluster, cfgCtx *configContext) {
+	// Per-node multi-HDD override takes precedence over cluster-level paths.
+	if cfgCtx != nil && len(cfgCtx.NodeDataDirPaths) > 0 {
+		config.WriteString("data_dir = [\n")
+		for i, p := range cfgCtx.NodeDataDirPaths {
+			fmt.Fprintf(config, "    { path = \"%s\"", p.Path)
+			if p.Capacity != "" {
+				fmt.Fprintf(config, ", capacity = \"%s\"", p.Capacity)
+			}
+			config.WriteString(" }")
+			if i < len(cfgCtx.NodeDataDirPaths)-1 {
+				config.WriteString(",")
+			}
+			config.WriteString("\n")
+		}
+		config.WriteString("]\n")
+		return
+	}
 	if cluster.HasStorageTier() && cluster.Spec.Storage.Data != nil && len(cluster.Spec.Storage.Data.Paths) > 0 {
 		// Multi-path configuration
 		paths := cluster.Spec.Storage.Data.Paths
@@ -912,6 +989,12 @@ func writeStorageConfig(config *strings.Builder, cluster *garagev1beta2.GarageCl
 	}
 	if cfgCtx != nil && cfgCtx.DataFsync != nil {
 		dataFsync = *cfgCtx.DataFsync
+	}
+	if cfgCtx != nil && cfgCtx.NodeMetadataSnapshotsDir != "" {
+		metadataSnapshotsDir = cfgCtx.NodeMetadataSnapshotsDir
+	}
+	if cfgCtx != nil && cfgCtx.NodeMetadataAutoSnapshotInterval != "" {
+		metadataAutoSnapshotInterval = cfgCtx.NodeMetadataAutoSnapshotInterval
 	}
 
 	if metadataFsync {
@@ -1368,16 +1451,18 @@ func apiServicePorts(cluster *garagev1beta2.GarageCluster) []corev1.ServicePort 
 // apiServiceSelector returns the pod-selector used by the in-cluster API
 // Service for the given cluster shape.
 //
-//   - Manual layout: GarageNode pods don't carry the unified instance label, so
-//     the historical Manual selector ({labelCluster: cluster.Name}) is preserved
-//     — a tier filter would silently match zero pods.
-//   - Otherwise: scope to the requested tier (storage or gateway). The bare
-//     "instance" selector matches both StatefulSet and Deployment pods and
-//     would round-robin in-cluster admin/S3 traffic across mixed tiers; the
-//     tier label removes that ambiguity.
+//   - Storage tier: pods are owned by per-node GarageNode StatefulSets in both
+//     Manual and Auto modes (post-#190). They carry {labelCluster, labelTier}
+//     but not the unified {name=garage, instance=<cluster>} labels, so the
+//     selector must be cluster+tier scoped.
+//   - Gateway tier: still a Deployment with the unified tier labels, so the
+//     tier-scoped selector matches as before.
 func (r *GarageClusterReconciler) apiServiceSelector(cluster *garagev1beta2.GarageCluster, tier string) map[string]string {
-	if cluster.Spec.LayoutPolicy == LayoutPolicyManual {
-		return r.selectorLabelsForCluster(cluster)
+	if tier == tierStorage {
+		return map[string]string{
+			labelCluster: cluster.Name,
+			labelTier:    tierStorage,
+		}
 	}
 	return r.selectorLabelsForTier(cluster, tier)
 }
@@ -1587,13 +1672,20 @@ func (r *GarageClusterReconciler) reconcilePerNodeLoadBalancerServices(ctx conte
 	replicas := cluster.StorageReplicas()
 	desired := make(map[string]struct{}, replicas)
 
+	// Per-#190, storage pods are owned by per-GarageNode StatefulSets named
+	// `<cluster>-storage-<i>` with pod `<cluster>-storage-<i>-0`. Select pods via
+	// the stable `garage.rajsingh.info/node` label written by the GarageNode
+	// controller — this avoids hard-coding the pod-name convention and works
+	// regardless of GarageNode renames or single-pod STS naming.
 	for i := int32(0); i < replicas; i++ {
-		podName := fmt.Sprintf("%s-%d", cluster.Name, i)
-		svcName := podName + "-rpc"
+		nodeName := autoModeGarageNodeName(cluster.Name, i)
+		svcName := perNodeRPCServiceName(cluster.Name, i)
 		desired[svcName] = struct{}{}
 
-		selector := r.selectorLabelsForCluster(cluster)
-		selector["statefulset.kubernetes.io/pod-name"] = podName
+		selector := map[string]string{
+			labelCluster:    cluster.Name,
+			labelGarageNode: nodeName,
+		}
 
 		svc := &corev1.Service{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1610,7 +1702,7 @@ func (r *GarageClusterReconciler) reconcilePerNodeLoadBalancerServices(ctx conte
 			},
 		}
 
-		log.Info("Reconciling per-node public endpoint RPC service", "name", svcName, "pod", podName, "type", corev1.ServiceTypeLoadBalancer)
+		log.Info("Reconciling per-node public endpoint RPC service", "name", svcName, "node", nodeName, "type", corev1.ServiceTypeLoadBalancer)
 		if err := reconcileService(ctx, r.Client, svc, cluster, r.Scheme); err != nil {
 			return err
 		}
@@ -1679,6 +1771,15 @@ func rpcServicePort(rpcPort, nodePort int32) corev1.ServicePort {
 		port.NodePort = nodePort
 	}
 	return port
+}
+
+// perNodeRPCServiceName is the canonical name for the per-pod LoadBalancer RPC
+// Service that fronts a single storage pod. The format `<cluster>-<i>-rpc` is
+// kept stable across the #190 migration so external systems (DNS, federation)
+// don't need to chase a rename — the underlying pod selector changed but the
+// Service name did not. Decoded by isClusterPerNodeRPCServiceName.
+func perNodeRPCServiceName(clusterName string, ordinal int32) string {
+	return fmt.Sprintf("%s-%d-rpc", clusterName, ordinal)
 }
 
 func isClusterPerNodeRPCServiceName(clusterName, serviceName string) bool {
@@ -1777,6 +1878,8 @@ func buildContainerPorts(cluster *garagev1beta2.GarageCluster) []corev1.Containe
 // data path in a multi-HDD configuration (issue #188). Naming is
 // `data-<index>` so existing single-path clusters keep using the legacy
 // `data` PVC name and don't see a destructive rename.
+//
+//nolint:unused // shared helper retained for parity with garagenode_controller naming
 func dataPathPVCName(i int) string {
 	return fmt.Sprintf("%s-%d", dataVolName, i)
 }
@@ -1785,6 +1888,8 @@ func dataPathPVCName(i int) string {
 // list of data paths (`storage.data.paths[]`). When true, the operator emits
 // one PVC + one volumeMount per path; otherwise it falls back to the legacy
 // single-PVC layout mounted at /data/data.
+//
+//nolint:unused // shared cluster-shape helper retained for tests and future use
 func hasMultipleDataPaths(cluster *garagev1beta2.GarageCluster) bool {
 	if !cluster.HasStorageTier() {
 		return false
@@ -1795,6 +1900,12 @@ func hasMultipleDataPaths(cluster *garagev1beta2.GarageCluster) bool {
 // buildVolumesAndMounts returns volumes and volume mounts for the Garage StatefulSet.
 // For gateway clusters, data volume is EmptyDir since gateways don't store blocks.
 // Metadata volume comes from PVC (via VolumeClaimTemplates) for both gateway and storage.
+//
+// Post-#190: the cluster-level storage STS no longer exists; this helper is
+// retained for unit tests that exercise the cluster-shape volume/mount logic.
+// The live storage path uses garagenode_controller's per-node builders.
+//
+//nolint:unused,unparam // retained for tests; per-node builders live in garagenode_controller.go
 func buildVolumesAndMounts(cluster *garagev1beta2.GarageCluster) ([]corev1.Volume, []corev1.VolumeMount) {
 	volumeMounts := []corev1.VolumeMount{
 		{Name: configVolumeName, MountPath: configMountPath, ReadOnly: true},
@@ -2014,376 +2125,6 @@ func buildVolumesAndMounts(cluster *garagev1beta2.GarageCluster) ([]corev1.Volum
 	return volumes, volumeMounts
 }
 
-// buildVolumeClaimTemplates returns PVC templates for the storage tier's StatefulSet.
-// Both metadata and data PVCs are created unless the user explicitly opted for EmptyDir.
-// Gateway pods never use PVCs — they get EmptyDir directly in the Deployment template.
-func buildVolumeClaimTemplates(cluster *garagev1beta2.GarageCluster) []corev1.PersistentVolumeClaim {
-	if !cluster.HasStorageTier() {
-		return nil
-	}
-
-	var templates []corev1.PersistentVolumeClaim
-
-	if !isMetadataEmptyDir(cluster) {
-		templates = append(templates, buildMetadataPVC(cluster))
-	}
-	if !isDataEmptyDir(cluster) {
-		if hasMultipleDataPaths(cluster) {
-			// Issue #188: when paths[] is declared, emit one PVC per path so
-			// each disk gets its own mount. Per-path Volume config (size,
-			// storageClass, etc.) wins; top-level data.* is the fallback.
-			for i, p := range cluster.Spec.Storage.Data.Paths {
-				templates = append(templates, buildDataPathPVC(cluster, i, p))
-			}
-		} else {
-			templates = append(templates, buildDataPVC(cluster))
-		}
-	}
-
-	return templates
-}
-
-// buildDataPathPVC creates the PVC template for one entry in
-// `spec.storage.data.paths[]`. Per-path `volume.*` settings take precedence;
-// missing fields fall back to the top-level `spec.storage.data.*` so that a
-// user can specify e.g. a single storageClassName once and have every per-path
-// PVC inherit it.
-func buildDataPathPVC(cluster *garagev1beta2.GarageCluster, idx int, path garagev1beta2.DataPath) corev1.PersistentVolumeClaim {
-	size := resource.MustParse("100Gi")
-	topLevel := cluster.Spec.Storage.Data // never nil — caller guards
-	pathVol := path.Volume
-
-	// Capacity declared on the DataPath itself feeds Garage's data_dir but is
-	// also a sensible default for the underlying PVC size when no explicit
-	// volume.size is set, so callers don't have to repeat themselves.
-	switch {
-	case pathVol != nil && pathVol.Size != nil && !pathVol.Size.IsZero():
-		size = *pathVol.Size
-	case path.Capacity != nil && !path.Capacity.IsZero():
-		size = *path.Capacity
-	case topLevel != nil && topLevel.Size != nil && !topLevel.Size.IsZero():
-		size = *topLevel.Size
-	}
-
-	var sc *string
-	if pathVol != nil && pathVol.StorageClassName != nil {
-		sc = pathVol.StorageClassName
-	} else if topLevel != nil {
-		sc = topLevel.StorageClassName
-	}
-
-	var accessModes []corev1.PersistentVolumeAccessMode
-	if pathVol != nil && len(pathVol.AccessModes) > 0 {
-		accessModes = pathVol.AccessModes
-	} else if topLevel != nil {
-		accessModes = topLevel.AccessModes
-	}
-
-	pvc := buildBasePVC(dataPathPVCName(idx), size, sc, accessModes)
-
-	var selector *metav1.LabelSelector
-	if pathVol != nil && pathVol.Selector != nil {
-		selector = pathVol.Selector
-	} else if topLevel != nil {
-		selector = topLevel.Selector
-	}
-	if selector != nil {
-		pvc.Spec.Selector = selector
-	}
-
-	labels := map[string]string(nil)
-	if pathVol != nil && len(pathVol.Labels) > 0 {
-		labels = pathVol.Labels
-	} else if topLevel != nil && len(topLevel.Labels) > 0 {
-		labels = topLevel.Labels
-	}
-	if len(labels) > 0 {
-		pvc.Labels = labels
-	}
-
-	annotations := map[string]string(nil)
-	if pathVol != nil && len(pathVol.Annotations) > 0 {
-		annotations = pathVol.Annotations
-	} else if topLevel != nil && len(topLevel.Annotations) > 0 {
-		annotations = topLevel.Annotations
-	}
-	if len(annotations) > 0 {
-		pvc.Annotations = annotations
-	}
-
-	return pvc
-}
-
-// buildMetadataPVC creates the metadata PVC template for the storage tier.
-func buildMetadataPVC(cluster *garagev1beta2.GarageCluster) corev1.PersistentVolumeClaim {
-	size := resource.MustParse("10Gi")
-
-	var sc *string
-	var accessModes []corev1.PersistentVolumeAccessMode
-	if meta := cluster.Spec.Storage.Metadata; meta != nil {
-		if meta.Size != nil && !meta.Size.IsZero() {
-			size = *meta.Size
-		}
-		sc = meta.StorageClassName
-		accessModes = meta.AccessModes
-	}
-
-	pvc := buildBasePVC(metadataVolName, size, sc, accessModes)
-
-	if meta := cluster.Spec.Storage.Metadata; meta != nil {
-		if meta.Selector != nil {
-			pvc.Spec.Selector = meta.Selector
-		}
-		if len(meta.Labels) > 0 {
-			pvc.Labels = meta.Labels
-		}
-		if len(meta.Annotations) > 0 {
-			pvc.Annotations = meta.Annotations
-		}
-	}
-
-	return pvc
-}
-
-// firstDataPathVolume returns the volume config of the first data path that
-// declares one, or nil. Used as a fallback when top-level data fields are unset
-// but the user configured paths[].volume — matches the v1alpha1 behavior from #51.
-func firstDataPathVolume(cluster *garagev1beta2.GarageCluster) *garagev1beta2.DataPathVolumeConfig {
-	if !cluster.HasStorageTier() {
-		return nil
-	}
-	data := cluster.Spec.Storage.Data
-	if data == nil {
-		return nil
-	}
-	for i := range data.Paths {
-		if data.Paths[i].Volume != nil {
-			return data.Paths[i].Volume
-		}
-	}
-	return nil
-}
-
-// buildDataPVC creates the data PVC template.
-//
-// Precedence for each field: top-level Storage.Data wins; otherwise fall back
-// to the first paths[].volume that defines it. This mirrors buildMetadataPVC
-// behavior and restores the v1alpha1 fix from #51 lost in the v1beta1 rewrite.
-func buildDataPVC(cluster *garagev1beta2.GarageCluster) corev1.PersistentVolumeClaim {
-	size := resource.MustParse("100Gi")
-
-	var sc *string
-	var accessModes []corev1.PersistentVolumeAccessMode
-	pathVol := firstDataPathVolume(cluster)
-	if data := cluster.Spec.Storage.Data; data != nil {
-		if data.Size != nil && !data.Size.IsZero() {
-			size = *data.Size
-		} else if pathVol != nil && pathVol.Size != nil && !pathVol.Size.IsZero() {
-			size = *pathVol.Size
-		}
-		sc = data.StorageClassName
-		if sc == nil && pathVol != nil {
-			sc = pathVol.StorageClassName
-		}
-		accessModes = data.AccessModes
-		if len(accessModes) == 0 && pathVol != nil {
-			accessModes = pathVol.AccessModes
-		}
-	}
-
-	pvc := buildBasePVC(dataVolName, size, sc, accessModes)
-
-	if data := cluster.Spec.Storage.Data; data != nil {
-		selector := data.Selector
-		if selector == nil && pathVol != nil {
-			selector = pathVol.Selector
-		}
-		if selector != nil {
-			pvc.Spec.Selector = selector
-		}
-
-		labels := data.Labels
-		if len(labels) == 0 && pathVol != nil {
-			labels = pathVol.Labels
-		}
-		if len(labels) > 0 {
-			pvc.Labels = labels
-		}
-
-		annotations := data.Annotations
-		if len(annotations) == 0 && pathVol != nil {
-			annotations = pathVol.Annotations
-		}
-		if len(annotations) > 0 {
-			pvc.Annotations = annotations
-		}
-	}
-
-	return pvc
-}
-
-// buildPVCRetentionPolicy returns the PVC retention policy for the storage StatefulSet.
-// Defaults to Retain for both policies (preserving existing behavior).
-func buildPVCRetentionPolicy(cluster *garagev1beta2.GarageCluster) *appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy {
-	whenDeleted := appsv1.RetainPersistentVolumeClaimRetentionPolicyType
-	whenScaled := appsv1.RetainPersistentVolumeClaimRetentionPolicyType
-
-	if cluster.HasStorageTier() && cluster.Spec.Storage.PVCRetentionPolicy != nil {
-		if cluster.Spec.Storage.PVCRetentionPolicy.WhenDeleted == "Delete" {
-			whenDeleted = appsv1.DeletePersistentVolumeClaimRetentionPolicyType
-		}
-		if cluster.Spec.Storage.PVCRetentionPolicy.WhenScaled == "Delete" {
-			whenScaled = appsv1.DeletePersistentVolumeClaimRetentionPolicyType
-		}
-	}
-
-	return &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
-		WhenDeleted: whenDeleted,
-		WhenScaled:  whenScaled,
-	}
-}
-
-// reconcileStatefulSet creates/updates the StatefulSet for the storage tier.
-// The configHash parameter is used to trigger rolling restarts when config changes,
-// since Garage does NOT support hot-reload (config is only read at startup).
-func (r *GarageClusterReconciler) reconcileStatefulSet(ctx context.Context, cluster *garagev1beta2.GarageCluster, configHash string) error {
-	log := logf.FromContext(ctx)
-	stsName := cluster.Name
-
-	image := resolveGarageImage(cluster.Spec.Image, cluster.Spec.ImageRepository, r.DefaultImage)
-
-	// Honor an explicit replicas=0 so operators can pause the storage tier
-	// without removing the tier definition (PVCs, capacity, etc. are preserved).
-	replicas := cluster.StorageReplicas()
-
-	containerPorts := buildContainerPorts(cluster)
-	volumes, volumeMounts := buildVolumesAndMounts(cluster)
-	volumeClaimTemplates := buildVolumeClaimTemplates(cluster)
-
-	st := cluster.Spec.Storage
-	podSpec := buildGaragePodSpec(PodSpecConfig{
-		Image:                     image,
-		ImagePullPolicy:           cluster.Spec.ImagePullPolicy,
-		ImagePullSecrets:          cluster.Spec.ImagePullSecrets,
-		Resources:                 st.Resources,
-		NodeSelector:              st.NodeSelector,
-		Tolerations:               st.Tolerations,
-		Affinity:                  st.Affinity,
-		PriorityClassName:         st.PriorityClassName,
-		ServiceAccountName:        cluster.Spec.ServiceAccountName,
-		SecurityContext:           st.SecurityContext,
-		ContainerSecurityContext:  st.ContainerSecurityContext,
-		TopologySpreadConstraints: st.TopologySpreadConstraints,
-		IsGateway:                 false,
-		Logging:                   cluster.Spec.Logging,
-		Env:                       st.Env,
-		EnvFrom:                   st.EnvFrom,
-	}, volumes, volumeMounts, containerPorts)
-
-	podLabels := r.selectorLabelsForTier(cluster, tierStorage)
-	for k, v := range st.PodLabels {
-		podLabels[k] = v
-	}
-
-	// Compute pod-spec-hash from the PodSpec plus user-provided pod metadata to detect changes
-	// to probes, image, resources, AND to user-supplied podAnnotations/podLabels. This is separate
-	// from config-hash (which only covers the ConfigMap content). When either hash changes, the
-	// StatefulSet will be updated and pods will restart.
-	//
-	// Note: we hash the USER-PROVIDED annotations/labels here, NOT the merged maps below — the
-	// merged map already contains config-hash and pod-spec-hash itself, which would be circular.
-	podSpecHashStr := computePodSpecHash(podSpec, st.PodAnnotations, st.PodLabels)
-
-	// Build pod annotations with checksums to trigger rolling restart on changes.
-	// This is required because Garage does NOT support hot-reload - SIGHUP is explicitly
-	// ignored and config is only read at startup. When hashes change, Kubernetes
-	// detects the annotation change and triggers a rolling update of the StatefulSet.
-	podAnnotations := make(map[string]string)
-	for k, v := range st.PodAnnotations {
-		podAnnotations[k] = v
-	}
-	podAnnotations["garage.rajsingh.info/config-hash"] = configHash
-	podAnnotations["garage.rajsingh.info/pod-spec-hash"] = podSpecHashStr
-
-	sts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      stsName,
-			Namespace: cluster.Namespace,
-			Labels:    r.labelsForTier(cluster, tierStorage),
-		},
-		Spec: appsv1.StatefulSetSpec{
-			ServiceName: cluster.Name + "-headless",
-			Replicas:    &replicas,
-			Selector:    &metav1.LabelSelector{MatchLabels: r.selectorLabelsForTier(cluster, tierStorage)},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: podLabels, Annotations: podAnnotations},
-				Spec:       podSpec,
-			},
-			VolumeClaimTemplates:                 volumeClaimTemplates,
-			PodManagementPolicy:                  appsv1.ParallelPodManagement,
-			UpdateStrategy:                       appsv1.StatefulSetUpdateStrategy{Type: appsv1.RollingUpdateStatefulSetStrategyType},
-			PersistentVolumeClaimRetentionPolicy: buildPVCRetentionPolicy(cluster),
-		},
-	}
-
-	if err := controllerutil.SetControllerReference(cluster, sts, r.Scheme); err != nil {
-		return err
-	}
-
-	existing := &appsv1.StatefulSet{}
-	err := r.Get(ctx, types.NamespacedName{Name: stsName, Namespace: cluster.Namespace}, existing)
-	if errors.IsNotFound(err) {
-		log.Info("Creating StatefulSet", "name", stsName)
-		return r.Create(ctx, sts)
-	}
-	if err != nil {
-		return err
-	}
-
-	// VolumeClaimTemplates are immutable in Kubernetes. If the storageClassName of any
-	// VCT changed, delete the StatefulSet (orphan cascade, preserving PVCs) and return.
-	// The next reconcile will create a new StatefulSet with the correct VCTs. The operator
-	// does NOT auto-delete the old PVCs — the user must delete them manually so the new
-	// StatefulSet can provision fresh PVCs with the correct storageClass.
-	if vctStorageClassChanged(existing.Spec.VolumeClaimTemplates, volumeClaimTemplates) {
-		log.Info("VolumeClaimTemplate storageClass changed, recreating StatefulSet (orphan cascade — delete old PVCs manually)", "name", stsName)
-		propagation := metav1.DeletePropagationOrphan
-		if err := r.Delete(ctx, existing, &client.DeleteOptions{PropagationPolicy: &propagation}); err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete StatefulSet for VCT recreation: %w", err)
-		}
-		return nil
-	}
-
-	// Check if update is needed by comparing key fields
-	needsUpdate := existing.Spec.Replicas == nil || *existing.Spec.Replicas != *sts.Spec.Replicas
-
-	// Check config hash annotation (indicates ConfigMap/TOML changes)
-	existingConfigHash := existing.Spec.Template.Annotations["garage.rajsingh.info/config-hash"]
-	newConfigHash := sts.Spec.Template.Annotations["garage.rajsingh.info/config-hash"]
-	if existingConfigHash != newConfigHash {
-		log.Info("Config hash changed, updating StatefulSet", "old", existingConfigHash, "new", newConfigHash)
-		needsUpdate = true
-	}
-
-	// Check pod-spec-hash annotation (detects changes to probes, image, resources, etc.)
-	existingPodSpecHash := existing.Spec.Template.Annotations["garage.rajsingh.info/pod-spec-hash"]
-	newPodSpecHash := sts.Spec.Template.Annotations["garage.rajsingh.info/pod-spec-hash"]
-	if existingPodSpecHash != newPodSpecHash {
-		log.Info("Pod spec hash changed, updating StatefulSet", "old", existingPodSpecHash, "new", newPodSpecHash)
-		needsUpdate = true
-	}
-
-	if !needsUpdate {
-		log.V(1).Info("StatefulSet is up to date", "name", stsName)
-		return nil
-	}
-
-	existing.Spec.Replicas = sts.Spec.Replicas
-	existing.Spec.Template = sts.Spec.Template
-	log.Info("Updating StatefulSet", "name", stsName)
-	return r.Update(ctx, existing)
-}
-
 // vctStorageClassChanged returns true if any VolumeClaimTemplate in desired has a different
 // storageClassName than the corresponding template in existing (matched by name). Kubernetes
 // treats VCTs as immutable, so a storageClass change requires deleting and recreating the STS.
@@ -2407,168 +2148,6 @@ func vctStorageClassChanged(existing, desired []corev1.PersistentVolumeClaim) bo
 		}
 	}
 	return false
-}
-
-// reconcilePVCExpansion expands existing storage-tier PVCs when the spec requests a
-// larger size. StatefulSet VolumeClaimTemplates are immutable in Kubernetes, so
-// resizing requires patching the individual PVC objects directly.
-func (r *GarageClusterReconciler) reconcilePVCExpansion(ctx context.Context, cluster *garagev1beta2.GarageCluster) error {
-	log := logf.FromContext(ctx)
-
-	if !cluster.HasStorageTier() {
-		return nil
-	}
-	// Honor an explicit replicas=0 so operators can pause the storage tier
-	// without removing the tier definition (PVCs, capacity, etc. are preserved).
-	replicas := cluster.StorageReplicas()
-
-	if !isMetadataEmptyDir(cluster) {
-		desiredSize := buildMetadataPVC(cluster).Spec.Resources.Requests[corev1.ResourceStorage]
-		for i := int32(0); i < replicas; i++ {
-			pvcName := fmt.Sprintf("metadata-%s-%d", cluster.Name, i)
-			if err := r.maybeExpandPVC(ctx, log, cluster.Namespace, pvcName, desiredSize); err != nil {
-				return err
-			}
-		}
-	}
-
-	if !isDataEmptyDir(cluster) {
-		if hasMultipleDataPaths(cluster) {
-			// Multi-path layout: PVC templates are named data-0, data-1, …
-			// so the per-replica PVC names are data-<idx>-<cluster>-<ord>.
-			for idx, p := range cluster.Spec.Storage.Data.Paths {
-				desiredSize := buildDataPathPVC(cluster, idx, p).Spec.Resources.Requests[corev1.ResourceStorage]
-				for i := int32(0); i < replicas; i++ {
-					pvcName := fmt.Sprintf("%s-%s-%d", dataPathPVCName(idx), cluster.Name, i)
-					if err := r.maybeExpandPVC(ctx, log, cluster.Namespace, pvcName, desiredSize); err != nil {
-						return err
-					}
-				}
-			}
-		} else {
-			desiredSize := buildDataPVC(cluster).Spec.Resources.Requests[corev1.ResourceStorage]
-			for i := int32(0); i < replicas; i++ {
-				pvcName := fmt.Sprintf("data-%s-%d", cluster.Name, i)
-				if err := r.maybeExpandPVC(ctx, log, cluster.Namespace, pvcName, desiredSize); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-func (r *GarageClusterReconciler) maybeExpandPVC(ctx context.Context, log logr.Logger, namespace, pvcName string, desiredSize resource.Quantity) error {
-	pvc := &corev1.PersistentVolumeClaim{}
-	if err := r.Get(ctx, types.NamespacedName{Name: pvcName, Namespace: namespace}, pvc); err != nil {
-		if errors.IsNotFound(err) {
-			return nil
-		}
-		return err
-	}
-
-	currentSize := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	if desiredSize.Cmp(currentSize) <= 0 {
-		return nil
-	}
-
-	// Check if the storage class supports volume expansion before attempting.
-	// If the SC is not found or doesn't have allowVolumeExpansion, skip rather than
-	// attempt a patch that Kubernetes will reject (static PVCs, missing SC, etc.).
-	if scName := pvc.Spec.StorageClassName; scName != nil && *scName != "" {
-		sc := &storagev1.StorageClass{}
-		if err := r.Get(ctx, types.NamespacedName{Name: *scName}, sc); err != nil {
-			if errors.IsNotFound(err) {
-				log.Info("Skipping PVC expansion: storage class not found", "name", pvcName, "storageClass", *scName)
-				return nil
-			}
-			return err
-		}
-		if sc.AllowVolumeExpansion == nil || !*sc.AllowVolumeExpansion {
-			log.Info("Skipping PVC expansion: storage class does not support resize", "name", pvcName, "storageClass", *scName)
-			return nil
-		}
-	}
-
-	log.Info("Expanding PVC", "name", pvcName, "namespace", namespace, "from", currentSize.String(), "to", desiredSize.String())
-	patch := client.MergeFrom(pvc.DeepCopy())
-	pvc.Spec.Resources.Requests[corev1.ResourceStorage] = desiredSize
-	return r.Patch(ctx, pvc, patch)
-}
-
-func (r *GarageClusterReconciler) reconcilePDB(ctx context.Context, cluster *garagev1beta2.GarageCluster) error {
-	log := logf.FromContext(ctx)
-
-	pdbCfg := cluster.Spec.Storage.PodDisruptionBudget
-
-	// Check if PDB is enabled (storage tier only).
-	if pdbCfg == nil || !pdbCfg.Enabled {
-		// PDB not enabled, delete if exists
-		pdb := &policyv1.PodDisruptionBudget{}
-		if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, pdb); err == nil {
-			log.Info("Deleting PDB (disabled)", "name", cluster.Name)
-			return r.Delete(ctx, pdb)
-		}
-		return nil
-	}
-
-	pdb := &policyv1.PodDisruptionBudget{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      cluster.Name,
-			Namespace: cluster.Namespace,
-			Labels:    r.labelsForTier(cluster, tierStorage),
-		},
-		Spec: policyv1.PodDisruptionBudgetSpec{
-			Selector: &metav1.LabelSelector{
-				MatchLabels: r.selectorLabelsForTier(cluster, tierStorage),
-			},
-		},
-	}
-
-	// Set MinAvailable or MaxUnavailable
-	if pdbCfg.MinAvailable != nil {
-		pdb.Spec.MinAvailable = pdbCfg.MinAvailable
-	} else if pdbCfg.MaxUnavailable != nil {
-		pdb.Spec.MaxUnavailable = pdbCfg.MaxUnavailable
-	} else {
-		// Default: require at least (replicas - 1) to maintain quorum
-		replicas := int32(3)
-		if r := cluster.StorageReplicas(); r > 0 {
-			replicas = r
-		}
-		minAvail := replicas - 1
-		if minAvail < 1 {
-			minAvail = 1
-		}
-		pdb.Spec.MinAvailable = &intstr.IntOrString{Type: intstr.Int, IntVal: minAvail}
-	}
-
-	// Set controller reference
-	if err := controllerutil.SetControllerReference(cluster, pdb, r.Scheme); err != nil {
-		return fmt.Errorf("failed to set controller reference: %w", err)
-	}
-
-	// Check if PDB exists
-	existing := &policyv1.PodDisruptionBudget{}
-	err := r.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, existing)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			log.Info("Creating PDB", "name", cluster.Name)
-			return r.Create(ctx, pdb)
-		}
-		return err
-	}
-
-	// Update if spec differs
-	if !apiequality.Semantic.DeepEqual(existing.Spec.MinAvailable, pdb.Spec.MinAvailable) ||
-		!apiequality.Semantic.DeepEqual(existing.Spec.MaxUnavailable, pdb.Spec.MaxUnavailable) {
-		existing.Spec = pdb.Spec
-		log.Info("Updating PDB", "name", cluster.Name)
-		return r.Update(ctx, existing)
-	}
-
-	return nil
 }
 
 func (r *GarageClusterReconciler) updateStatus(ctx context.Context, cluster *garagev1beta2.GarageCluster, phase string, err error) (ctrl.Result, error) {
@@ -2624,21 +2203,47 @@ func (r *GarageClusterReconciler) updateStatusFromCluster(ctx context.Context, c
 		}
 	} else {
 		// Auto mode: aggregate across the storage and gateway tiers.
+		//
+		// Post-#190 the storage tier is N × per-GarageNode StatefulSets — there is
+		// no single cluster-named storage STS to query. Mirror the Manual path and
+		// count the operator-owned GarageNodes by their .status.connected. The
+		// gateway tier remains a single Deployment/StatefulSet named via
+		// gatewayWorkloadName(cluster) and is still queried directly.
 		var storageDesired, storageReady int32
-		if cluster.HasStorageTier() {
+		var gatewayDesired, gatewayReady int32
+
+		if cluster.HasStorageTier() || cluster.HasGatewayTier() {
 			storageDesired = cluster.StorageReplicas()
-			sts := &appsv1.StatefulSet{}
-			if err := r.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, sts); err != nil {
-				if !errors.IsNotFound(err) {
-					return ctrl.Result{}, err
-				}
+			gatewayDesired = cluster.GatewayReplicas()
+
+			gnList := &garagev1beta1.GarageNodeList{}
+			if err := r.List(ctx, gnList,
+				client.InNamespace(cluster.Namespace),
+				client.MatchingLabels(map[string]string{labelCluster: cluster.Name}),
+			); err != nil {
+				log.Error(err, "Failed to list child GarageNodes for status aggregation")
 			} else {
-				storageReady = sts.Status.ReadyReplicas
+				for _, n := range gnList.Items {
+					if n.Spec.ClusterRef.Name != cluster.Name {
+						continue
+					}
+					if !n.Status.Connected {
+						continue
+					}
+					if n.Spec.Gateway {
+						gatewayReady++
+					} else {
+						storageReady++
+					}
+				}
 			}
 		}
-		var gatewayDesired, gatewayReady int32
-		if cluster.HasGatewayTier() {
-			gatewayDesired = cluster.GatewayReplicas()
+
+		// Gateway tier is reconciled by the cluster controller as a single
+		// Deployment/StatefulSet — when no per-pod GarageNode CRs exist (the
+		// common case), fall back to the workload's ReadyReplicas so the count
+		// reflects the gateway pods' rollout state.
+		if cluster.HasGatewayTier() && gatewayReady == 0 {
 			gwSts := &appsv1.StatefulSet{}
 			if err := r.Get(ctx, types.NamespacedName{Name: gatewayWorkloadName(cluster), Namespace: cluster.Namespace}, gwSts); err != nil {
 				if !errors.IsNotFound(err) {
@@ -2648,6 +2253,7 @@ func (r *GarageClusterReconciler) updateStatusFromCluster(ctx context.Context, c
 				gatewayReady = gwSts.Status.ReadyReplicas
 			}
 		}
+
 		cluster.Status.StorageReplicas = storageDesired
 		cluster.Status.StorageReadyReplicas = storageReady
 		cluster.Status.GatewayReplicas = gatewayDesired
@@ -2911,9 +2517,9 @@ func (r *GarageClusterReconciler) updateStatusFromCluster(ctx context.Context, c
 // storage and gateway tiers. Component is taken from whichever tier exists; when
 // both tiers exist, "storage" wins.
 func (r *GarageClusterReconciler) labelsForCluster(cluster *garagev1beta2.GarageCluster) map[string]string {
-	component := "storage"
+	component := tierStorage
 	if !cluster.HasStorageTier() && cluster.HasGatewayTier() {
-		component = "gateway"
+		component = tierGateway
 	}
 	return map[string]string{
 		labelAppName:      defaultAppName,
@@ -2925,17 +2531,14 @@ func (r *GarageClusterReconciler) labelsForCluster(cluster *garagev1beta2.Garage
 }
 
 func (r *GarageClusterReconciler) selectorLabelsForCluster(cluster *garagev1beta2.GarageCluster) map[string]string {
-	// Auto-mode pods are selected through Kubernetes app labels. Manual-mode pods
-	// are owned by GarageNode resources and use app.kubernetes.io/name=garagenode,
-	// so the shared cluster ownership label is the stable selector across nodes.
-	if cluster.Spec.LayoutPolicy == LayoutPolicyManual {
-		return map[string]string{
-			labelCluster: cluster.Name,
-		}
-	}
+	// Post-#190, both Manual and Auto storage tiers are GarageNode-owned per-node
+	// StatefulSets. Those pods carry app.kubernetes.io/name=garagenode and
+	// app.kubernetes.io/instance=<node-name> (not the cluster name), so the only
+	// stable selector that spans the tier is the shared ownership label.
+	// Gateway-tier Deployments are unaffected — they keep the unified labels and
+	// are reached via tier-specific selectors (selectorLabelsForTier).
 	return map[string]string{
-		labelAppName:     defaultAppName,
-		labelAppInstance: cluster.Name,
+		labelCluster: cluster.Name,
 	}
 }
 
@@ -3397,7 +3000,11 @@ func assignNewNodesToLayout(ctx context.Context, garageClient *garage.Client, no
 	return nil
 }
 
-// bootstrapCluster handles the initial cluster formation by connecting nodes via Admin API
+// bootstrapCluster handles initial cluster formation by connecting nodes via the
+// Admin API. Scope (post-#190): only fires for gateway-only edge clusters — i.e.
+// CRs without a storage tier. Storage-tier nodes are bootstrapped by the per-node
+// GarageNode reconciler, which owns each node's StatefulSet, Service, and layout
+// entry. The call site in Reconcile is guarded by `!cluster.HasStorageTier()`.
 func (r *GarageClusterReconciler) bootstrapCluster(ctx context.Context, cluster *garagev1beta2.GarageCluster) error {
 	log := logf.FromContext(ctx)
 
@@ -5135,6 +4742,12 @@ const (
 // labelTier is the operator's per-tier label key.
 const labelTier = "garage.rajsingh.info/tier"
 
+// labelGarageNode is the per-pod label written by the GarageNode controller
+// onto its StatefulSet's pod template. Stable across pod restarts and
+// independent of the StatefulSet's pod-name convention, so it's the right
+// selector for per-pod Services (e.g. per-node LoadBalancer RPC).
+const labelGarageNode = "garage.rajsingh.info/node"
+
 // labelsForTier returns operator-managed labels scoped to a single tier. Use this
 // when labelling tier-owned resources (StatefulSet / Deployment / per-tier service /
 // PDB) so the label selectors can target one tier without matching the other.
@@ -5162,6 +4775,8 @@ func (r *GarageClusterReconciler) selectorLabelsForTier(cluster *garagev1beta2.G
 // isMetadataEmptyDir returns true when the storage tier's metadata volume is
 // configured as EmptyDir. Returns false when there's no storage tier (gateway-only
 // clusters), since gateway pods always use EmptyDir without going through this path.
+//
+//nolint:unused // used by buildVolumesAndMounts (test-only post-#190)
 func isMetadataEmptyDir(cluster *garagev1beta2.GarageCluster) bool {
 	if !cluster.HasStorageTier() {
 		return false
@@ -5172,6 +4787,8 @@ func isMetadataEmptyDir(cluster *garagev1beta2.GarageCluster) bool {
 
 // isDataEmptyDir returns true when the storage tier's data volume is configured
 // as EmptyDir. Returns false when there's no storage tier.
+//
+//nolint:unused // used by buildVolumesAndMounts (test-only post-#190)
 func isDataEmptyDir(cluster *garagev1beta2.GarageCluster) bool {
 	if !cluster.HasStorageTier() {
 		return false
