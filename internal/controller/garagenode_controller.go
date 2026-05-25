@@ -779,14 +779,20 @@ func (r *GarageNodeReconciler) buildNodeVolumeClaimTemplates(node *garagev1beta1
 // The tier label is critical: post-#190 the cluster-level API Service selects
 // storage pods via {labelCluster, labelTier=storage}. Without it, the Service
 // has no endpoints and admin/S3 traffic to <cluster>.<ns>.svc fails.
+//
+// Storage pods carry the cluster-level {labelAppName=garage, labelAppInstance=<cluster>}
+// pair so externally-defined Services (Tailscale LBs, etc.) selecting on the
+// pre-#190 convention {name=garage, instance=<cluster>, tier=storage} keep
+// matching after the per-node refactor. The unique-per-STS identity comes from
+// labelGarageNode, not from labelAppName/Instance.
 func (r *GarageNodeReconciler) labelsForNode(node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster) map[string]string {
 	tier := tierStorage
 	if node.Spec.Gateway {
 		tier = tierGateway
 	}
 	return map[string]string{
-		labelAppName:      "garagenode",
-		labelAppInstance:  node.Name,
+		labelAppName:      defaultAppName,
+		labelAppInstance:  cluster.Name,
 		labelAppComponent: "node",
 		labelAppManagedBy: operatorName,
 		labelCluster:      cluster.Name,
@@ -795,12 +801,17 @@ func (r *GarageNodeReconciler) labelsForNode(node *garagev1beta1.GarageNode, clu
 	}
 }
 
-// selectorLabelsForNode returns selector labels for a GarageNode's pods.
+// selectorLabelsForNode returns the per-STS selector. It must be unique per
+// GarageNode (so each per-node STS owns exactly its own pod) and immutable for
+// the lifetime of the STS. labelGarageNode is unique per node by construction;
+// labelAppManagedBy is added as a defense-in-depth scope so the selector never
+// matches a pod from an unrelated workload that happens to reuse the same node
+// name. labelAppName/Instance are deliberately omitted — they carry
+// cluster-shared values for external Service compatibility (see labelsForNode).
 func (r *GarageNodeReconciler) selectorLabelsForNode(node *garagev1beta1.GarageNode) map[string]string {
 	return map[string]string{
-		labelAppName:     "garagenode",
-		labelAppInstance: node.Name,
-		labelGarageNode:  node.Name,
+		labelAppManagedBy: operatorName,
+		labelGarageNode:   node.Name,
 	}
 }
 
