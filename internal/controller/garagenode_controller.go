@@ -83,6 +83,21 @@ func (r *GarageNodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		Name:      node.Spec.ClusterRef.Name,
 		Namespace: clusterNamespace,
 	}, cluster); err != nil {
+		// Cluster gone (the cluster-level finalizer ran ahead of GC catching up to
+		// this GarageNode) → no admin API to talk to; the layout entries were
+		// already drained by the cluster finalizer's removeNodesFromLayout call.
+		// Drop the per-node finalizer so the GarageNode + its owned STS get GC'd
+		// instead of wedging this namespace forever.
+		if errors.IsNotFound(err) && !node.DeletionTimestamp.IsZero() {
+			if controllerutil.ContainsFinalizer(node, garageNodeFinalizer) {
+				log.Info("Parent cluster already deleted; releasing GarageNode finalizer", "node", node.Name)
+				controllerutil.RemoveFinalizer(node, garageNodeFinalizer)
+				if updateErr := r.Update(ctx, node); updateErr != nil {
+					return ctrl.Result{}, updateErr
+				}
+			}
+			return ctrl.Result{}, nil
+		}
 		return r.updateStatus(ctx, node, PhaseFailed, fmt.Errorf("cluster not found: %w", err))
 	}
 	// User-created GarageNodes still require Manual layout — operator-managed CRs

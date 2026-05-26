@@ -876,9 +876,39 @@ func (r *GarageKeyReconciler) finalize(ctx context.Context, key *garagev1beta1.G
 		return nil
 	}
 
+	// Pre-revoke every per-bucket grant the operator believes this key has before
+	// calling DeleteKey. Upstream DeleteKey iterates state.authorized_buckets
+	// sequentially and calls set_bucket_key_permissions per bucket — if a single
+	// bucket is wedged (e.g. its RPC lookup never returns), DeleteKey hangs
+	// forever and our client's request-level timeout is the only escape. By
+	// clearing the grants first, with a fresh short timeout per call, one stuck
+	// bucket can't poison the whole finalize. Each iteration has its own
+	// context so we keep making progress even when some calls time out.
+	for _, b := range key.Status.Buckets {
+		if b.BucketID == "" {
+			continue
+		}
+		denyCtx, cancel := context.WithTimeout(ctx, finalizeRPCTimeout)
+		_, err := garageClient.DenyBucketKey(denyCtx, garage.DenyBucketKeyRequest{
+			BucketID:    b.BucketID,
+			AccessKeyID: key.Status.AccessKeyID,
+			Permissions: garage.BucketKeyPerms{Read: true, Write: true, Owner: true},
+		})
+		cancel()
+		if err != nil {
+			if garage.IsNotFound(err) {
+				continue
+			}
+			log.Info("Pre-revoke of bucket grant failed; continuing",
+				"bucketID", b.BucketID, "accessKeyID", key.Status.AccessKeyID, "error", err)
+		}
+	}
+
 	log.Info("Deleting key", "accessKeyID", key.Status.AccessKeyID)
 
-	if err := garageClient.DeleteKey(ctx, key.Status.AccessKeyID); err != nil {
+	delCtx, cancel := context.WithTimeout(ctx, finalizeRPCTimeout)
+	defer cancel()
+	if err := garageClient.DeleteKey(delCtx, key.Status.AccessKeyID); err != nil {
 		// Check if key doesn't exist (404) - that's okay, we can proceed
 		if garage.IsNotFound(err) {
 			log.Info("Key already deleted or not found", "accessKeyID", key.Status.AccessKeyID)

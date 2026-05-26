@@ -18,7 +18,11 @@ package controller
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -26,12 +30,15 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
+	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
 
 const testNamespace = "default"
@@ -357,6 +364,251 @@ var _ = Describe("GarageBucket Controller", func() {
 
 func int64Ptr(i int64) *int64 {
 	return &i
+}
+
+// TestGetBucketWithTimeout_HangServer asserts that getBucketWithTimeout
+// returns errBucketInfoTimeout (the sentinel) when the upstream admin API
+// hangs past the per-call deadline — same shape as a wedged GetBucketInfo
+// in production.
+func TestGetBucketWithTimeout_HangServer(t *testing.T) {
+	// Hang on every request — simulates a Garage admin API that's stuck on
+	// a stale authorized_keys entry whose RPC lookup never returns.
+	hangServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer hangServer.Close()
+
+	prev := getBucketInfoTimeout
+	getBucketInfoTimeout = 100 * time.Millisecond
+	defer func() { getBucketInfoTimeout = prev }()
+
+	client := garage.NewClient(hangServer.URL, "test-token")
+	start := time.Now()
+	_, err := getBucketWithTimeout(context.Background(), client, garage.GetBucketRequest{ID: "abc"})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !isBucketLookupTimeout(err) {
+		t.Errorf("expected isBucketLookupTimeout(err)=true; got err=%v", err)
+	}
+	// Should return ~100ms after deadline, not hang for the full client timeout.
+	if elapsed > 2*time.Second {
+		t.Errorf("getBucketWithTimeout took %s, expected <2s", elapsed)
+	}
+}
+
+// TestGetBucketWithTimeout_ParentContextCancel ensures we DON'T mark a
+// caller-cancelled context as a stuck-bucket signal. Only our own deadline
+// firing should count.
+func TestGetBucketWithTimeout_ParentContextCancel(t *testing.T) {
+	hangServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer hangServer.Close()
+
+	prev := getBucketInfoTimeout
+	getBucketInfoTimeout = 10 * time.Second
+	defer func() { getBucketInfoTimeout = prev }()
+
+	client := garage.NewClient(hangServer.URL, "test-token")
+	parentCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := getBucketWithTimeout(parentCtx, client, garage.GetBucketRequest{ID: "abc"})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if isBucketLookupTimeout(err) {
+		t.Errorf("parent-ctx cancel must not be reported as bucket lookup timeout; got %v", err)
+	}
+}
+
+// newBucketReconcilerWithFakeClient builds a GarageBucketReconciler backed
+// by a fake k8s client preloaded with the given bucket. Subresource status
+// is enabled so r.Status().Update works.
+func newBucketReconcilerWithFakeClient(t *testing.T, bucket *garagev1beta1.GarageBucket) (*GarageBucketReconciler, *garagev1beta1.GarageBucket) {
+	t.Helper()
+	s := runtime.NewScheme()
+	if err := garagev1beta1.AddToScheme(s); err != nil {
+		t.Fatalf("AddToScheme v1beta1: %v", err)
+	}
+	if err := garagev1beta2.AddToScheme(s); err != nil {
+		t.Fatalf("AddToScheme v1beta2: %v", err)
+	}
+	fc := fake.NewClientBuilder().
+		WithScheme(s).
+		WithObjects(bucket).
+		WithStatusSubresource(&garagev1beta1.GarageBucket{}).
+		Build()
+	r := &GarageBucketReconciler{Client: fc, Scheme: s}
+
+	live := &garagev1beta1.GarageBucket{}
+	if err := fc.Get(context.Background(), types.NamespacedName{Name: bucket.Name, Namespace: bucket.Namespace}, live); err != nil {
+		t.Fatalf("get bucket: %v", err)
+	}
+	return r, live
+}
+
+// TestHandleBucketLookupTimeout_SetsConditionAtThreshold drives
+// handleBucketLookupTimeout N consecutive times (no successes in between)
+// and asserts: counter increments on each call; BucketLookupStuck condition
+// is True with Reason=AdminAPITimeout once count reaches the threshold; and
+// the result requeues on the unhealthy interval rather than surfacing an
+// error.
+func TestHandleBucketLookupTimeout_SetsConditionAtThreshold(t *testing.T) {
+	ctx := context.Background()
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "wedged-bucket", Namespace: testNamespace},
+		Spec: garagev1beta1.GarageBucketSpec{
+			ClusterRef:  garagev1beta1.ClusterReference{Name: testClusterName},
+			GlobalAlias: "wedged-alias",
+		},
+	}
+	r, live := newBucketReconcilerWithFakeClient(t, bucket)
+
+	for i := 1; i <= BucketLookupStuckThreshold; i++ {
+		res, err := r.handleBucketLookupTimeout(ctx, live)
+		if err != nil {
+			t.Fatalf("iter %d: unexpected error: %v", i, err)
+		}
+		if res.RequeueAfter != RequeueAfterUnhealthy {
+			t.Errorf("iter %d: RequeueAfter=%s, want %s", i, res.RequeueAfter, RequeueAfterUnhealthy)
+		}
+
+		// Re-fetch to verify persisted annotation count.
+		fresh := &garagev1beta1.GarageBucket{}
+		if err := r.Get(ctx, types.NamespacedName{Name: bucket.Name, Namespace: bucket.Namespace}, fresh); err != nil {
+			t.Fatalf("iter %d: get bucket: %v", i, err)
+		}
+		gotCount := readTimeoutCounter(fresh)
+		if gotCount != i {
+			t.Errorf("iter %d: counter=%d, want %d", i, gotCount, i)
+		}
+		live = fresh
+
+		cond := meta.FindStatusCondition(fresh.Status.Conditions, garagev1beta1.ConditionBucketLookupStuck)
+		if i < BucketLookupStuckThreshold {
+			if cond != nil {
+				t.Errorf("iter %d (below threshold): expected no BucketLookupStuck condition, got %+v", i, cond)
+			}
+		} else {
+			if cond == nil {
+				t.Fatalf("iter %d (threshold reached): expected BucketLookupStuck condition, got nil", i)
+			}
+			if cond.Status != metav1.ConditionTrue {
+				t.Errorf("condition.Status=%v, want True", cond.Status)
+			}
+			if cond.Reason != garagev1beta1.ReasonBucketLookupStuck {
+				t.Errorf("condition.Reason=%q, want %q", cond.Reason, garagev1beta1.ReasonBucketLookupStuck)
+			}
+			// Message should name the bucket alias and point at the manual fix.
+			if !strings.Contains(cond.Message, "wedged-alias") {
+				t.Errorf("condition.Message does not name the bucket alias: %q", cond.Message)
+			}
+			if !strings.Contains(cond.Message, garagev1beta1.RepairTypeAliases) {
+				t.Errorf("condition.Message does not mention RepairType=Aliases: %q", cond.Message)
+			}
+		}
+	}
+}
+
+// TestClearBucketLookupTimeouts_ResetsCounterAndCondition verifies that a
+// successful GetBucketInfo (simulated by directly calling
+// clearBucketLookupTimeouts) wipes both the counter annotation and the
+// BucketLookupStuck condition.
+func TestClearBucketLookupTimeouts_ResetsCounterAndCondition(t *testing.T) {
+	ctx := context.Background()
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "recovered-bucket",
+			Namespace:   testNamespace,
+			Annotations: map[string]string{garagev1beta1.AnnotationBucketLookupTimeouts: "3"},
+		},
+		Spec: garagev1beta1.GarageBucketSpec{
+			ClusterRef: garagev1beta1.ClusterReference{Name: testClusterName},
+		},
+		Status: garagev1beta1.GarageBucketStatus{
+			Conditions: []metav1.Condition{
+				{
+					Type:               garagev1beta1.ConditionBucketLookupStuck,
+					Status:             metav1.ConditionTrue,
+					Reason:             garagev1beta1.ReasonBucketLookupStuck,
+					Message:            "stuck",
+					LastTransitionTime: metav1.Now(),
+				},
+			},
+		},
+	}
+	r, live := newBucketReconcilerWithFakeClient(t, bucket)
+
+	// Seed: pull current state so we have a non-zero count and live condition.
+	if got := readTimeoutCounter(live); got != 3 {
+		t.Fatalf("precondition: counter=%d, want 3", got)
+	}
+
+	if err := r.clearBucketLookupTimeouts(ctx, live); err != nil {
+		t.Fatalf("clearBucketLookupTimeouts: %v", err)
+	}
+
+	fresh := &garagev1beta1.GarageBucket{}
+	if err := r.Get(ctx, types.NamespacedName{Name: bucket.Name, Namespace: bucket.Namespace}, fresh); err != nil {
+		t.Fatalf("get bucket: %v", err)
+	}
+	if got := readTimeoutCounter(fresh); got != 0 {
+		t.Errorf("counter after clear=%d, want 0", got)
+	}
+	if _, ok := fresh.Annotations[garagev1beta1.AnnotationBucketLookupTimeouts]; ok {
+		t.Errorf("annotation should be removed")
+	}
+	// Conditions on the live object are cleared in-memory by RemoveStatusCondition.
+	// clearBucketLookupTimeouts does not flush status (callers do as part of
+	// their own status update). We assert the in-memory clear here.
+	if cond := meta.FindStatusCondition(live.Status.Conditions, garagev1beta1.ConditionBucketLookupStuck); cond != nil {
+		t.Errorf("BucketLookupStuck condition still set in-memory: %+v", cond)
+	}
+}
+
+// TestHandleThenClear_FullCycle simulates the production sequence: three
+// reconciles time out (condition gets set), then the next reconcile sees a
+// success (clear is invoked) — final state has no counter and no condition.
+func TestHandleThenClear_FullCycle(t *testing.T) {
+	ctx := context.Background()
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "cycle-bucket", Namespace: testNamespace},
+		Spec: garagev1beta1.GarageBucketSpec{
+			ClusterRef: garagev1beta1.ClusterReference{Name: testClusterName},
+		},
+	}
+	r, live := newBucketReconcilerWithFakeClient(t, bucket)
+
+	for i := 0; i < BucketLookupStuckThreshold; i++ {
+		if _, err := r.handleBucketLookupTimeout(ctx, live); err != nil {
+			t.Fatalf("handleBucketLookupTimeout iter %d: %v", i, err)
+		}
+		if err := r.Get(ctx, types.NamespacedName{Name: bucket.Name, Namespace: bucket.Namespace}, live); err != nil {
+			t.Fatalf("get bucket iter %d: %v", i, err)
+		}
+	}
+	if cond := meta.FindStatusCondition(live.Status.Conditions, garagev1beta1.ConditionBucketLookupStuck); cond == nil {
+		t.Fatal("expected BucketLookupStuck condition after threshold reached")
+	}
+
+	// First successful GetBucketInfo on the next reconcile.
+	if err := r.clearBucketLookupTimeouts(ctx, live); err != nil {
+		t.Fatalf("clearBucketLookupTimeouts: %v", err)
+	}
+	fresh := &garagev1beta1.GarageBucket{}
+	if err := r.Get(ctx, types.NamespacedName{Name: bucket.Name, Namespace: bucket.Namespace}, fresh); err != nil {
+		t.Fatalf("get bucket: %v", err)
+	}
+	if got := readTimeoutCounter(fresh); got != 0 {
+		t.Errorf("counter after recovery=%d, want 0", got)
+	}
+	if cond := meta.FindStatusCondition(live.Status.Conditions, garagev1beta1.ConditionBucketLookupStuck); cond != nil {
+		t.Errorf("BucketLookupStuck condition should be cleared in-memory: %+v", cond)
+	}
 }
 
 func TestParseMPUOlderThan(t *testing.T) {

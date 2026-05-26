@@ -91,6 +91,14 @@ const (
 
 	// ConditionAliasesConfigured indicates bucket aliases have been configured
 	ConditionAliasesConfigured = "AliasesConfigured"
+
+	// ConditionBucketLookupStuck indicates the Garage admin API has timed out
+	// repeatedly when reading this bucket's info. Almost always caused by a
+	// stale entry in the bucket's authorized_keys whose RPC lookup never
+	// completes (upstream netapp::try_connect has no TCP timeout). Recover by
+	// triggering RepairType=Aliases on the parent GarageCluster via the
+	// garage.rajsingh.info/trigger-repair annotation.
+	ConditionBucketLookupStuck = "BucketLookupStuck"
 )
 
 // GarageKey condition types
@@ -199,6 +207,12 @@ const (
 	// ReasonGatewayTombstonesPending indicates stale gateway layout entries are
 	// queued but not auto-applied (layoutManagement.autoApply is false).
 	ReasonGatewayTombstonesPending = "PendingRemoval"
+
+	// ReasonBucketLookupStuck indicates GetBucketInfo has timed out N
+	// consecutive times for this bucket. Surfaced via the
+	// ConditionBucketLookupStuck condition; manual recovery is to trigger
+	// RepairType=Aliases on the parent GarageCluster.
+	ReasonBucketLookupStuck = "AdminAPITimeout"
 )
 
 // Annotation keys for operational tasks
@@ -239,6 +253,13 @@ const (
 
 	// AnnotationCleanupMPUOlderThan specifies the age threshold for MPU cleanup (e.g., "24h", "7d")
 	AnnotationCleanupMPUOlderThan = AnnotationPrefix + "cleanup-mpu-older-than"
+
+	// AnnotationBucketLookupTimeouts tracks consecutive GetBucketInfo timeouts
+	// on this bucket. Incremented on each timeout, cleared on first success.
+	// At BucketLookupStuckThreshold (3), the operator sets the
+	// ConditionBucketLookupStuck status condition. Internal use only — users
+	// should not set this directly.
+	AnnotationBucketLookupTimeouts = AnnotationPrefix + "bucket-lookup-timeouts"
 
 	// GarageCluster repair/maintenance annotations
 

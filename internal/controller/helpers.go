@@ -265,6 +265,11 @@ const (
 	FinalizationRetryAnnotation = "garage.rajsingh.info/finalization-retries"
 	// FinalizationMaxRetries before giving up and removing finalizer
 	FinalizationMaxRetries = 5
+	// finalizeRPCTimeout caps a single admin API call on the finalize hot path.
+	// Generous compared to a healthy call, short enough that one wedged peer
+	// (e.g. a bucket whose authorized_keys lookup never returns) cannot
+	// monopolize the whole reconcile.
+	finalizeRPCTimeout = 15 * time.Second
 )
 
 // GetGarageClient creates a Garage Admin API client for the given cluster.
