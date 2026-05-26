@@ -19,6 +19,12 @@ package controller
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -29,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
+	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
 
 var _ = Describe("GarageKey Controller", func() {
@@ -454,6 +461,144 @@ var _ = Describe("GarageKey Controller", func() {
 			// All chars after GK prefix must be hex (0-9a-f)
 			for _, c := range akID[2:] {
 				Expect("0123456789abcdef").To(ContainSubstring(string(c)))
+			}
+		})
+	})
+
+	Describe("finalize pre-revokes bucket grants before DeleteKey", func() {
+		// Spins up a mock Garage admin server that lets each test override
+		// per-bucket DenyBucketKey behavior (status code + optional sleep).
+		type denyResp struct {
+			delay  time.Duration
+			status int
+		}
+
+		const (
+			testAccessKeyID = "GKtestkey1234567890abcdef"
+			bucketIDGood1   = "11111111111111111111111111111111"
+			bucketIDStuck   = "22222222222222222222222222222222"
+			bucketIDGood2   = "33333333333333333333333333333333"
+		)
+
+		buildKey := func() *garagev1beta1.GarageKey {
+			return &garagev1beta1.GarageKey{
+				ObjectMeta: metav1.ObjectMeta{Name: "k", Namespace: testNamespace},
+				Status: garagev1beta1.GarageKeyStatus{
+					AccessKeyID: testAccessKeyID,
+					Buckets: []garagev1beta1.KeyBucketAccess{
+						{BucketID: bucketIDGood1, Read: true},
+						{BucketID: bucketIDStuck, Read: true, Write: true},
+						{BucketID: bucketIDGood2, Owner: true},
+					},
+				},
+			}
+		}
+
+		newServer := func(denyBehavior map[string]denyResp, deleteKeyStatus int, denyCalls *[]string, deleteCalls *int32) *httptest.Server {
+			var mu sync.Mutex
+			return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v2/DenyBucketKey"):
+					var req garage.DenyBucketKeyRequest
+					_ = json.NewDecoder(r.Body).Decode(&req)
+					mu.Lock()
+					*denyCalls = append(*denyCalls, req.BucketID)
+					mu.Unlock()
+					beh, ok := denyBehavior[req.BucketID]
+					if !ok {
+						w.WriteHeader(http.StatusOK)
+						_, _ = w.Write([]byte(`{}`))
+						return
+					}
+					if beh.delay > 0 {
+						select {
+						case <-time.After(beh.delay):
+						case <-r.Context().Done():
+							return
+						}
+					}
+					status := beh.status
+					if status == 0 {
+						status = http.StatusOK
+					}
+					w.WriteHeader(status)
+					if status == http.StatusOK {
+						_, _ = w.Write([]byte(`{}`))
+					}
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/v2/DeleteKey"):
+					atomic.AddInt32(deleteCalls, 1)
+					status := deleteKeyStatus
+					if status == 0 {
+						status = http.StatusOK
+					}
+					w.WriteHeader(status)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+		}
+
+		It("revokes the surviving buckets and still calls DeleteKey when one DenyBucketKey errors", func() {
+			var denyCalls []string
+			var deleteCalls int32
+			srv := newServer(map[string]denyResp{
+				bucketIDStuck: {status: http.StatusInternalServerError},
+			}, http.StatusOK, &denyCalls, &deleteCalls)
+			defer srv.Close()
+
+			r := &GarageKeyReconciler{}
+			err := r.finalize(context.Background(), buildKey(), garage.NewClient(srv.URL, "tok"))
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(denyCalls).To(ConsistOf(bucketIDGood1, bucketIDStuck, bucketIDGood2))
+			Expect(atomic.LoadInt32(&deleteCalls)).To(Equal(int32(1)))
+		})
+
+		It("treats a NotFound from DeleteKey after pre-revoke as success", func() {
+			var denyCalls []string
+			var deleteCalls int32
+			srv := newServer(nil, http.StatusNotFound, &denyCalls, &deleteCalls)
+			defer srv.Close()
+
+			r := &GarageKeyReconciler{}
+			err := r.finalize(context.Background(), buildKey(), garage.NewClient(srv.URL, "tok"))
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(denyCalls).To(HaveLen(3))
+			Expect(atomic.LoadInt32(&deleteCalls)).To(Equal(int32(1)))
+		})
+
+		It("does not let a slow DenyBucketKey block subsequent buckets or DeleteKey", func() {
+			var denyCalls []string
+			var deleteCalls int32
+			// Hang the stuck bucket past the per-call timeout but well under the
+			// total test budget. The other two must still be called and DeleteKey
+			// must still fire.
+			srv := newServer(map[string]denyResp{
+				bucketIDStuck: {delay: 20 * time.Second},
+			}, http.StatusOK, &denyCalls, &deleteCalls)
+			defer srv.Close()
+
+			r := &GarageKeyReconciler{}
+
+			done := make(chan error, 1)
+			start := time.Now()
+			go func() {
+				done <- r.finalize(context.Background(), buildKey(), garage.NewClient(srv.URL, "tok"))
+			}()
+
+			select {
+			case err := <-done:
+				elapsed := time.Since(start)
+				Expect(err).NotTo(HaveOccurred())
+				// Should finish at roughly one per-call timeout (15s) for the stuck
+				// bucket plus negligible time for the others — well under 30s.
+				Expect(elapsed).To(BeNumerically("<", 25*time.Second),
+					"finalize should not be blocked by the full upstream delay")
+				Expect(denyCalls).To(ConsistOf(bucketIDGood1, bucketIDStuck, bucketIDGood2))
+				Expect(atomic.LoadInt32(&deleteCalls)).To(Equal(int32(1)))
+			case <-time.After(45 * time.Second):
+				Fail("finalize blocked past the per-call timeout budget")
 			}
 		})
 	})

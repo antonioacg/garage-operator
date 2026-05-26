@@ -18,8 +18,10 @@ package controller
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -40,7 +42,26 @@ import (
 
 const (
 	garageBucketFinalizer = "garagebucket.garage.rajsingh.info/finalizer"
+
+	// BucketLookupStuckThreshold is the number of consecutive GetBucketInfo
+	// timeouts after which we set the BucketLookupStuck status condition.
+	BucketLookupStuckThreshold = 3
 )
+
+// getBucketInfoTimeout caps each individual GetBucketInfo admin API call
+// from the bucket controller. Upstream Garage admin API can hang
+// indefinitely on a single bucket whose authorized_keys contains a stale
+// node entry (netapp::try_connect has no TCP timeout). Without a per-call
+// cap, one poisoned bucket wedges the bucket workqueue.
+//
+// Declared as a var (not const) so tests can shorten it without waiting 15s.
+var getBucketInfoTimeout = 15 * time.Second
+
+// errBucketInfoTimeout is the sentinel returned by getBucketWithTimeout when
+// the per-call deadline fires. Callers treat this distinctly from other
+// GetBucket errors so they can bail the reconcile gracefully and let the
+// stuck-bucket tracker increment its counter.
+var errBucketInfoTimeout = stderrors.New("GetBucketInfo timed out")
 
 // GarageBucketReconciler reconciles a GarageBucket object
 type GarageBucketReconciler struct {
@@ -219,6 +240,13 @@ func (r *GarageBucketReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	// Reconcile the bucket
 	if err := r.reconcileBucket(ctx, bucket, garageClient); err != nil {
+		// A wedged GetBucketInfo is informational, not a reconcile failure.
+		// Bail with a stuck-bucket signal instead of marking PhaseFailed; the
+		// rest of the reconcile (cluster ref, owner ref, finalizer) already
+		// ran above and persisted.
+		if isBucketLookupTimeout(err) {
+			return r.handleBucketLookupTimeout(ctx, bucket)
+		}
 		return r.updateStatus(ctx, bucket, PhaseFailed, err)
 	}
 
@@ -283,8 +311,11 @@ func (r *GarageBucketReconciler) getOrCreateBucket(ctx context.Context, bucket *
 
 	// spec.bucketId takes absolute priority — never create, never guess.
 	if bucket.Spec.BucketID != "" {
-		existing, err := garageClient.GetBucket(ctx, garage.GetBucketRequest{ID: bucket.Spec.BucketID})
+		existing, err := getBucketWithTimeout(ctx, garageClient, garage.GetBucketRequest{ID: bucket.Spec.BucketID})
 		if err != nil {
+			if isBucketLookupTimeout(err) {
+				return nil, err
+			}
 			return nil, fmt.Errorf("spec.bucketId %s not found or unreachable: %w", bucket.Spec.BucketID, err)
 		}
 		bucket.Status.BucketID = existing.ID
@@ -296,9 +327,12 @@ func (r *GarageBucketReconciler) getOrCreateBucket(ctx context.Context, bucket *
 	// Treating transient errors as "not found" is what caused duplicate
 	// buckets to be created during Garage cluster recovery.
 	if bucket.Status.BucketID != "" {
-		existing, err := garageClient.GetBucket(ctx, garage.GetBucketRequest{ID: bucket.Status.BucketID})
+		existing, err := getBucketWithTimeout(ctx, garageClient, garage.GetBucketRequest{ID: bucket.Status.BucketID})
 		if err == nil {
 			return existing, nil
+		}
+		if isBucketLookupTimeout(err) {
+			return nil, err
 		}
 		if !garage.IsNotFound(err) {
 			return nil, fmt.Errorf("failed to get bucket by ID %s: %w", bucket.Status.BucketID, err)
@@ -307,7 +341,7 @@ func (r *GarageBucketReconciler) getOrCreateBucket(ctx context.Context, bucket *
 		log.Info("Tracked bucket ID not found, falling back to alias lookup", "bucketID", bucket.Status.BucketID, "alias", alias)
 	}
 
-	existing, err := garageClient.GetBucket(ctx, garage.GetBucketRequest{GlobalAlias: alias})
+	existing, err := getBucketWithTimeout(ctx, garageClient, garage.GetBucketRequest{GlobalAlias: alias})
 	if err == nil {
 		if bucket.Status.BucketID != "" && existing.ID != bucket.Status.BucketID {
 			log.Info("Alias resolved to a different bucket than previously tracked; adopting it",
@@ -315,6 +349,9 @@ func (r *GarageBucketReconciler) getOrCreateBucket(ctx context.Context, bucket *
 		}
 		bucket.Status.BucketID = existing.ID
 		return existing, nil
+	}
+	if isBucketLookupTimeout(err) {
+		return nil, err
 	}
 	if !garage.IsNotFound(err) {
 		return nil, fmt.Errorf("failed to get bucket by alias %s: %w", alias, err)
@@ -690,9 +727,17 @@ func (r *GarageBucketReconciler) updateStatusFromGarage(ctx context.Context, buc
 	}
 
 	// Get bucket info from Garage
-	garageBucket, err := garageClient.GetBucket(ctx, garage.GetBucketRequest{ID: bucket.Status.BucketID})
+	garageBucket, err := getBucketWithTimeout(ctx, garageClient, garage.GetBucketRequest{ID: bucket.Status.BucketID})
 	if err != nil {
+		if isBucketLookupTimeout(err) {
+			return r.handleBucketLookupTimeout(ctx, bucket)
+		}
 		return r.updateStatus(ctx, bucket, PhaseFailed, fmt.Errorf("failed to get bucket info: %w", err))
+	}
+	// First success after one or more timeouts → reset counter and clear
+	// the BucketLookupStuck condition so a transient stall self-heals.
+	if err := r.clearBucketLookupTimeouts(ctx, bucket); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to clear bucket-lookup-timeouts annotation")
 	}
 
 	// Capture old status before modifications to detect no-op updates
@@ -812,6 +857,132 @@ func (r *GarageBucketReconciler) updateStatusFromGarage(ctx context.Context, buc
 
 	// Status updated — the informer watch event will re-enqueue for immediate verification.
 	return ctrl.Result{}, nil
+}
+
+// getBucketWithTimeout wraps garageClient.GetBucket with a per-call deadline.
+// Returns errBucketInfoTimeout when the call exceeds getBucketInfoTimeout —
+// callers use that sentinel to bump the stuck-bucket counter and bail
+// gracefully without surfacing a generic API error.
+func getBucketWithTimeout(ctx context.Context, garageClient *garage.Client, req garage.GetBucketRequest) (*garage.Bucket, error) {
+	callCtx, cancel := context.WithTimeout(ctx, getBucketInfoTimeout)
+	defer cancel()
+	b, err := garageClient.GetBucket(callCtx, req)
+	if err != nil && stderrors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		// Distinguish per-call timeout from parent-ctx cancellation. We only
+		// want to count it as a "stuck" signal when our own deadline fired,
+		// not when the controller is shutting down.
+		return nil, errBucketInfoTimeout
+	}
+	return b, err
+}
+
+// isBucketLookupTimeout returns true if err originated from a per-call
+// GetBucketInfo deadline. Used by callers to decide whether to bail with a
+// stuck-bucket signal vs. propagate the error.
+func isBucketLookupTimeout(err error) bool {
+	return stderrors.Is(err, errBucketInfoTimeout)
+}
+
+// readTimeoutCounter parses the AnnotationBucketLookupTimeouts annotation
+// into an int. Returns 0 for missing, malformed, or negative values.
+func readTimeoutCounter(bucket *garagev1beta1.GarageBucket) int {
+	if bucket.Annotations == nil {
+		return 0
+	}
+	v, ok := bucket.Annotations[garagev1beta1.AnnotationBucketLookupTimeouts]
+	if !ok {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// recordBucketLookupTimeout increments the consecutive-timeout counter
+// annotation via a Patch (avoids ResourceVersion conflicts with subsequent
+// status updates). Returns the new count.
+func (r *GarageBucketReconciler) recordBucketLookupTimeout(ctx context.Context, bucket *garagev1beta1.GarageBucket) (int, error) {
+	current := readTimeoutCounter(bucket) + 1
+	patch := client.MergeFrom(bucket.DeepCopy())
+	if bucket.Annotations == nil {
+		bucket.Annotations = map[string]string{}
+	}
+	bucket.Annotations[garagev1beta1.AnnotationBucketLookupTimeouts] = strconv.Itoa(current)
+	if err := r.Patch(ctx, bucket, patch); err != nil {
+		return current, err
+	}
+	return current, nil
+}
+
+// clearBucketLookupTimeouts removes the counter annotation and the
+// BucketLookupStuck condition if either is set. Idempotent. Called on the
+// first successful GetBucket so a transient stall self-heals.
+func (r *GarageBucketReconciler) clearBucketLookupTimeouts(ctx context.Context, bucket *garagev1beta1.GarageBucket) error {
+	hadAnno := false
+	if bucket.Annotations != nil {
+		_, hadAnno = bucket.Annotations[garagev1beta1.AnnotationBucketLookupTimeouts]
+	}
+	hadCond := meta.FindStatusCondition(bucket.Status.Conditions, garagev1beta1.ConditionBucketLookupStuck) != nil
+	if !hadAnno && !hadCond {
+		return nil
+	}
+	if hadAnno {
+		patch := client.MergeFrom(bucket.DeepCopy())
+		delete(bucket.Annotations, garagev1beta1.AnnotationBucketLookupTimeouts)
+		if err := r.Patch(ctx, bucket, patch); err != nil {
+			return err
+		}
+	}
+	if hadCond {
+		meta.RemoveStatusCondition(&bucket.Status.Conditions, garagev1beta1.ConditionBucketLookupStuck)
+	}
+	return nil
+}
+
+// handleBucketLookupTimeout is called when a GetBucketInfo call from this
+// reconcile timed out. Increments the counter and, on reaching
+// BucketLookupStuckThreshold consecutive timeouts, sets the
+// BucketLookupStuck status condition pointing operators at the
+// trigger-repair=Aliases workaround. Returns a Result that requeues on the
+// unhealthy interval — the timeout is informational, never a workqueue
+// error.
+func (r *GarageBucketReconciler) handleBucketLookupTimeout(ctx context.Context, bucket *garagev1beta1.GarageBucket) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+	count, patchErr := r.recordBucketLookupTimeout(ctx, bucket)
+	if patchErr != nil {
+		log.Error(patchErr, "Failed to record bucket-lookup-timeouts annotation")
+		// Keep going — counter is best-effort; the condition is the durable signal.
+	}
+	log.Info("GetBucketInfo timed out; the bucket may be wedged on a stale authorized_keys entry",
+		"bucket", bucket.Name, "consecutiveTimeouts", count, "threshold", BucketLookupStuckThreshold)
+
+	if count >= BucketLookupStuckThreshold {
+		// TODO: auto-trigger Aliases repair on the parent cluster with a cooldown (see #190 follow-ups)
+		alias := bucket.Spec.GlobalAlias
+		if alias == "" {
+			alias = bucket.Name
+		}
+		meta.SetStatusCondition(&bucket.Status.Conditions, metav1.Condition{
+			Type:   garagev1beta1.ConditionBucketLookupStuck,
+			Status: metav1.ConditionTrue,
+			Reason: garagev1beta1.ReasonBucketLookupStuck,
+			Message: fmt.Sprintf(
+				"GetBucketInfo for bucket %q timed out %d consecutive times. "+
+					"Likely cause: stale entry in authorized_keys whose RPC lookup hangs. "+
+					"Manual recovery: set annotation %s=%s on the parent GarageCluster.",
+				alias, count,
+				garagev1beta1.AnnotationTriggerRepair,
+				garagev1beta1.RepairTypeAliases,
+			),
+			ObservedGeneration: bucket.Generation,
+		})
+		if err := UpdateStatusWithRetry(ctx, r.Client, bucket); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	return ctrl.Result{RequeueAfter: RequeueAfterUnhealthy}, nil
 }
 
 func formatBytes(bytes int64) string {

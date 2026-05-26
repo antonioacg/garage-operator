@@ -184,7 +184,7 @@ spec:
 		By("expecting PVCs to be provisioned for metadata+data on the per-node STS")
 		Eventually(func(g Gomega) {
 			get := exec.Command("kubectl", "get", "pvc", "-n", testNS,
-				"-l", "app.kubernetes.io/instance="+v1Storage+"-storage-0", "-o", "jsonpath={.items[*].metadata.name}")
+				"-l", "garage.rajsingh.info/node="+v1Storage+"-storage-0", "-o", "jsonpath={.items[*].metadata.name}")
 			o, err := utils.Run(get)
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(o).NotTo(BeEmpty(), "expected at least one PVC for v1beta1 storage cluster's per-node STS")
