@@ -661,16 +661,20 @@ var _ = Describe("GarageCluster PodDisruptionBudget reconcile", func() {
 		}
 	}
 
-	It("creates a PDB with MinAvailable=1 when enabled with no explicit value", func() {
+	It("defaults MinAvailable to replicas-1 to preserve quorum on drain", func() {
+		// newCluster sets storage.replicas=3 → expect MinAvailable=2.
 		Expect(k8sClient.Create(ctx, newCluster(&garagev1beta2.PodDisruptionBudgetConfig{Enabled: true}))).To(Succeed())
 		driveReconciles()
 
 		pdb := &policyv1.PodDisruptionBudget{}
 		Expect(k8sClient.Get(ctx, key, pdb)).To(Succeed())
 		Expect(pdb.Spec.MinAvailable).NotTo(BeNil())
-		Expect(pdb.Spec.MinAvailable.IntValue()).To(Equal(1))
+		Expect(pdb.Spec.MinAvailable.IntValue()).To(Equal(2))
 		Expect(pdb.Spec.MaxUnavailable).To(BeNil())
-		Expect(pdb.Spec.Selector.MatchLabels).To(HaveKeyWithValue(labelCluster, clusterName))
+		// Selector matches the pre-#192 shape so existing PDBs upgrade in place
+		// (spec.selector is immutable).
+		Expect(pdb.Spec.Selector.MatchLabels).To(HaveKeyWithValue(labelAppName, defaultAppName))
+		Expect(pdb.Spec.Selector.MatchLabels).To(HaveKeyWithValue(labelAppInstance, clusterName))
 		Expect(pdb.Spec.Selector.MatchLabels).To(HaveKeyWithValue(labelTier, tierStorage))
 	})
 
@@ -705,5 +709,66 @@ var _ = Describe("GarageCluster PodDisruptionBudget reconcile", func() {
 		driveReconciles()
 
 		Expect(errors.IsNotFound(k8sClient.Get(ctx, key, &policyv1.PodDisruptionBudget{}))).To(BeTrue())
+	})
+
+	It("floors MinAvailable at 1 for a single-replica cluster", func() {
+		size := resource.MustParse("1Gi")
+		Expect(k8sClient.Create(ctx, &garagev1beta2.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: testNamespace},
+			Spec: garagev1beta2.GarageClusterSpec{
+				Replication: &garagev1beta2.ReplicationConfig{Factor: 1},
+				Storage: &garagev1beta2.StorageSpec{
+					Replicas:            1,
+					Metadata:            &garagev1beta2.VolumeConfig{Size: &size},
+					Data:                &garagev1beta2.VolumeConfig{Size: &size},
+					PodDisruptionBudget: &garagev1beta2.PodDisruptionBudgetConfig{Enabled: true},
+				},
+			},
+		})).To(Succeed())
+		driveReconciles()
+
+		pdb := &policyv1.PodDisruptionBudget{}
+		Expect(k8sClient.Get(ctx, key, pdb)).To(Succeed())
+		Expect(pdb.Spec.MinAvailable.IntValue()).To(Equal(1))
+	})
+
+	It("leaves a foreign PDB with the same name alone (no ownerRef)", func() {
+		foreign := &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: testNamespace,
+				Labels:    map[string]string{"managed-by": "policy-engine"},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "policy.example.com/v1",
+					Kind:       "PolicyTemplate",
+					Name:       "external",
+					UID:        "00000000-0000-0000-0000-000000000001",
+					Controller: ptr.To(true),
+				}},
+			},
+			Spec: policyv1.PodDisruptionBudgetSpec{
+				Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"foreign": annotationTrue}},
+				MinAvailable: ptr.To(intstr.FromInt(7)),
+			},
+		}
+		Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+
+		Expect(k8sClient.Create(ctx, newCluster(&garagev1beta2.PodDisruptionBudgetConfig{Enabled: true}))).To(Succeed())
+		driveReconciles()
+
+		got := &policyv1.PodDisruptionBudget{}
+		Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
+		Expect(got.Spec.MinAvailable.IntValue()).To(Equal(7))
+		Expect(got.Spec.Selector.MatchLabels).To(HaveKeyWithValue("foreign", "true"))
+
+		// And the foreign PDB also isn't deleted when wantPDB=false.
+		updated := &garagev1beta2.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, updated)).To(Succeed())
+		updated.Spec.Storage.PodDisruptionBudget.Enabled = false
+		Expect(k8sClient.Update(ctx, updated)).To(Succeed())
+		driveReconciles()
+		Expect(k8sClient.Get(ctx, key, &policyv1.PodDisruptionBudget{})).To(Succeed())
+
+		_ = k8sClient.Delete(ctx, foreign)
 	})
 })
