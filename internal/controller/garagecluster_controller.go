@@ -32,6 +32,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -168,6 +169,13 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Create or update API Service (primary <cr>, scoped to storage tier when
 	// present, else to the gateway tier for edge-gateway clusters)
 	if err := r.reconcileAPIService(ctx, cluster); err != nil {
+		return r.updateStatus(ctx, cluster, PhaseFailed, err)
+	}
+
+	// Reconcile PodDisruptionBudget for the storage tier (covers all per-node
+	// STSes via cluster+tier label selector, since each per-node STS has 1
+	// replica and a per-STS PDB would be meaningless).
+	if err := r.reconcilePodDisruptionBudget(ctx, cluster); err != nil {
 		return r.updateStatus(ctx, cluster, PhaseFailed, err)
 	}
 
@@ -1512,6 +1520,120 @@ func (r *GarageClusterReconciler) reconcileAPIService(ctx context.Context, clust
 
 	log.Info("Reconciling API Service", "name", serviceName, "tier", primaryTier)
 	return reconcileService(ctx, r.Client, svc, cluster, r.Scheme)
+}
+
+// reconcilePodDisruptionBudget creates/updates a PDB covering the storage tier
+// when spec.storage.podDisruptionBudget.enabled is true. Deletes the PDB if it
+// exists but is no longer wanted (storage tier dropped, or enabled flipped to
+// false). Regression of #196: this reconcile was deleted in #192 along with
+// the legacy cluster-level StatefulSet, but the spec field and its CRD
+// validation stayed in place, silently no-op'ing user PDB configs.
+//
+// Selector matches pre-#192 ({labelAppName, labelAppInstance, labelTier}) so
+// existing PDBs upgrade in place without hitting the spec.selector immutability
+// error. Storage pods (per-node STSes from #190) carry these labels as well as
+// {labelCluster, labelTier}, so either selector is functionally correct; the
+// pre-#192 shape is preferred only for upgrade compatibility.
+func (r *GarageClusterReconciler) reconcilePodDisruptionBudget(ctx context.Context, cluster *garagev1beta2.GarageCluster) error {
+	log := logf.FromContext(ctx)
+	pdbName := cluster.Name
+	pdbKey := types.NamespacedName{Name: pdbName, Namespace: cluster.Namespace}
+
+	wantPDB := cluster.HasStorageTier() &&
+		cluster.Spec.Storage.PodDisruptionBudget != nil &&
+		cluster.Spec.Storage.PodDisruptionBudget.Enabled
+
+	if !wantPDB {
+		existing := &policyv1.PodDisruptionBudget{}
+		err := r.Get(ctx, pdbKey, existing)
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		// Don't touch a PDB we don't own — could be user- or policy-engine-managed.
+		if !metav1.IsControlledBy(existing, cluster) {
+			return nil
+		}
+		log.Info("Deleting PDB (no longer requested)", "name", pdbName)
+		if err := r.Delete(ctx, existing); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("deleting PDB: %w", err)
+		}
+		return nil
+	}
+
+	pdbCfg := cluster.Spec.Storage.PodDisruptionBudget
+	spec := policyv1.PodDisruptionBudgetSpec{
+		Selector: &metav1.LabelSelector{MatchLabels: r.selectorLabelsForTier(cluster, tierStorage)},
+	}
+	switch {
+	case pdbCfg.MinAvailable != nil:
+		spec.MinAvailable = pdbCfg.MinAvailable
+	case pdbCfg.MaxUnavailable != nil:
+		spec.MaxUnavailable = pdbCfg.MaxUnavailable
+	default:
+		// Default to (replicas-1) with a floor of 1 — preserves quorum on drain
+		// for 3+ replica clusters. Matches the pre-#192 default and the warning
+		// emitted by the v1beta1/v1beta2 validating webhooks.
+		replicas := cluster.StorageReplicas()
+		if replicas < 2 {
+			replicas = 2
+		}
+		minAvail := intstr.FromInt(int(replicas - 1))
+		spec.MinAvailable = &minAvail
+	}
+
+	desired := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pdbName,
+			Namespace: cluster.Namespace,
+			Labels:    r.labelsForTier(cluster, tierStorage),
+		},
+		Spec: spec,
+	}
+	if err := controllerutil.SetControllerReference(cluster, desired, r.Scheme); err != nil {
+		return err
+	}
+
+	existing := &policyv1.PodDisruptionBudget{}
+	err := r.Get(ctx, pdbKey, existing)
+	if errors.IsNotFound(err) {
+		log.Info("Creating PDB", "name", pdbName)
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+	// If a foreign PDB already squats on our name, leave it alone rather than
+	// fight a policy engine. The operator surfaces this via the reconcile log;
+	// users can rename the foreign PDB or disable spec.storage.podDisruptionBudget.
+	if existing.UID != "" && len(existing.OwnerReferences) > 0 && !metav1.IsControlledBy(existing, cluster) {
+		log.Info("PDB exists but is not controlled by this GarageCluster; skipping update", "name", pdbName)
+		return nil
+	}
+	if equality.Semantic.DeepEqual(existing.Spec, desired.Spec) &&
+		equality.Semantic.DeepEqual(existing.Labels, desired.Labels) &&
+		metav1.IsControlledBy(existing, cluster) {
+		return nil
+	}
+	existing.Labels = desired.Labels
+	existing.OwnerReferences = desired.OwnerReferences
+	existing.Spec = desired.Spec
+	log.Info("Updating PDB", "name", pdbName)
+	if err := r.Update(ctx, existing); err != nil {
+		// PDB selector is immutable post-creation. If an upgrade-from-old-shape
+		// PDB has a different selector, recreate it so the new selector lands.
+		if errors.IsInvalid(err) {
+			log.Info("PDB update rejected (likely selector immutable); recreating", "name", pdbName)
+			if delErr := r.Delete(ctx, existing); delErr != nil && !errors.IsNotFound(delErr) {
+				return fmt.Errorf("deleting PDB for recreate: %w", delErr)
+			}
+			return r.Create(ctx, desired)
+		}
+		return err
+	}
+	return nil
 }
 
 // reconcileGatewayAPIService reconciles a tier-scoped <cr>-gateway Service so
@@ -4728,6 +4850,7 @@ func (r *GarageClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Secret{}).
+		Owns(&policyv1.PodDisruptionBudget{}).
 		Watches(&corev1.PersistentVolumeClaim{}, pvcMapper).
 		Named("garagecluster").
 		Complete(r)

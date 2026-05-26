@@ -961,8 +961,8 @@ func TestComputePodSpecHash(t *testing.T) {
 
 func TestBuildGaragePodSpec_UserEnv(t *testing.T) {
 	userEnv := []corev1.EnvVar{
-		{Name: "GARAGE_ALLOW_WORLD_READABLE_SECRETS", Value: "true"},
-		{Name: "MY_EXTRA", Value: "foo"},
+		{Name: "GARAGE_ALLOW_WORLD_READABLE_SECRETS", Value: annotationTrue},
+		{Name: "MY_EXTRA", Value: "user-supplied-value"},
 		// Intentional override: user re-declares GARAGE_NODE_HOST. Since user env
 		// is appended AFTER the built-in, this entry must appear after the
 		// built-in in the resulting container.Env slice.
@@ -995,8 +995,8 @@ func TestBuildGaragePodSpec_UserEnv(t *testing.T) {
 	if vs, ok := got["GARAGE_ALLOW_WORLD_READABLE_SECRETS"]; !ok || vs[0] != "true" {
 		t.Errorf("expected GARAGE_ALLOW_WORLD_READABLE_SECRETS=true, got %v", vs)
 	}
-	if vs, ok := got["MY_EXTRA"]; !ok || vs[0] != "foo" {
-		t.Errorf("expected MY_EXTRA=foo, got %v", vs)
+	if vs, ok := got["MY_EXTRA"]; !ok || vs[0] != "user-supplied-value" {
+		t.Errorf("expected MY_EXTRA=user-supplied-value, got %v", vs)
 	}
 
 	// Built-in must still be present, and the user override must appear AFTER

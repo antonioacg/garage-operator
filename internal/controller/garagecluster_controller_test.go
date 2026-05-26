@@ -24,10 +24,12 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -600,5 +602,173 @@ var _ = Describe("GarageCluster Controller", func() {
 			}, autoSecret)
 			Expect(errors.IsNotFound(err)).To(BeTrue())
 		})
+	})
+})
+
+// Regression guard for #196: spec.storage.podDisruptionBudget was a no-op
+// after #192 removed the legacy reconcilePDB along with the cluster-level
+// StatefulSet. The replacement reconcile lives on the cluster controller and
+// targets the storage tier via {labelCluster, labelTier=storage} so it
+// covers every per-node StatefulSet introduced in #190.
+var _ = Describe("GarageCluster PodDisruptionBudget reconcile", func() {
+	const clusterName = "pdb-cluster"
+	var (
+		ctx        context.Context
+		reconciler *GarageClusterReconciler
+		key        types.NamespacedName
+	)
+
+	BeforeEach(func() {
+		ctx = context.Background()
+		reconciler = &GarageClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		key = types.NamespacedName{Name: clusterName, Namespace: testNamespace}
+	})
+
+	AfterEach(func() {
+		// Drop finalizer first so Delete actually GC's — the cluster's normal
+		// finalizer makes admin-API calls that envtest can't service.
+		cluster := &garagev1beta2.GarageCluster{}
+		if err := k8sClient.Get(ctx, key, cluster); err == nil {
+			cluster.Finalizers = nil
+			_ = k8sClient.Update(ctx, cluster)
+			_ = k8sClient.Delete(ctx, cluster)
+		}
+		_ = k8sClient.Delete(ctx, &policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: testNamespace}})
+		_ = k8sClient.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-rpc-secret", Namespace: testNamespace}})
+		_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: clusterName + "-config", Namespace: testNamespace}})
+	})
+
+	newCluster := func(pdb *garagev1beta2.PodDisruptionBudgetConfig) *garagev1beta2.GarageCluster {
+		return &garagev1beta2.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: testNamespace},
+			Spec: garagev1beta2.GarageClusterSpec{
+				Replication: &garagev1beta2.ReplicationConfig{Factor: 1},
+				Storage: &garagev1beta2.StorageSpec{
+					Replicas:            3,
+					Metadata:            &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("1Gi"))},
+					Data:                &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("10Gi"))},
+					PodDisruptionBudget: pdb,
+				},
+			},
+		}
+	}
+
+	driveReconciles := func() {
+		// Twice — first adds finalizer, second creates resources.
+		for i := 0; i < 2; i++ {
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: key})
+			Expect(err).NotTo(HaveOccurred())
+		}
+	}
+
+	It("defaults MinAvailable to replicas-1 to preserve quorum on drain", func() {
+		// newCluster sets storage.replicas=3 → expect MinAvailable=2.
+		Expect(k8sClient.Create(ctx, newCluster(&garagev1beta2.PodDisruptionBudgetConfig{Enabled: true}))).To(Succeed())
+		driveReconciles()
+
+		pdb := &policyv1.PodDisruptionBudget{}
+		Expect(k8sClient.Get(ctx, key, pdb)).To(Succeed())
+		Expect(pdb.Spec.MinAvailable).NotTo(BeNil())
+		Expect(pdb.Spec.MinAvailable.IntValue()).To(Equal(2))
+		Expect(pdb.Spec.MaxUnavailable).To(BeNil())
+		// Selector matches the pre-#192 shape so existing PDBs upgrade in place
+		// (spec.selector is immutable).
+		Expect(pdb.Spec.Selector.MatchLabels).To(HaveKeyWithValue(labelAppName, defaultAppName))
+		Expect(pdb.Spec.Selector.MatchLabels).To(HaveKeyWithValue(labelAppInstance, clusterName))
+		Expect(pdb.Spec.Selector.MatchLabels).To(HaveKeyWithValue(labelTier, tierStorage))
+	})
+
+	It("honors an explicit MaxUnavailable", func() {
+		one := intstr.FromInt(1)
+		Expect(k8sClient.Create(ctx, newCluster(&garagev1beta2.PodDisruptionBudgetConfig{Enabled: true, MaxUnavailable: &one}))).To(Succeed())
+		driveReconciles()
+
+		pdb := &policyv1.PodDisruptionBudget{}
+		Expect(k8sClient.Get(ctx, key, pdb)).To(Succeed())
+		Expect(pdb.Spec.MinAvailable).To(BeNil())
+		Expect(pdb.Spec.MaxUnavailable).NotTo(BeNil())
+		Expect(pdb.Spec.MaxUnavailable.IntValue()).To(Equal(1))
+	})
+
+	It("deletes the PDB when enabled flips to false", func() {
+		Expect(k8sClient.Create(ctx, newCluster(&garagev1beta2.PodDisruptionBudgetConfig{Enabled: true}))).To(Succeed())
+		driveReconciles()
+		Expect(k8sClient.Get(ctx, key, &policyv1.PodDisruptionBudget{})).To(Succeed())
+
+		updated := &garagev1beta2.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, updated)).To(Succeed())
+		updated.Spec.Storage.PodDisruptionBudget.Enabled = false
+		Expect(k8sClient.Update(ctx, updated)).To(Succeed())
+		driveReconciles()
+
+		Expect(errors.IsNotFound(k8sClient.Get(ctx, key, &policyv1.PodDisruptionBudget{}))).To(BeTrue())
+	})
+
+	It("does not create a PDB when the field is omitted", func() {
+		Expect(k8sClient.Create(ctx, newCluster(nil))).To(Succeed())
+		driveReconciles()
+
+		Expect(errors.IsNotFound(k8sClient.Get(ctx, key, &policyv1.PodDisruptionBudget{}))).To(BeTrue())
+	})
+
+	It("floors MinAvailable at 1 for a single-replica cluster", func() {
+		size := resource.MustParse("1Gi")
+		Expect(k8sClient.Create(ctx, &garagev1beta2.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: testNamespace},
+			Spec: garagev1beta2.GarageClusterSpec{
+				Replication: &garagev1beta2.ReplicationConfig{Factor: 1},
+				Storage: &garagev1beta2.StorageSpec{
+					Replicas:            1,
+					Metadata:            &garagev1beta2.VolumeConfig{Size: &size},
+					Data:                &garagev1beta2.VolumeConfig{Size: &size},
+					PodDisruptionBudget: &garagev1beta2.PodDisruptionBudgetConfig{Enabled: true},
+				},
+			},
+		})).To(Succeed())
+		driveReconciles()
+
+		pdb := &policyv1.PodDisruptionBudget{}
+		Expect(k8sClient.Get(ctx, key, pdb)).To(Succeed())
+		Expect(pdb.Spec.MinAvailable.IntValue()).To(Equal(1))
+	})
+
+	It("leaves a foreign PDB with the same name alone (no ownerRef)", func() {
+		foreign := &policyv1.PodDisruptionBudget{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      clusterName,
+				Namespace: testNamespace,
+				Labels:    map[string]string{"managed-by": "policy-engine"},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "policy.example.com/v1",
+					Kind:       "PolicyTemplate",
+					Name:       "external",
+					UID:        "00000000-0000-0000-0000-000000000001",
+					Controller: ptr.To(true),
+				}},
+			},
+			Spec: policyv1.PodDisruptionBudgetSpec{
+				Selector:     &metav1.LabelSelector{MatchLabels: map[string]string{"foreign": annotationTrue}},
+				MinAvailable: ptr.To(intstr.FromInt(7)),
+			},
+		}
+		Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+
+		Expect(k8sClient.Create(ctx, newCluster(&garagev1beta2.PodDisruptionBudgetConfig{Enabled: true}))).To(Succeed())
+		driveReconciles()
+
+		got := &policyv1.PodDisruptionBudget{}
+		Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
+		Expect(got.Spec.MinAvailable.IntValue()).To(Equal(7))
+		Expect(got.Spec.Selector.MatchLabels).To(HaveKeyWithValue("foreign", "true"))
+
+		// And the foreign PDB also isn't deleted when wantPDB=false.
+		updated := &garagev1beta2.GarageCluster{}
+		Expect(k8sClient.Get(ctx, key, updated)).To(Succeed())
+		updated.Spec.Storage.PodDisruptionBudget.Enabled = false
+		Expect(k8sClient.Update(ctx, updated)).To(Succeed())
+		driveReconciles()
+		Expect(k8sClient.Get(ctx, key, &policyv1.PodDisruptionBudget{})).To(Succeed())
+
+		_ = k8sClient.Delete(ctx, foreign)
 	})
 })
