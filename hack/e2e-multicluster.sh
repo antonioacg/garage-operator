@@ -58,8 +58,26 @@ test_fail() {
     ((TESTS_FAILED++))
 }
 
+dump_debug_info() {
+    local cluster="$1"
+    local dir="${E2E_DEBUG_DIR:-/tmp/e2e-debug}"
+    mkdir -p "$dir" 2>/dev/null || return 0
+    kubectl --context "kind-$cluster" get all -A -o wide > "$dir/${cluster}-resources.txt" 2>&1 || true
+    kubectl --context "kind-$cluster" get garagecluster,garagenode,garagebucket,garagekey,garageadmintoken -A -o yaml > "$dir/${cluster}-garage-resources.yaml" 2>&1 || true
+    kubectl --context "kind-$cluster" get events -A --sort-by=.lastTimestamp > "$dir/${cluster}-events.txt" 2>&1 || true
+    kubectl --context "kind-$cluster" logs deployment/garage-operator -n garage-operator-system --tail=2000 > "$dir/${cluster}-operator.log" 2>&1 || true
+    kubectl --context "kind-$cluster" logs deployment/garage-operator -n garage-operator-system --tail=2000 --previous > "$dir/${cluster}-operator-previous.log" 2>&1 || true
+}
+
 cleanup() {
     if [ "$CLEANUP" = true ]; then
+        local existing
+        existing="$(kind get clusters 2>/dev/null || true)"
+        for c in "$CLUSTER1_NAME" "$CLUSTER2_NAME"; do
+            if echo "$existing" | grep -qx "$c"; then
+                dump_debug_info "$c"
+            fi
+        done
         log_info "Cleaning up kind clusters..."
         kind delete cluster --name "$CLUSTER1_NAME" 2>/dev/null || true
         kind delete cluster --name "$CLUSTER2_NAME" 2>/dev/null || true
