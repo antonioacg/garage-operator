@@ -89,16 +89,9 @@ jobs:
       - name: Run single-cluster e2e tests
         run: make test-e2e-cluster
 
-      - name: Collect debug info
-        if: failure()
-        run: |
-          mkdir -p /tmp/e2e-debug
-          kind get clusters > /tmp/e2e-debug/clusters.txt 2>&1 || true
-          for cluster in $(kind get clusters 2>/dev/null); do
-            kubectl --context "kind-$cluster" get all -A > "/tmp/e2e-debug/${cluster}-resources.txt" 2>&1 || true
-            kubectl --context "kind-$cluster" logs deployment/garage-operator -n garage-operator-system --tail=200 > "/tmp/e2e-debug/${cluster}-operator.txt" 2>&1 || true
-          done
-
+      # The script's trap dumps operator logs + resources to /tmp/e2e-debug
+      # before tearing down kind, so the upload below captures real state. If
+      # the script crashes before its trap fires, this artifact will be empty.
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v7
@@ -106,6 +99,7 @@ jobs:
           name: cluster-e2e-logs
           path: /tmp/e2e-debug/
           retention-days: 7
+          if-no-files-found: warn
 
   e2e-cosi:
     name: COSI E2E Tests
@@ -136,17 +130,6 @@ jobs:
       - name: Run COSI e2e tests
         run: make test-e2e-cosi
 
-      - name: Collect debug info
-        if: failure()
-        run: |
-          mkdir -p /tmp/e2e-debug
-          kind get clusters > /tmp/e2e-debug/clusters.txt 2>&1 || true
-          for cluster in $(kind get clusters 2>/dev/null); do
-            kubectl --context "kind-$cluster" get all -A > "/tmp/e2e-debug/${cluster}-resources.txt" 2>&1 || true
-            kubectl --context "kind-$cluster" logs deployment/garage-operator -n garage-operator-system --tail=200 > "/tmp/e2e-debug/${cluster}-operator.txt" 2>&1 || true
-            kubectl --context "kind-$cluster" get bucketclaim,bucketaccess -A > "/tmp/e2e-debug/${cluster}-cosi.txt" 2>&1 || true
-          done
-
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v7
@@ -154,6 +137,7 @@ jobs:
           name: cosi-e2e-logs
           path: /tmp/e2e-debug/
           retention-days: 7
+          if-no-files-found: warn
 
   e2e-multicluster:
     name: Multi-Cluster E2E Tests
@@ -184,16 +168,6 @@ jobs:
       - name: Run multi-cluster e2e tests
         run: make test-e2e-multicluster
 
-      - name: Collect debug info
-        if: failure()
-        run: |
-          mkdir -p /tmp/e2e-debug
-          kind get clusters > /tmp/e2e-debug/clusters.txt 2>&1 || true
-          for cluster in $(kind get clusters 2>/dev/null); do
-            kubectl --context "kind-$cluster" get all -A > "/tmp/e2e-debug/${cluster}-resources.txt" 2>&1 || true
-            kubectl --context "kind-$cluster" logs deployment/garage-operator -n garage-operator-system --tail=200 > "/tmp/e2e-debug/${cluster}-operator.txt" 2>&1 || true
-          done
-
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v7
@@ -201,6 +175,7 @@ jobs:
           name: multicluster-e2e-logs
           path: /tmp/e2e-debug/
           retention-days: 7
+          if-no-files-found: warn
 
   e2e-external-gateway:
     name: External Gateway E2E Tests
@@ -231,18 +206,6 @@ jobs:
       - name: Run external gateway e2e tests
         run: make test-e2e-external-gateway
 
-      - name: Collect debug info
-        if: failure()
-        run: |
-          mkdir -p /tmp/e2e-debug
-          kind get clusters > /tmp/e2e-debug/clusters.txt 2>&1 || true
-          for cluster in $(kind get clusters 2>/dev/null); do
-            kubectl --context "kind-$cluster" get all -A > "/tmp/e2e-debug/${cluster}-resources.txt" 2>&1 || true
-            kubectl --context "kind-$cluster" logs deployment/garage-operator -n garage-operator-system --tail=200 > "/tmp/e2e-debug/${cluster}-operator.txt" 2>&1 || true
-            kubectl --context "kind-$cluster" get garagecluster -A -o yaml > "/tmp/e2e-debug/${cluster}-garageclusters.txt" 2>&1 || true
-          done
-          docker logs garage-ext-gw-e2e-external-garage > /tmp/e2e-debug/external-garage.txt 2>&1 || true
-
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v7
@@ -250,6 +213,7 @@ jobs:
           name: external-gateway-e2e-logs
           path: /tmp/e2e-debug/
           retention-days: 7
+          if-no-files-found: warn
 
   e2e-ipv6:
     name: IPv6 Dual-Stack E2E Tests
@@ -280,15 +244,6 @@ jobs:
       - name: Run IPv6 dual-stack e2e tests
         run: make test-e2e-ipv6
 
-      - name: Collect debug info
-        if: failure()
-        run: |
-          mkdir -p /tmp/e2e-debug
-          kubectl --context "kind-garage-e2e-ipv6" get all -A > /tmp/e2e-debug/resources.txt 2>&1 || true
-          kubectl --context "kind-garage-e2e-ipv6" logs deployment/garage-operator -n garage-operator-system --tail=200 > /tmp/e2e-debug/operator.txt 2>&1 || true
-          kubectl --context "kind-garage-e2e-ipv6" get garagenode,garagecluster -n garage-operator-system -o yaml > /tmp/e2e-debug/garage-resources.txt 2>&1 || true
-          kubectl --context "kind-garage-e2e-ipv6" get pods -n garage-operator-system -o wide > /tmp/e2e-debug/pods.txt 2>&1 || true
-
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v7
@@ -296,4 +251,5 @@ jobs:
           name: ipv6-e2e-logs
           path: /tmp/e2e-debug/
           retention-days: 7
+          if-no-files-found: warn
 
