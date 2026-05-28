@@ -3284,7 +3284,17 @@ func (r *GarageClusterReconciler) bootstrapCluster(ctx context.Context, cluster 
 		connectedNodes = health.ConnectedNodes
 		healthStatus = health.Status
 	}
-	needsReconnect := health == nil || connectedNodes < len(nodes) || (!cluster.HasGatewayTier() && healthStatus != healthStatusHealthy)
+	// Reconnect when:
+	//   - Health probe failed entirely
+	//   - Some local nodes are disconnected (the actual #203 trigger)
+	//   - Storage-only cluster shows non-healthy AND we have no remote
+	//     clusters configured. In federated setups the local view is
+	//     permanently "unavailable" until remote peers join, so the
+	//     health-status trigger here would otherwise call ConnectClusterNodes
+	//     on every reconcile against an already-converged local quorum.
+	needsReconnect := health == nil ||
+		connectedNodes < len(nodes) ||
+		(!cluster.HasGatewayTier() && healthStatus != healthStatusHealthy && len(cluster.Spec.RemoteClusters) == 0)
 	if needsReconnect {
 		log.Info("Cluster needs node reconnection", "connected", connectedNodes, "expected", len(nodes), "status", healthStatus)
 		connectNodes(ctx, nodes, adminToken, adminPort, rpcPort)
@@ -4969,19 +4979,16 @@ func (r *GarageClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}}
 	})
 
-	// GarageNode status changes (especially status.NodeID becoming non-empty
-	// after first reconcile) must retrigger the owning cluster so the
-	// cluster-shared ConfigMap can refresh its auto-populated bootstrap_peers
-	// list with the newly-known sibling (#203).
-	nodeMapper := handler.EnqueueRequestsFromMapFunc(func(_ context.Context, obj client.Object) []reconcile.Request {
-		gn, ok := obj.(*garagev1beta1.GarageNode)
-		if !ok || gn.Spec.ClusterRef.Name == "" {
-			return nil
-		}
-		return []reconcile.Request{{
-			NamespacedName: types.NamespacedName{Name: gn.Spec.ClusterRef.Name, Namespace: gn.Namespace},
-		}}
-	})
+	// Note: we intentionally do NOT Watch GarageNode here. Status ticks on
+	// child GarageNodes (LastSeen, Conditions) fire frequently, and re-running
+	// the cluster reconcile on every tick caused two regressions in CI: (a)
+	// bootstrapCluster's O(n²) ConnectClusterNodes loop hammered the Admin
+	// API, and (b) Auto-mode scale-down lost its 60s window because the
+	// cluster controller kept re-listing GarageNodes mid-deletion. The
+	// existing controller-runtime requeue (1 min default) and the StatefulSet
+	// rolling-restart path that picks up ConfigMap changes are sufficient for
+	// bootstrap_peers to land within one reconcile of a sibling's NodeID
+	// being discovered.
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&garagev1beta2.GarageCluster{}).
@@ -4992,7 +4999,6 @@ func (r *GarageClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Secret{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
 		Watches(&corev1.PersistentVolumeClaim{}, pvcMapper).
-		Watches(&garagev1beta1.GarageNode{}, nodeMapper).
 		Named("garagecluster").
 		Complete(r)
 }
