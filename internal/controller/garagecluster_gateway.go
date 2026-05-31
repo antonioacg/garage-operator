@@ -493,17 +493,15 @@ func (r *GarageClusterReconciler) reconcileGatewayTombstones(ctx context.Context
 		log.Error(err, "Failed to stage stale gateway entry removal")
 		return
 	}
-	layout, err = layoutClient.GetClusterLayout(ctx)
-	if err != nil {
-		log.Error(err, "Failed to refresh layout after staging tombstone removal")
-		return
-	}
-	newVersion := layout.Version + 1
-	if err := layoutClient.ApplyClusterLayout(ctx, newVersion); err != nil {
+	if err := layoutClient.ApplyStagedLayoutChanges(ctx); err != nil {
 		if !garage.IsReplicationConstraint(err) {
 			log.Error(err, "Failed to apply gateway tombstone removal")
 		}
 		return
+	}
+	newVersion := layout.Version + 1
+	if cur, gerr := layoutClient.GetClusterLayout(ctx); gerr == nil {
+		newVersion = cur.Version
 	}
 	log.Info("Removed stale gateway entries from layout", "count", len(stale), "version", newVersion)
 
