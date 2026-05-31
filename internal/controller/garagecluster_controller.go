@@ -546,19 +546,8 @@ func (r *GarageClusterReconciler) removeNodesFromLayout(ctx context.Context, clu
 		return fmt.Errorf("failed to stage node removals: %w", err)
 	}
 
-	// Get updated layout with staged changes
-	layout, err = garageClient.GetClusterLayout(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get updated layout: %w", err)
-	}
-
-	// Apply the layout changes
-	newVersion := layout.Version + 1
-	if err := garageClient.ApplyClusterLayout(ctx, newVersion); err != nil {
-		if garage.IsConflict(err) {
-			log.Info("Layout version conflict during finalization, will retry", "attemptedVersion", newVersion)
-			return fmt.Errorf("layout version conflict: %w", err)
-		}
+	// Apply the staged removals, tolerating the concurrent-writer race.
+	if err := garageClient.ApplyStagedLayoutChanges(ctx); err != nil {
 		if garage.IsReplicationConstraint(err) {
 			log.Info("Cannot remove nodes: would violate replication constraints. "+
 				"Nodes will remain in layout until more nodes are added or replication factor is reduced.",
@@ -568,14 +557,18 @@ func (r *GarageClusterReconciler) removeNodesFromLayout(ctx context.Context, clu
 		return fmt.Errorf("failed to apply layout removal: %w", err)
 	}
 
-	log.Info("Removed nodes from layout", "count", len(nodesToRemove), "version", newVersion)
+	log.Info("Removed nodes from layout", "count", len(nodesToRemove))
 
 	// For gateway clusters, immediately skip dead nodes since gateways never store data.
 	// This prevents the removed gateway nodes from getting stuck in Draining state,
 	// which would cause quorum calculation to include unreachable nodes.
 	if cluster.HasGatewayTier() {
+		appliedVersion := layout.Version + 1
+		if cur, gerr := garageClient.GetClusterLayout(ctx); gerr == nil {
+			appliedVersion = cur.Version
+		}
 		skipReq := garage.SkipDeadNodesRequest{
-			Version:          newVersion,
+			Version:          appliedVersion,
 			AllowMissingData: true, // Safe for gateways - they never have data
 		}
 		result, err := garageClient.ClusterLayoutSkipDeadNodes(ctx, skipReq)
@@ -3157,17 +3150,12 @@ func assignNewNodesToLayout(ctx context.Context, garageClient *garage.Client, no
 			"replicationFactor", cfg.replicationFactor)
 	}
 
-	// Apply staged changes
+	// Apply staged changes (race-tolerant: apply rejection is a generic 500, not a 409).
 	log.Info("Applying staged layout changes", "stagedCount", len(layout.StagedRoleChanges), "totalNodes", totalNodesAfterApply, "currentVersion", layout.Version)
-	newVersion := layout.Version + 1
-	if err := garageClient.ApplyClusterLayout(ctx, newVersion); err != nil {
-		if garage.IsConflict(err) {
-			log.Info("Layout version conflict, requeueing to retry", "attemptedVersion", newVersion)
-			return fmt.Errorf("layout version conflict (version %d): %w", newVersion, err)
-		}
+	if err := garageClient.ApplyStagedLayoutChanges(ctx); err != nil {
 		return fmt.Errorf("failed to apply cluster layout: %w", err)
 	}
-	log.Info("Applied cluster layout", "version", newVersion)
+	log.Info("Applied cluster layout")
 	return nil
 }
 
@@ -4398,17 +4386,12 @@ func (r *GarageClusterReconciler) addRemoteNodesToLayout(
 		return nil // Nothing to apply
 	}
 
-	// Apply layout
-	newVersion := layout.Version + 1
-	if err := localClient.ApplyClusterLayout(ctx, newVersion); err != nil {
-		if garage.IsConflict(err) {
-			log.Info("Layout version conflict, will retry on next reconciliation", "version", newVersion)
-			return nil
-		}
+	// Apply layout (race-tolerant: apply rejection is a generic 500, not a 409).
+	if err := localClient.ApplyStagedLayoutChanges(ctx); err != nil {
 		return fmt.Errorf("failed to apply layout: %w", err)
 	}
 
-	log.Info("Applied federated layout", "cluster", remote.Name, "version", newVersion, "nodesAdded", len(newRoles))
+	log.Info("Applied federated layout", "cluster", remote.Name, "nodesAdded", len(newRoles))
 
 	// After adding nodes, check for stale remote nodes that were removed from the remote cluster.
 	// Only possible when we have a fresh remote status to compare against.
@@ -4481,13 +4464,8 @@ func (r *GarageClusterReconciler) removeStaleRemoteNodes(
 		return fmt.Errorf("failed to get updated layout: %w", err)
 	}
 
-	// Apply layout
-	newVersion := layout.Version + 1
-	if err := localClient.ApplyClusterLayout(ctx, newVersion); err != nil {
-		if garage.IsConflict(err) {
-			log.Info("Layout version conflict during stale node removal, will retry", "version", newVersion)
-			return nil
-		}
+	// Apply layout (race-tolerant: apply rejection is a generic 500, not a 409).
+	if err := localClient.ApplyStagedLayoutChanges(ctx); err != nil {
 		if garage.IsReplicationConstraint(err) {
 			log.Info("Cannot remove stale remote nodes: would violate replication constraints",
 				"staleCount", len(staleNodes))
@@ -4496,14 +4474,18 @@ func (r *GarageClusterReconciler) removeStaleRemoteNodes(
 		return fmt.Errorf("failed to apply stale node removal: %w", err)
 	}
 
+	appliedVersion := layout.Version + 1
+	if cur, gerr := localClient.GetClusterLayout(ctx); gerr == nil {
+		appliedVersion = cur.Version
+	}
 	log.Info("Removed stale remote nodes from layout",
-		"count", len(staleNodes), "remoteCluster", remote.Name, "version", newVersion)
+		"count", len(staleNodes), "remoteCluster", remote.Name, "version", appliedVersion)
 
 	// After removing stale remote nodes, call skip-dead-nodes to prevent draining stalls.
 	// Remote nodes are typically unreachable after removal, so they can't acknowledge sync.
 	// Use allowMissingData=true since we've confirmed these nodes no longer exist in the remote cluster.
 	skipReq := garage.SkipDeadNodesRequest{
-		Version:          newVersion,
+		Version:          appliedVersion,
 		AllowMissingData: true, // Safe - nodes confirmed removed from remote cluster
 	}
 	result, err := localClient.ClusterLayoutSkipDeadNodes(ctx, skipReq)

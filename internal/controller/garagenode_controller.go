@@ -1128,8 +1128,6 @@ func (r *GarageNodeReconciler) reconcileNode(ctx context.Context, node *garagev1
 			}
 		}
 
-		stagedVersion := layout.Version + 1
-
 		updates := []garage.NodeRoleChange{{
 			ID:       nodeID,
 			Zone:     node.Spec.Zone,
@@ -1141,15 +1139,15 @@ func (r *GarageNodeReconciler) reconcileNode(ctx context.Context, node *garagev1
 			return fmt.Errorf("failed to update layout: %w", err)
 		}
 
-		if err := garageClient.ApplyClusterLayout(ctx, stagedVersion); err != nil {
-			if garage.IsConflict(err) {
-				log.Info("Layout version mismatch, will retry on next reconciliation", "attemptedVersion", stagedVersion)
-				return nil
-			}
+		// ApplyStagedLayoutChanges re-reads the version after staging and
+		// tolerates the concurrent-writer race (apply rejection is a generic
+		// 500, not a 409 — so a returned error here is a genuine failure worth
+		// requeueing, not a benign version race).
+		if err := garageClient.ApplyStagedLayoutChanges(ctx); err != nil {
 			return fmt.Errorf("failed to apply layout: %w", err)
 		}
 
-		log.Info("Applied layout update", "version", stagedVersion)
+		log.Info("Applied layout update", "nodeID", nodeID, "zone", node.Spec.Zone)
 	}
 
 	return nil
@@ -1377,11 +1375,7 @@ func (r *GarageNodeReconciler) removeNodeFromExternalLayout(ctx context.Context,
 	if err := garageClient.UpdateClusterLayout(ctx, updates); err != nil {
 		return fmt.Errorf("stage node removal: %w", err)
 	}
-	stagedVersion := layout.Version + 1
-	if err := garageClient.ApplyClusterLayout(ctx, stagedVersion); err != nil {
-		if garage.IsConflict(err) {
-			return fmt.Errorf("layout version mismatch: %w", err)
-		}
+	if err := garageClient.ApplyStagedLayoutChanges(ctx); err != nil {
 		if garage.IsReplicationConstraint(err) {
 			// Best-effort cleanup; admin will need to add capacity or
 			// reduce replication to actually drop this entry.
@@ -1472,16 +1466,11 @@ func (r *GarageNodeReconciler) finalize(ctx context.Context, node *garagev1beta1
 		return fmt.Errorf("failed to stage node removal: %w", err)
 	}
 
-	stagedVersion := layout.Version + 1
 	if len(layout.StagedRoleChanges) > 0 {
 		log.Info("Adding removal to existing staged layout changes", "existingStagedCount", len(layout.StagedRoleChanges))
 	}
 
-	if err := garageClient.ApplyClusterLayout(ctx, stagedVersion); err != nil {
-		if garage.IsConflict(err) {
-			log.Info("Layout version mismatch during removal, will retry", "attemptedVersion", stagedVersion)
-			return fmt.Errorf("layout version mismatch, retry needed: %w", err)
-		}
+	if err := garageClient.ApplyStagedLayoutChanges(ctx); err != nil {
 		if garage.IsReplicationConstraint(err) {
 			log.Info("Cannot remove node: would violate replication factor constraints. "+
 				"The node will be removed from Kubernetes but will remain in the Garage layout. "+
@@ -1492,12 +1481,21 @@ func (r *GarageNodeReconciler) finalize(ctx context.Context, node *garagev1beta1
 		return fmt.Errorf("failed to apply layout removal: %w", err)
 	}
 
-	log.Info("Removed node from layout", "version", stagedVersion)
+	// Re-read the committed version for logging and the gateway skip-dead-nodes
+	// call (ApplyStagedLayoutChanges does not surface the version it applied,
+	// and a concurrent writer may have advanced it past our local target).
+	appliedVersion := layout.Version + 1
+	if cur, gerr := garageClient.GetClusterLayout(ctx); gerr == nil {
+		appliedVersion = cur.Version
+	}
+	log.Info("Removed node from layout", "version", appliedVersion)
 
-	// For gateway nodes, immediately skip dead nodes
+	// For gateway nodes, immediately skip dead nodes. Gateways own no partitions
+	// so this is belt-and-suspenders (it advances ack/sync trackers so the
+	// removed entry never lingers in a Draining version), not a data operation.
 	if node.Spec.Gateway {
 		skipReq := garage.SkipDeadNodesRequest{
-			Version:          stagedVersion,
+			Version:          appliedVersion,
 			AllowMissingData: true,
 		}
 		result, err := garageClient.ClusterLayoutSkipDeadNodes(ctx, skipReq)
