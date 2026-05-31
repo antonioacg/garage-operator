@@ -1906,6 +1906,260 @@ spec:
 	})
 })
 
+// Unified Cluster exercises the #209 fix: a single GarageCluster CR declaring
+// BOTH a storage tier and a gateway tier. The gateway tier must run as per-node
+// GarageNodes (gateway:true, capacity=nil layout role) rather than a cluster-level
+// StatefulSet — so gateway pods participate in FullReplication locally and S3
+// sig-auth resolves keys via get_local() without per-request storage-tier RPCs.
+var _ = Describe("Unified Cluster (storage + gateway in one CR)", Ordered, Label("unified-gateway"), func() {
+	const testNamespace = "garage-unified-test"
+	const clusterName = "unified-cluster"
+
+	BeforeAll(func() {
+		By("creating manager namespace")
+		cmd := exec.Command("kubectl", "create", "ns", namespace)
+		_, _ = utils.Run(cmd)
+
+		By("labeling the manager namespace restricted")
+		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
+			"pod-security.kubernetes.io/enforce=restricted")
+		_, _ = utils.Run(cmd)
+
+		By("installing CRDs")
+		cmd = exec.Command("make", "install")
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
+		Expect(utils.WaitCRDsEstablished()).To(Succeed())
+
+		By("deploying the controller-manager")
+		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", projectImage))
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+
+		By("waiting for controller-manager pod to be Ready")
+		verifyControllerUp := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "pods", "-l", "control-plane=controller-manager",
+				"-n", namespace,
+				"-o", "jsonpath={.items[0].status.conditions[?(@.type=='Ready')].status}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("True"), "Controller not Ready: %s", output)
+		}
+		Eventually(verifyControllerUp, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("creating + labeling test namespace")
+		cmd = exec.Command("kubectl", "create", "ns", testNamespace)
+		_, _ = utils.Run(cmd)
+		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", testNamespace,
+			"pod-security.kubernetes.io/enforce=restricted")
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	AfterAll(func() {
+		By("cleaning up unified-cluster test resources")
+		cmd := exec.Command("kubectl", "delete", "garagecluster", clusterName, "-n", testNamespace, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+		time.Sleep(10 * time.Second)
+		cmd = exec.Command("kubectl", "delete", "ns", testNamespace, "--ignore-not-found")
+		_, _ = utils.Run(cmd)
+		cmd = exec.Command("make", "undeploy")
+		_, _ = utils.Run(cmd)
+		cmd = exec.Command("make", "uninstall")
+		_, _ = utils.Run(cmd)
+	})
+
+	It("creates the unified cluster and reaches Running", func() {
+		By("creating admin token secret")
+		adminTokenSecret := fmt.Sprintf(`
+apiVersion: v1
+kind: Secret
+metadata:
+  name: garage-admin-token
+  namespace: %s
+type: Opaque
+stringData:
+  admin-token: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+`, testNamespace)
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(adminTokenSecret)
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("applying a unified GarageCluster (storage + gateway in one CR)")
+		unifiedYAML := fmt.Sprintf(`
+apiVersion: garage.rajsingh.info/v1beta2
+kind: GarageCluster
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  replication:
+    factor: 1
+  layoutManagement:
+    autoApply: true
+  storage:
+    replicas: 1
+    metadata:
+      size: 1Gi
+    data:
+      size: 1Gi
+    resources:
+      limits: {memory: 256Mi}
+      requests: {memory: 128Mi}
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      fsGroup: 1000
+      seccompProfile: {type: RuntimeDefault}
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      runAsUser: 1000
+      capabilities: {drop: [ALL]}
+      seccompProfile: {type: RuntimeDefault}
+  gateway:
+    replicas: 1
+    resources:
+      limits: {memory: 128Mi}
+      requests: {memory: 64Mi}
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      fsGroup: 1000
+      seccompProfile: {type: RuntimeDefault}
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      runAsNonRoot: true
+      runAsUser: 1000
+      capabilities: {drop: [ALL]}
+      seccompProfile: {type: RuntimeDefault}
+  admin:
+    adminTokenSecretRef:
+      name: garage-admin-token
+      key: admin-token
+  security:
+    allowInsecureSecretPermissions: true
+`, clusterName, testNamespace)
+		applyUnified := func(g Gomega) {
+			c := exec.Command("kubectl", "apply", "-f", "-")
+			c.Stdin = strings.NewReader(unifiedYAML)
+			out, err := utils.Run(c)
+			g.Expect(err).NotTo(HaveOccurred(), "Failed to create unified cluster: %s", out)
+		}
+		Eventually(applyUnified, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("waiting for the unified cluster to be Running")
+		verifyRunning := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagecluster", clusterName,
+				"-n", testNamespace, "-o", "jsonpath={.status.phase}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(Equal("Running"), "Unified cluster not Running: phase=%s", output)
+		}
+		Eventually(verifyRunning, 5*time.Minute, 5*time.Second).Should(Succeed())
+	})
+
+	It("runs the gateway tier as per-node GarageNodes, not a cluster StatefulSet", func() {
+		By("verifying an operator-owned gateway GarageNode exists")
+		verifyGatewayNode := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagenode",
+				"-n", testNamespace,
+				"-l", fmt.Sprintf("garage.rajsingh.info/cluster=%s,garage.rajsingh.info/tier=gateway,app.kubernetes.io/managed-by=operator", clusterName),
+				"-o", "jsonpath={.items[*].metadata.name}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(output).To(ContainSubstring(clusterName+"-gateway-0"),
+				"expected an operator-owned gateway GarageNode <cluster>-gateway-0, got: %q", output)
+		}
+		Eventually(verifyGatewayNode, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("verifying the per-node gateway StatefulSet exists")
+		verifyPerNodeSTS := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "statefulset", clusterName+"-gateway-0",
+				"-n", testNamespace, "-o", "jsonpath={.metadata.name}")
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred(), "per-node gateway STS missing: %s", output)
+			g.Expect(output).To(Equal(clusterName + "-gateway-0"))
+		}
+		Eventually(verifyPerNodeSTS, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("verifying NO legacy cluster-level gateway StatefulSet exists")
+		cmd := exec.Command("kubectl", "get", "statefulset", clusterName+"-gateway",
+			"-n", testNamespace, "--ignore-not-found", "-o", "jsonpath={.metadata.name}")
+		output, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.TrimSpace(output)).To(BeEmpty(),
+			"legacy cluster-level gateway StatefulSet <cluster>-gateway must NOT exist in a per-node unified cluster")
+	})
+
+	It("assigns the gateway pod a capacity=nil layout role (#209)", func() {
+		adminToken := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		verifyGatewayRole := func(g Gomega) {
+			curlCmd := fmt.Sprintf("curl -s -H 'Authorization: Bearer %s' http://%s.%s.svc.cluster.local:3903/v2/GetClusterLayout",
+				adminToken, clusterName, testNamespace)
+			cmd := exec.Command("kubectl", "run", "curl-unified-layout", "--rm", "-i", "--restart=Never",
+				"-n", testNamespace,
+				"--image=docker.io/curlimages/curl:latest",
+				"--overrides", fmt.Sprintf(`{
+					"spec": {
+						"containers": [{
+							"name": "curl-unified-layout",
+							"image": "docker.io/curlimages/curl:latest",
+							"imagePullPolicy": "IfNotPresent",
+							"command": ["/bin/sh", "-c"],
+							"args": [%q],
+							"securityContext": {
+								"readOnlyRootFilesystem": true,
+								"allowPrivilegeEscalation": false,
+								"capabilities": {"drop": ["ALL"]},
+								"runAsNonRoot": true,
+								"runAsUser": 1000,
+								"seccompProfile": {"type": "RuntimeDefault"}
+							}
+						}]
+					}
+				}`, curlCmd))
+			output, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred(), "Failed to query layout: %s", output)
+
+			var layout struct {
+				Roles []struct {
+					ID       string   `json:"id"`
+					Tags     []string `json:"tags"`
+					Capacity *uint64  `json:"capacity"`
+				} `json:"roles"`
+			}
+			jsonStart := strings.Index(output, "{")
+			jsonEnd := strings.LastIndex(output, "}")
+			g.Expect(jsonStart).To(BeNumerically(">=", 0), "No JSON in output: %s", output)
+			jsonStr := output[jsonStart : jsonEnd+1]
+			g.Expect(json.Unmarshal([]byte(jsonStr), &layout)).To(Succeed(), "bad layout JSON: %s", jsonStr)
+
+			gatewayRoles, storageRoles := 0, 0
+			for _, role := range layout.Roles {
+				isGateway := false
+				for _, tag := range role.Tags {
+					if tag == "tier:gateway" {
+						isGateway = true
+					}
+				}
+				if isGateway && role.Capacity == nil {
+					gatewayRoles++
+				}
+				if role.Capacity != nil {
+					storageRoles++
+				}
+			}
+			g.Expect(gatewayRoles).To(BeNumerically(">=", 1),
+				"expected >=1 gateway role (capacity=nil + tier:gateway) in unified cluster layout: %+v", layout.Roles)
+			g.Expect(storageRoles).To(BeNumerically(">=", 1),
+				"expected the storage node to still hold a capacity role: %+v", layout.Roles)
+		}
+		Eventually(verifyGatewayRole, 4*time.Minute, 10*time.Second).Should(Succeed())
+	})
+})
+
 var _ = Describe("Webhooks", Ordered, Label("webhooks"), func() {
 	const webhookNamespace = "garage-webhook-system"
 	var webhookControllerPodName string
