@@ -9,6 +9,41 @@ upstream-grounded assumption. The validation **materially changed** several
 motivations and corrected two latent bugs in the existing operator. Citations
 below are to `../garage` source unless noted.
 
+## Implementation status (this PR)
+
+**Shipped + tested (unit/envtest + e2e + lint green):**
+
+1. **Layout-apply correctness** — `Client.ApplyStagedLayoutChanges` replaces the
+   broken `IsConflict`-based retry at all 8 apply sites (apply rejection is HTTP
+   500, not 409). Re-reads version, skips no-op applies, resolves the
+   concurrent-writer race.
+2. **Per-node gateway unification for unified clusters (#209)** — gateway tier in
+   a unified `storage + gateway` CR now runs as per-node `GarageNode`s
+   (`gateway: true`, `capacity: nil` role, metadata PVC, EmptyDir data). Includes
+   the v0.5.3-safe per-node gateway config (no storage `rpc_public_addr`
+   inheritance) and tombstone cleanup that won't fight the per-node controller.
+3. **Cluster-health surface** — `QuorumAtRisk`, `RemoteClustersHealthy`,
+   `FederationConfigured` conditions + `status.layoutDiagnosis` printcolumn +
+   federation `rpc_public_addr` webhook warning.
+
+**Scoped/deferred (validation-driven):**
+
+- **Edge gateways stay on the cluster-level StatefulSet path.** Their layout
+  lives on a *remote* storage cluster; the existing gateway-connection path
+  already assigns their `capacity: nil` role correctly (only unified clusters
+  were broken). Migrating them to per-node would add a dual-admin-client code
+  path in the node controller with no functional gain. The principled boundary:
+  *within one GarageCluster CR every tier is per-pod; cross-cluster edge gateways
+  keep the cluster-level connection logic.*
+- **Coordinated factor migration (#208) is deferred to its own PR.** The
+  validation showed it is genuinely destructive (must delete on-disk
+  `cluster_layout`, rebuild the ENTIRE layout, simultaneous restart, asymmetric
+  crash hazard on factor *increase*) and **narrower in value than #208 framed**
+  (it fixes sharded-data write quorum, not stuck admin-table writes — those need
+  restore-majority or `dangerous` mode). It warrants dedicated chaos e2e and
+  should not ride alongside the gateway-path change. The precise validated safe
+  sequence is documented in §4 below so it is ready to build next.
+
 ---
 
 ## 1. Problem statement

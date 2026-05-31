@@ -147,9 +147,16 @@ A `GarageCluster` describes two optional tiers, both reconciled from the same CR
   with metadata + data PVCs. The cluster spec generates N × `GarageNode` CRs
   (one per pod ordinal), and the GarageNode controller owns each node's 1-replica
   STS. Pod node identity persists across restarts via the metadata PVC.
-- `spec.gateway` — ephemeral **Deployment** with EmptyDir for both metadata and
-  data. Gateway pods generate a fresh Ed25519 node identity on every restart;
-  the operator garbage-collects stale layout entries via tombstone cleanup.
+- `spec.gateway` — in a **unified cluster** (storage + gateway in the same CR),
+  the gateway tier ALSO runs as N × per-node `GarageNode` CRs
+  (`<cr>-gateway-N`, `gateway: true`) — symmetric with storage — each with a
+  small metadata PVC (persistent identity) and EmptyDir data. The GarageNode
+  controller assigns each gateway pod a `capacity: nil` layout role so
+  `key_table`/`bucket_table` are full-replicated locally and S3 sig-auth resolves
+  keys via `get_local()` without a per-request quorum RPC to the storage tier
+  (issue #209). In an **edge gateway** (gateway-only CR + `connectTo`), the
+  gateway tier stays a cluster-level **StatefulSet** (`<cr>-gateway`) because its
+  layout lives on a remote storage cluster managed by the gateway-connection path.
 
 A CR must set at least one of `storage`, `gateway`, or `connectTo`. The webhook
 rejects empty specs and `gateway` without either `storage` (unified cluster) or
@@ -175,33 +182,50 @@ rejects empty specs and `gateway` without either `storage` (unified cluster) or
 
 ### Workload differences
 
-| Aspect | Storage tier | Gateway tier |
-|---|---|---|
-| Workload | N × `StatefulSet`s (one per GarageNode, `replicas: 1`) | `Deployment` (`<cr>-gateway`) |
-| GarageNode CRs | one per pod ordinal (Auto: operator-owned `<cr>-storage-N`; Manual: user-owned) | none |
-| metadata volume | PVC via volumeClaimTemplates (per node) | EmptyDir |
-| data volume | PVC via volumeClaimTemplates (per node) | EmptyDir |
-| Update strategy | per-node STS default | RollingUpdate with maxSurge:25%, maxUnavailable:25% |
-| Pod naming | `<garagenode>-0` (each STS has one pod) | random suffix |
-| Node identity | persists (PVC) | rotates per pod restart |
-| ConfigMap | per-node when overrides present, else shared | single shared |
-| Layout capacity | from PVC size | nil (gateway) |
+| Aspect | Storage tier | Gateway tier (unified) | Gateway tier (edge) |
+|---|---|---|---|
+| Workload | N × `StatefulSet`s (`replicas: 1`) | N × `StatefulSet`s (`replicas: 1`) | `StatefulSet` (`<cr>-gateway`) |
+| GarageNode CRs | one per ordinal (`<cr>-storage-N`) | one per ordinal (`<cr>-gateway-N`, `gateway: true`) | none |
+| metadata volume | PVC (per node) | PVC (per node, 1Gi default) | PVC (per replica) |
+| data volume | PVC (per node) | EmptyDir | EmptyDir |
+| Node identity | persists (PVC) | persists (PVC) | persists (PVC) |
+| ConfigMap | per-node when overrides present, else shared | **always per-node** (so it never inherits the storage `rpc_public_addr`) | gateway-specific |
+| Layout owner | per-`GarageNode` controller (local) | per-`GarageNode` controller (local) | gateway-connection path (remote) |
+| Layout capacity | from PVC size | nil (gateway) | nil (gateway) |
 
-In both Auto and Manual mode the storage tier is N × 1-replica StatefulSets,
-each owned by a `GarageNode` CR. The difference is **ownership** of those
-GarageNodes — the operator (Auto) or the user (Manual) — not the workload
-shape.
+In a unified cluster every tier is reconciled as per-pod `GarageNode`s; the
+difference between tiers is `gateway: true` (capacity nil, EmptyDir data) and
+between Auto/Manual is **ownership** of those GarageNodes (operator vs user),
+not the workload shape. Edge gateways (a separate gateway-only CR connecting to
+a remote storage cluster) keep the cluster-level StatefulSet because their layout
+is owned remotely.
+
+### Layout staging/apply concurrency
+
+Every layout mutation goes through `Client.ApplyStagedLayoutChanges`
+(`internal/garage/client.go`). Two upstream facts make a naive
+`ApplyClusterLayout(version+1)` wrong (validated against Garage v2.3.0):
+`ApplyClusterLayout`'s version-rejection is a generic error mapped to **HTTP 500,
+not 409** (so `garage.IsConflict` never caught an apply race), and apply
+**always** bumps the version (so an unconditional apply churns layout gossip).
+The helper re-reads the layout, skips apply when nothing is staged, and on
+failure re-reads to detect whether a concurrent writer already committed the
+staged change (staging is a per-node `LwwMap` that merges, so this is safe).
 
 ### Gateway tombstone cleanup
 
-Gateway node IDs are ephemeral. On each reconcile the operator:
+On each reconcile the operator:
 
 1. Picks the right admin client — local for unified clusters, remote for edge
    gateways (via `connectTo`).
 2. Queries the cluster's layout and lists entries tagged with both
    `cluster:<name>/<namespace>` and `tier:gateway`.
-3. Cross-references with the live gateway pods' current node IDs.
-4. Stages removal of any layout entry that has no matching pod.
+3. Cross-references with the live gateway pods (`isUp`) AND the node IDs claimed
+   by live operator-owned gateway `GarageNode` CRs (`status.nodeId`). A role
+   claimed by an existing gateway GarageNode is **never** removed — this keeps
+   the cluster-level cleanup from fighting the per-node controller during a brief
+   pod restart (the per-node finalizer owns role removal on delete).
+4. Stages removal of any remaining unclaimed `tier:gateway` entry.
 
 When `spec.layoutManagement.autoApply: true` the removal is applied immediately
 and `skip-dead-nodes` is called on the new layout version. Otherwise the
@@ -441,6 +465,27 @@ status:
 ```
 
 On failure, `succeeded: false` and `error` contains the message. The annotation is kept for retry.
+
+### Cluster-health conditions (validated against Garage v2.3.0)
+
+`updateStatusFromCluster` derives actionable conditions + a one-line
+`status.layoutDiagnosis` (shown as the `Diagnosis` printcolumn) via
+`setClusterHealthConditions` (`internal/controller/garagecluster_health.go`):
+
+| Condition | True/False means | Lever |
+|---|---|---|
+| `QuorumAtRisk` | True when Garage reports `PartitionsQuorum < Partitions` — object writes to those partitions block | restore storage nodes, or `consistencyMode: dangerous` (NOT a layout edit) |
+| `RemoteClustersHealthy` | False when a federated remote is unreachable > 1h (short blips ignored) | if a zone is permanently gone, reduce `replication.factor` |
+| `FederationConfigured` | False when `spec.remoteClusters` is set but no `rpc_public_addr`/`publicEndpoint` (HelloMessage advertises the unroutable pod IP) | set `spec.network.rpcPublicAddr` or a `publicEndpoint` (also a webhook admission warning) |
+
+Validation notes: a roleless gateway is **not** a deterministic 403 — S3 auth
+falls back to a quorum `get()` that succeeds in a healthy cluster; the
+`capacity: nil` gateway role is a resilience/latency optimization (local-first
+auth, decoupled from storage availability). `degraded` mode lowers only READ
+quorum; it does **not** unblock stuck metadata (GarageKey/bucket) writes — those
+need a reachable majority of roled nodes (`floor(N/2)+1`), and stale gateway
+entries inflate N only in `consistent` mode (so tombstone cleanup matters for
+admin-write availability).
 
 ---
 
