@@ -1190,6 +1190,12 @@ type GarageClusterStatus struct {
 	// +optional
 	FactorMigration *FactorMigrationStatus `json:"factorMigration,omitempty"`
 
+	// UnreachablePeers lists peers that have been continuously down beyond the
+	// sustained-unreachable threshold, each as "<shortNodeId> (down <duration>)".
+	// Drives the PeerUnreachable condition. Empty when all peers are reachable.
+	// +optional
+	UnreachablePeers []string `json:"unreachablePeers,omitempty"`
+
 	// ObservedGeneration is the last observed generation.
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`

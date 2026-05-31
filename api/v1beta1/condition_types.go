@@ -94,6 +94,16 @@ const (
 	// and remote peers infer the unroutable pod IP — cross-cluster RPC degrades
 	// after any pod restart. Surfaced as a webhook warning at admission too.
 	ConditionFederationConfigured = "FederationConfigured"
+
+	// ConditionPeerUnreachable is True when one or more peers have been
+	// continuously down (is_up=false) beyond a sustained threshold. The operator
+	// can only read is_up + lastSeenSecsAgo from the admin API — NOT Garage's
+	// internal Abandoned state — so detection is duration-based. Matters most for
+	// edge gateways on a single RPC link: Garage stops retrying a peer after ~10
+	// failed attempts, and the operator's periodic ConnectClusterNodes nudge is
+	// then the only recovery path. Transient restarts (below the threshold) do not
+	// trip it.
+	ConditionPeerUnreachable = "PeerUnreachable"
 )
 
 // Condition reasons for the cluster-health surface.
@@ -110,6 +120,10 @@ const (
 	ReasonMissingRPCPublicAddr = "MissingRPCPublicAddr"
 	// ReasonFederationReady indicates federation networking is configured.
 	ReasonFederationReady = "Configured"
+	// ReasonPeersReachable indicates all known peers are reachable.
+	ReasonPeersReachable = "AllReachable"
+	// ReasonPeersUnreachable indicates one or more peers are sustained-unreachable.
+	ReasonPeersUnreachable = "SustainedUnreachable"
 )
 
 // GarageBucket condition types

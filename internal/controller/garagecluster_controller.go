@@ -2525,6 +2525,12 @@ func (r *GarageClusterReconciler) updateStatusFromCluster(ctx context.Context, c
 		if err != nil {
 			log.V(1).Info("Failed to get cluster status", "error", err)
 		} else {
+			// Sustained-unreachable peer detection: the admin API exposes only
+			// is_up + lastSeenSecsAgo (not Garage's internal Abandoned state), so
+			// we flag peers down longer than the threshold. Transient restarts
+			// (below the threshold) don't trip it.
+			cluster.Status.UnreachablePeers = computeUnreachablePeers(status.Nodes)
+
 			// Use a stable cluster identifier:
 			// - Keep existing ClusterID if still present in the cluster
 			// - Otherwise use the lexicographically smallest node ID for consistency

@@ -26,12 +26,48 @@ import (
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
+	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
 
 // remoteStaleThreshold is how long a federated remote cluster may be
 // unreachable before RemoteClustersHealthy flips False. Below this it's treated
 // as a transient blip.
 const remoteStaleThreshold = time.Hour
+
+// peerUnreachableThreshold is how long a peer may be continuously down before
+// PeerUnreachable trips. Comfortably above a normal pod restart so routine
+// rollouts don't flap the condition, well under Garage's ~10-retry Abandoned
+// window so the operator still gets early warning.
+const peerUnreachableThreshold = 10 * time.Minute
+
+// computeUnreachablePeers returns "<shortId> (down <duration>)" descriptions for
+// peers that are not up and were last seen longer ago than the threshold. A peer
+// with no lastSeenSecsAgo (never seen) is also flagged.
+func computeUnreachablePeers(nodes []garage.NodeInfo) []string {
+	var out []string
+	for _, n := range nodes {
+		if n.IsUp {
+			continue
+		}
+		secs := uint64(0)
+		if n.LastSeenSecsAgo != nil {
+			secs = *n.LastSeenSecsAgo
+			if time.Duration(secs)*time.Second < peerUnreachableThreshold {
+				continue // transient — not yet sustained
+			}
+		}
+		short := n.ID
+		if len(short) > 16 {
+			short = short[:16]
+		}
+		desc := fmt.Sprintf("%s (never seen)", short)
+		if n.LastSeenSecsAgo != nil {
+			desc = fmt.Sprintf("%s (down %s)", short, (time.Duration(secs) * time.Second).Round(time.Minute))
+		}
+		out = append(out, desc)
+	}
+	return out
+}
 
 // clusterHasRPCPublicAddr reports whether the cluster advertises an
 // externally-routable RPC address — either an explicit network.rpcPublicAddr or
@@ -155,6 +191,30 @@ func setClusterHealthConditions(cluster *garagev1beta2.GarageCluster) {
 		}
 	} else {
 		meta.RemoveStatusCondition(&cluster.Status.Conditions, garagev1beta1.ConditionFederationConfigured)
+	}
+
+	// --- PeerUnreachable: sustained-down peers ----------------------------
+	if len(cluster.Status.UnreachablePeers) > 0 {
+		msg := fmt.Sprintf(
+			"peers unreachable beyond %s: %s; the operator's periodic ConnectClusterNodes nudge is the recovery path "+
+				"(Garage stops retrying a peer after ~10 attempts)",
+			peerUnreachableThreshold, strings.Join(cluster.Status.UnreachablePeers, ", "))
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:               garagev1beta1.ConditionPeerUnreachable,
+			Status:             metav1.ConditionTrue,
+			Reason:             garagev1beta1.ReasonPeersUnreachable,
+			Message:            msg,
+			ObservedGeneration: gen,
+		})
+		diagnoses = append(diagnoses, msg)
+	} else {
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:               garagev1beta1.ConditionPeerUnreachable,
+			Status:             metav1.ConditionFalse,
+			Reason:             garagev1beta1.ReasonPeersReachable,
+			Message:            "all known peers are reachable",
+			ObservedGeneration: gen,
+		})
 	}
 
 	// One-line human summary = most severe active problem.

@@ -478,6 +478,7 @@ On failure, `succeeded: false` and `error` contains the message. The annotation 
 | `QuorumAtRisk` | True when Garage reports `PartitionsQuorum < Partitions` — object writes to those partitions block | restore storage nodes, or `consistencyMode: dangerous` (NOT a layout edit) |
 | `RemoteClustersHealthy` | False when a federated remote is unreachable > 1h (short blips ignored) | if a zone is permanently gone, reduce `replication.factor` |
 | `FederationConfigured` | False when `spec.remoteClusters` is set but no `rpc_public_addr`/`publicEndpoint` (HelloMessage advertises the unroutable pod IP) | set `spec.network.rpcPublicAddr` or a `publicEndpoint` (also a webhook admission warning) |
+| `PeerUnreachable` | True when a peer has been continuously down (`is_up:false`) beyond ~10m — surfaced in `status.unreachablePeers`. Detection is duration-based via `lastSeenSecsAgo` (the admin API can't read Garage's internal `Abandoned` state). | the operator's periodic `ConnectClusterNodes` nudge is the recovery path (esp. for single-link edge gateways) |
 
 Validation notes: a roleless gateway is **not** a deterministic 403 — S3 auth
 falls back to a quorum `get()` that succeeds in a healthy cluster; the

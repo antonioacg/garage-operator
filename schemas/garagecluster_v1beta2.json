@@ -6847,6 +6847,13 @@
           "description": "TotalNodes is the total nodes across all clusters (local + remote).",
           "type": "integer"
         },
+        "unreachablePeers": {
+          "description": "UnreachablePeers lists peers that have been continuously down beyond the\nsustained-unreachable threshold, each as \"<shortNodeId> (down <duration>)\".\nDrives the PeerUnreachable condition. Empty when all peers are reachable.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "workerCount": {
           "description": "WorkerCount is the total number of background workers.",
           "format": "int32",
