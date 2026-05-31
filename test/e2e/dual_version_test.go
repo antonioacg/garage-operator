@@ -276,19 +276,27 @@ spec:
 		out, err := utils.Run(apply)
 		Expect(err).NotTo(HaveOccurred(), "apply v1beta2 unified: %s", out)
 
-		By("expecting per-node storage StatefulSets and a gateway StatefulSet")
-		// Post-#190: storage tier is per-GarageNode (named <cluster>-storage-N), not
-		// a single STS named <cluster>. Gateway tier is unchanged.
+		By("expecting per-node storage AND per-node gateway StatefulSets")
+		// Post-#190 storage is per-GarageNode (<cluster>-storage-N). Post-#209 the
+		// gateway tier of a UNIFIED cluster is ALSO per-GarageNode
+		// (<cluster>-gateway-N) — not a single cluster-level <cluster>-gateway STS.
 		Eventually(func(g Gomega) {
 			get := exec.Command("kubectl", "get", "statefulset", v2Unified+"-storage-0", "-n", testNS)
 			_, err := utils.Run(get)
 			g.Expect(err).NotTo(HaveOccurred())
 		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 		Eventually(func(g Gomega) {
-			get := exec.Command("kubectl", "get", "statefulset", v2Unified+"-gateway", "-n", testNS)
+			get := exec.Command("kubectl", "get", "statefulset", v2Unified+"-gateway-0", "-n", testNS)
 			_, err := utils.Run(get)
 			g.Expect(err).NotTo(HaveOccurred())
 		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+		By("expecting NO legacy cluster-level gateway StatefulSet")
+		Consistently(func(g Gomega) {
+			get := exec.Command("kubectl", "get", "statefulset", v2Unified+"-gateway", "-n", testNS, "--ignore-not-found", "-o", "jsonpath={.metadata.name}")
+			out, err := utils.Run(get)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(strings.TrimSpace(out)).To(BeEmpty())
+		}, 10*time.Second, 5*time.Second).Should(Succeed())
 	})
 
 	// Scenario 4: v1beta2 edge gateway with connectTo.adminApiEndpoint.
