@@ -508,6 +508,123 @@ func TestLaunchScrubCommand_RequestBody(t *testing.T) {
 	}
 }
 
+const (
+	pathGetClusterLayout   = "/v2/GetClusterLayout"
+	pathApplyClusterLayout = "/v2/ApplyClusterLayout"
+)
+
+// TestApplyStagedLayoutChanges exercises the concurrent-writer-safe apply path.
+// Garage returns a generic 500 ("Invalid new layout version") on a version
+// race — NOT a 409 — so the helper must re-read the layout to decide whether a
+// sibling writer already committed our staged change.
+func TestApplyStagedLayoutChanges(t *testing.T) {
+	t.Run("no staged changes does not apply", func(t *testing.T) {
+		applied := false
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case pathGetClusterLayout:
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"version":7,"roles":[],"stagedRoleChanges":[]}`))
+			case pathApplyClusterLayout:
+				applied = true
+				w.WriteHeader(http.StatusOK)
+			default:
+				t.Fatalf("unexpected path %q", r.URL.Path)
+			}
+		}))
+		defer srv.Close()
+
+		c := NewClient(srv.URL, "tok")
+		if err := c.ApplyStagedLayoutChanges(context.Background()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if applied {
+			t.Fatal("apply must not be called when nothing is staged (version churn)")
+		}
+	})
+
+	t.Run("staged changes applied at version+1", func(t *testing.T) {
+		var gotVersion uint64
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case pathGetClusterLayout:
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"version":7,"roles":[],"stagedRoleChanges":[{"id":"n1","zone":"z","tags":[]}]}`))
+			case pathApplyClusterLayout:
+				var req ApplyLayoutRequest
+				_ = json.NewDecoder(r.Body).Decode(&req)
+				gotVersion = req.Version
+				w.WriteHeader(http.StatusOK)
+			default:
+				t.Fatalf("unexpected path %q", r.URL.Path)
+			}
+		}))
+		defer srv.Close()
+
+		c := NewClient(srv.URL, "tok")
+		if err := c.ApplyStagedLayoutChanges(context.Background()); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if gotVersion != 8 {
+			t.Fatalf("applied version = %d, want 8", gotVersion)
+		}
+	})
+
+	t.Run("version race resolved when sibling already applied", func(t *testing.T) {
+		// Apply is rejected with a generic 500; the subsequent GetClusterLayout
+		// shows the version already advanced past our target, so the helper
+		// treats it as success.
+		getCalls := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case pathGetClusterLayout:
+				getCalls++
+				w.Header().Set("Content-Type", "application/json")
+				if getCalls == 1 {
+					_, _ = w.Write([]byte(`{"version":7,"roles":[],"stagedRoleChanges":[{"id":"n1","zone":"z","tags":[]}]}`))
+				} else {
+					// Sibling committed; version advanced and staging cleared.
+					_, _ = w.Write([]byte(`{"version":8,"roles":[{"id":"n1","zone":"z","tags":[]}],"stagedRoleChanges":[]}`))
+				}
+			case pathApplyClusterLayout:
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"code":"InternalError","message":"Invalid new layout version"}`))
+			default:
+				t.Fatalf("unexpected path %q", r.URL.Path)
+			}
+		}))
+		defer srv.Close()
+
+		c := NewClient(srv.URL, "tok")
+		if err := c.ApplyStagedLayoutChanges(context.Background()); err != nil {
+			t.Fatalf("expected race to resolve to success, got: %v", err)
+		}
+	})
+
+	t.Run("genuine apply failure surfaces error", func(t *testing.T) {
+		// Apply rejected and the version did NOT advance — a real failure the
+		// caller must requeue on.
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case pathGetClusterLayout:
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"version":7,"roles":[],"stagedRoleChanges":[{"id":"n1","zone":"z","tags":[]}]}`))
+			case pathApplyClusterLayout:
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"code":"InternalError","message":"some other failure"}`))
+			default:
+				t.Fatalf("unexpected path %q", r.URL.Path)
+			}
+		}))
+		defer srv.Close()
+
+		c := NewClient(srv.URL, "tok")
+		if err := c.ApplyStagedLayoutChanges(context.Background()); err == nil {
+			t.Fatal("expected apply failure to surface as an error")
+		}
+	})
+}
+
 func TestConnectNode_ReturnsErrorWhenGarageReportsFailure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v2/ConnectClusterNodes" {

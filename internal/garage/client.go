@@ -452,6 +452,50 @@ func (c *Client) ApplyClusterLayout(ctx context.Context, version uint64) error {
 	return err
 }
 
+// ApplyStagedLayoutChanges commits whatever layout changes are currently staged,
+// tolerating the concurrent-writer race that arises when several reconcilers
+// stage their own role into the same cluster layout.
+//
+// Two upstream facts make a naive `ApplyClusterLayout(version+1)` wrong (verified
+// against Garage v2.3.0):
+//
+//  1. ApplyClusterLayout ALWAYS increments the version with no no-op
+//     short-circuit (src/rpc/layout/version.rs:290-303). Applying when nothing
+//     is staged churns the version + layout gossip pointlessly. So we read the
+//     layout first and return early when nothing is staged.
+//
+//  2. The version-mismatch rejection is a generic Error::Message("Invalid new
+//     layout version") that maps to HTTP 500, NOT 409
+//     (src/rpc/layout/history.rs:273-276). IsConflict() (which only matches 409)
+//     therefore never catches an apply race. When apply fails we re-read the
+//     layout: if another writer already advanced the version (committing our
+//     staged change too, since staging is a per-node LwwMap that merges), we
+//     treat it as success; otherwise we surface the error so the caller requeues
+//     and retries against the new current+1.
+//
+// Staging is a CRDT merge keyed by node UUID, so committing "whatever is staged"
+// is safe — it commits our change plus any sibling's concurrently-staged change.
+func (c *Client) ApplyStagedLayoutChanges(ctx context.Context) error {
+	layout, err := c.GetClusterLayout(ctx)
+	if err != nil {
+		return err
+	}
+	if len(layout.StagedRoleChanges) == 0 && layout.StagedParameters == nil {
+		// Nothing to apply — do not bump the version.
+		return nil
+	}
+	target := layout.Version + 1
+	if err := c.ApplyClusterLayout(ctx, target); err != nil {
+		// Apply rejection is not a 409; re-read to decide whether a concurrent
+		// writer already committed our staged change.
+		if fresh, gerr := c.GetClusterLayout(ctx); gerr == nil && fresh.Version >= target {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
 // RevertClusterLayout reverts staged layout changes
 func (c *Client) RevertClusterLayout(ctx context.Context) error {
 	_, err := c.doRequest(ctx, http.MethodPost, "/v2/RevertClusterLayout", nil)

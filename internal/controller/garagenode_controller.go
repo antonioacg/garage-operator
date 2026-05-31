@@ -266,13 +266,21 @@ func (r *GarageNodeReconciler) reconcileStatefulSet(ctx context.Context, node *g
 	// Build merged pod config (cluster defaults + node overrides)
 	image := mergeNodeImage(cluster.Spec.Image, cluster.Spec.ImageRepository, node.Spec.Image, node.Spec.ImageRepository, r.DefaultImage)
 
-	// Cluster-level fallback scheduling values come from the storage tier when set
-	// (manual-layout GarageNodes are functionally storage nodes). Edge gateway clusters
-	// don't have a storage tier; in that case we fall back to gateway-tier values.
+	// Cluster-level fallback scheduling values come from the tier this node
+	// belongs to. A gateway GarageNode (node.Spec.Gateway) inherits the gateway
+	// tier's PodTemplate; a storage GarageNode inherits the storage tier's. This
+	// matters in a unified cluster where BOTH tiers are declared — without the
+	// gateway branch, gateway pods would wrongly inherit storage-tier scheduling
+	// (resources, nodeSelector, affinity). Fallbacks cover single-tier clusters.
 	var tierTemplate *garagev1beta2.PodTemplate
-	if cluster.HasStorageTier() {
+	switch {
+	case node.Spec.Gateway && cluster.HasGatewayTier():
+		tierTemplate = &cluster.Spec.Gateway.PodTemplate
+	case !node.Spec.Gateway && cluster.HasStorageTier():
 		tierTemplate = &cluster.Spec.Storage.PodTemplate
-	} else if cluster.HasGatewayTier() {
+	case cluster.HasStorageTier():
+		tierTemplate = &cluster.Spec.Storage.PodTemplate
+	case cluster.HasGatewayTier():
 		tierTemplate = &cluster.Spec.Gateway.PodTemplate
 	}
 
@@ -1128,8 +1136,6 @@ func (r *GarageNodeReconciler) reconcileNode(ctx context.Context, node *garagev1
 			}
 		}
 
-		stagedVersion := layout.Version + 1
-
 		updates := []garage.NodeRoleChange{{
 			ID:       nodeID,
 			Zone:     node.Spec.Zone,
@@ -1141,15 +1147,15 @@ func (r *GarageNodeReconciler) reconcileNode(ctx context.Context, node *garagev1
 			return fmt.Errorf("failed to update layout: %w", err)
 		}
 
-		if err := garageClient.ApplyClusterLayout(ctx, stagedVersion); err != nil {
-			if garage.IsConflict(err) {
-				log.Info("Layout version mismatch, will retry on next reconciliation", "attemptedVersion", stagedVersion)
-				return nil
-			}
+		// ApplyStagedLayoutChanges re-reads the version after staging and
+		// tolerates the concurrent-writer race (apply rejection is a generic
+		// 500, not a 409 — so a returned error here is a genuine failure worth
+		// requeueing, not a benign version race).
+		if err := garageClient.ApplyStagedLayoutChanges(ctx); err != nil {
 			return fmt.Errorf("failed to apply layout: %w", err)
 		}
 
-		log.Info("Applied layout update", "version", stagedVersion)
+		log.Info("Applied layout update", "nodeID", nodeID, "zone", node.Spec.Zone)
 	}
 
 	return nil
@@ -1377,11 +1383,7 @@ func (r *GarageNodeReconciler) removeNodeFromExternalLayout(ctx context.Context,
 	if err := garageClient.UpdateClusterLayout(ctx, updates); err != nil {
 		return fmt.Errorf("stage node removal: %w", err)
 	}
-	stagedVersion := layout.Version + 1
-	if err := garageClient.ApplyClusterLayout(ctx, stagedVersion); err != nil {
-		if garage.IsConflict(err) {
-			return fmt.Errorf("layout version mismatch: %w", err)
-		}
+	if err := garageClient.ApplyStagedLayoutChanges(ctx); err != nil {
 		if garage.IsReplicationConstraint(err) {
 			// Best-effort cleanup; admin will need to add capacity or
 			// reduce replication to actually drop this entry.
@@ -1472,16 +1474,11 @@ func (r *GarageNodeReconciler) finalize(ctx context.Context, node *garagev1beta1
 		return fmt.Errorf("failed to stage node removal: %w", err)
 	}
 
-	stagedVersion := layout.Version + 1
 	if len(layout.StagedRoleChanges) > 0 {
 		log.Info("Adding removal to existing staged layout changes", "existingStagedCount", len(layout.StagedRoleChanges))
 	}
 
-	if err := garageClient.ApplyClusterLayout(ctx, stagedVersion); err != nil {
-		if garage.IsConflict(err) {
-			log.Info("Layout version mismatch during removal, will retry", "attemptedVersion", stagedVersion)
-			return fmt.Errorf("layout version mismatch, retry needed: %w", err)
-		}
+	if err := garageClient.ApplyStagedLayoutChanges(ctx); err != nil {
 		if garage.IsReplicationConstraint(err) {
 			log.Info("Cannot remove node: would violate replication factor constraints. "+
 				"The node will be removed from Kubernetes but will remain in the Garage layout. "+
@@ -1492,12 +1489,21 @@ func (r *GarageNodeReconciler) finalize(ctx context.Context, node *garagev1beta1
 		return fmt.Errorf("failed to apply layout removal: %w", err)
 	}
 
-	log.Info("Removed node from layout", "version", stagedVersion)
+	// Re-read the committed version for logging and the gateway skip-dead-nodes
+	// call (ApplyStagedLayoutChanges does not surface the version it applied,
+	// and a concurrent writer may have advanced it past our local target).
+	appliedVersion := layout.Version + 1
+	if cur, gerr := garageClient.GetClusterLayout(ctx); gerr == nil {
+		appliedVersion = cur.Version
+	}
+	log.Info("Removed node from layout", "version", appliedVersion)
 
-	// For gateway nodes, immediately skip dead nodes
+	// For gateway nodes, immediately skip dead nodes. Gateways own no partitions
+	// so this is belt-and-suspenders (it advances ack/sync trackers so the
+	// removed entry never lingers in a Draining version), not a data operation.
 	if node.Spec.Gateway {
 		skipReq := garage.SkipDeadNodesRequest{
-			Version:          stagedVersion,
+			Version:          appliedVersion,
 			AllowMissingData: true,
 		}
 		result, err := garageClient.ClusterLayoutSkipDeadNodes(ctx, skipReq)
@@ -1726,6 +1732,13 @@ func (r *GarageNodeReconciler) reconcileNodeConfigMap(ctx context.Context, node 
 	cfgCtx, err := buildConfigContext(ctx, r.Client, cluster)
 	if err != nil {
 		cfgCtx = &configContext{}
+	}
+
+	// A gateway node must never inherit the storage tier's rpc_public_addr from
+	// the shared cluster config (the v0.5.3 outage). Its own address, if any,
+	// still flows through NodeRPCPublicAddr below.
+	if node.Spec.Gateway {
+		cfgCtx.OmitClusterRPCPublicAddr = true
 	}
 
 	// Apply node-level rpc_public_addr via NodeRPCPublicAddr — this takes highest priority

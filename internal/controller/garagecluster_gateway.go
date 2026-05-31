@@ -417,6 +417,29 @@ func (r *GarageClusterReconciler) reconcileGatewayTombstones(ctx context.Context
 		}
 	}
 
+	// In a unified cluster the gateway tier runs as per-node GarageNodes, whose
+	// finalizers own layout-role removal on delete. A node that just restarted
+	// is briefly not "isUp" yet its CR (and role) are valid — removing it here
+	// would fight the per-node controller. So preserve any role claimed by a live
+	// operator-owned gateway GarageNode CR (via status.nodeId). Edge gateways have
+	// no such CRs, so this set is empty there and the isUp check governs alone.
+	claimed := make(map[string]bool)
+	gwNodes := &garagev1beta1.GarageNodeList{}
+	if err := r.List(ctx, gwNodes,
+		client.InNamespace(cluster.Namespace),
+		client.MatchingLabels(map[string]string{
+			labelCluster:      cluster.Name,
+			labelTier:         tierGateway,
+			labelAppManagedBy: managedByOperatorValue,
+		}),
+	); err == nil {
+		for i := range gwNodes.Items {
+			if id := gwNodes.Items[i].Status.NodeID; id != "" {
+				claimed[id] = true
+			}
+		}
+	}
+
 	gatewayOwnershipTag := fmt.Sprintf("cluster:%s/%s", cluster.Name, cluster.Namespace)
 	gatewayTierTag := "tier:" + tierGateway
 	var stale []string
@@ -434,7 +457,7 @@ func (r *GarageClusterReconciler) reconcileGatewayTombstones(ctx context.Context
 		if !ownsThis || !isGatewayTier {
 			continue
 		}
-		if live[role.ID] {
+		if live[role.ID] || claimed[role.ID] {
 			continue
 		}
 		stale = append(stale, role.ID)
@@ -470,17 +493,15 @@ func (r *GarageClusterReconciler) reconcileGatewayTombstones(ctx context.Context
 		log.Error(err, "Failed to stage stale gateway entry removal")
 		return
 	}
-	layout, err = layoutClient.GetClusterLayout(ctx)
-	if err != nil {
-		log.Error(err, "Failed to refresh layout after staging tombstone removal")
-		return
-	}
-	newVersion := layout.Version + 1
-	if err := layoutClient.ApplyClusterLayout(ctx, newVersion); err != nil {
+	if err := layoutClient.ApplyStagedLayoutChanges(ctx); err != nil {
 		if !garage.IsReplicationConstraint(err) {
 			log.Error(err, "Failed to apply gateway tombstone removal")
 		}
 		return
+	}
+	newVersion := layout.Version + 1
+	if cur, gerr := layoutClient.GetClusterLayout(ctx); gerr == nil {
+		newVersion = cur.Version
 	}
 	log.Info("Removed stale gateway entries from layout", "count", len(stale), "version", newVersion)
 
