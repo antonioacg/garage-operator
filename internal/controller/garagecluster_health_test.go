@@ -26,6 +26,7 @@ import (
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
+	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
 
 func condStatus(cluster *garagev1beta2.GarageCluster, condType string) (metav1.ConditionStatus, bool) {
@@ -154,6 +155,50 @@ func TestSetClusterHealthConditions_NoFederationClearsConditions(t *testing.T) {
 	}
 	if _, ok := condStatus(cluster, garagev1beta1.ConditionFederationConfigured); ok {
 		t.Fatal("FederationConfigured must be removed for a non-federated cluster")
+	}
+}
+
+func TestComputeUnreachablePeers(t *testing.T) {
+	up := func(secs uint64) *uint64 { return &secs }
+	nodes := []garage.NodeInfo{
+		{ID: "aaaaaaaaaaaaaaaaaaaa", IsUp: true},                             // up → ignored
+		{ID: "bbbbbbbbbbbbbbbbbbbb", IsUp: false, LastSeenSecsAgo: up(120)},  // 2m down → transient
+		{ID: "cccccccccccccccccccc", IsUp: false, LastSeenSecsAgo: up(1800)}, // 30m down → flagged
+		{ID: "dddddddddddddddddddd", IsUp: false, LastSeenSecsAgo: nil},      // never seen → flagged
+	}
+	got := computeUnreachablePeers(nodes)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 unreachable peers, got %d: %v", len(got), got)
+	}
+	if !strings.Contains(got[0], "cccccccccccccccc") || !strings.Contains(got[0], "down") {
+		t.Fatalf("unexpected first entry: %q", got[0])
+	}
+	if !strings.Contains(got[1], "never seen") {
+		t.Fatalf("expected a never-seen entry, got %q", got[1])
+	}
+}
+
+func TestSetClusterHealthConditions_PeerUnreachable(t *testing.T) {
+	cluster := &garagev1beta2.GarageCluster{
+		Status: garagev1beta2.GarageClusterStatus{
+			Health:           &garagev1beta2.ClusterHealth{Partitions: 256, PartitionsQuorum: 256},
+			UnreachablePeers: []string{"abc123 (down 30m0s)"},
+		},
+	}
+	setClusterHealthConditions(cluster)
+	st, ok := condStatus(cluster, garagev1beta1.ConditionPeerUnreachable)
+	if !ok || st != metav1.ConditionTrue {
+		t.Fatalf("expected PeerUnreachable=True, got %v (present=%v)", st, ok)
+	}
+	if cluster.Status.LayoutDiagnosis == "" {
+		t.Fatal("expected a diagnosis when a peer is sustained-unreachable")
+	}
+
+	// Clears when peers recover.
+	cluster.Status.UnreachablePeers = nil
+	setClusterHealthConditions(cluster)
+	if st, _ := condStatus(cluster, garagev1beta1.ConditionPeerUnreachable); st != metav1.ConditionFalse {
+		t.Fatalf("expected PeerUnreachable=False after recovery, got %v", st)
 	}
 }
 

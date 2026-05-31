@@ -798,6 +798,11 @@ func (in *GarageClusterStatus) DeepCopyInto(out *GarageClusterStatus) {
 		*out = new(FactorMigrationStatus)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.UnreachablePeers != nil {
+		in, out := &in.UnreachablePeers, &out.UnreachablePeers
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]metav1.Condition, len(*in))
