@@ -2257,26 +2257,42 @@ spec:
 	})
 
 	It("reduces the replication factor from 2 to 1 via purge-cluster-layout", func() {
-		By("setting spec.replication.factor=1 AND the purge annotation atomically")
-		// Patch both in a single merge so the operator never observes the
-		// annotation with a stale factor (the factor-mismatch guard). The operator
-		// tolerates the race too, but this keeps the e2e deterministic.
-		patchBoth := func(g Gomega) {
+		By("patching spec.replication.factor=1")
+		patchFactor := func(g Gomega) {
 			c := exec.Command("kubectl", "patch", "garagecluster", clusterName, "-n", testNamespace,
-				"--type=merge", "-p",
-				`{"metadata":{"annotations":{"garage.rajsingh.info/purge-cluster-layout":"factor=1"}},"spec":{"replication":{"factor":1}}}`)
+				"--type=merge", "-p", `{"spec":{"replication":{"factor":1}}}`)
 			out, err := utils.Run(c)
-			g.Expect(err).NotTo(HaveOccurred(), "patch factor+annotation: %s", out)
+			g.Expect(err).NotTo(HaveOccurred(), "patch factor: %s", out)
 		}
-		Eventually(patchBoth, time.Minute, 5*time.Second).Should(Succeed())
+		Eventually(patchFactor, time.Minute, 5*time.Second).Should(Succeed())
 
-		By("waiting for the migration to reach Completed")
-		verifyCompleted := func(g Gomega) {
+		By("confirming the spec.replication.factor change took effect")
+		verifyFactor := func(g Gomega) {
 			cmd := exec.Command("kubectl", "get", "garagecluster", clusterName, "-n", testNamespace,
-				"-o", "jsonpath={.status.factorMigration.phase}")
+				"-o", "jsonpath={.spec.replication.factor}")
 			out, err := utils.Run(cmd)
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(out).To(Equal("Completed"), "factorMigration.phase=%s", out)
+			g.Expect(strings.TrimSpace(out)).To(Equal("1"), "spec.replication.factor=%s", out)
+		}
+		Eventually(verifyFactor, time.Minute, 5*time.Second).Should(Succeed())
+
+		By("setting the purge-cluster-layout annotation")
+		cmd := exec.Command("kubectl", "annotate", "garagecluster", clusterName, "-n", testNamespace,
+			"garage.rajsingh.info/purge-cluster-layout=factor=1", "--overwrite")
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("waiting for the migration to reach Completed (fail fast with the message on Failed)")
+		verifyCompleted := func(g Gomega) {
+			cmd := exec.Command("kubectl", "get", "garagecluster", clusterName, "-n", testNamespace,
+				"-o", "jsonpath={.status.factorMigration.phase}|{.status.factorMigration.message}")
+			out, err := utils.Run(cmd)
+			g.Expect(err).NotTo(HaveOccurred())
+			phase := strings.TrimSpace(strings.Split(out, "|")[0])
+			if phase == "Failed" {
+				StopTrying(fmt.Sprintf("factor migration Failed: %s", out)).Now()
+			}
+			g.Expect(phase).To(Equal("Completed"), "factorMigration=%s", out)
 		}
 		Eventually(verifyCompleted, 12*time.Minute, 10*time.Second).Should(Succeed())
 	})
