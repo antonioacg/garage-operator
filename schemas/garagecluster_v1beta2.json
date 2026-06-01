@@ -6280,6 +6280,10 @@
               "format": "date-time",
               "type": "string"
             },
+            "force": {
+              "description": "Force records whether the trigger carried the ,force flag (overriding the\ndangerous-mode / pending-tombstone guards). Captured at start because the\nannotation is consumed immediately.",
+              "type": "boolean"
+            },
             "fromFactor": {
               "description": "FromFactor is the replication factor before the migration.",
               "type": "integer"

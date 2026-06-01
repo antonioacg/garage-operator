@@ -1500,6 +1500,12 @@ type FactorMigrationStatus struct {
 	// +optional
 	ToFactor int `json:"toFactor,omitempty"`
 
+	// Force records whether the trigger carried the ,force flag (overriding the
+	// dangerous-mode / pending-tombstone guards). Captured at start because the
+	// annotation is consumed immediately.
+	// +optional
+	Force bool `json:"force,omitempty"`
+
 	// PurgeID uniquely identifies this migration; it is the marker-file suffix the
 	// per-node init container uses so the on-disk cluster_layout is deleted exactly
 	// once even across extra restarts.
