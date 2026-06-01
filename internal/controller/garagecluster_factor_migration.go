@@ -98,13 +98,48 @@ func (r *GarageClusterReconciler) reconcileFactorMigration(ctx context.Context, 
 	}
 
 	fm := cluster.Status.FactorMigration
-	// Fresh start: annotation present and no in-flight migration.
-	if fm == nil || fm.Phase == "" || fm.Phase == fmPhaseCompleted || fm.Phase == fmPhaseFailed {
+	ann := cluster.Annotations[garagev1beta1.AnnotationPurgeClusterLayout]
+
+	// A terminal migration (Completed/Failed) must NEVER restart from a lingering
+	// trigger annotation. This is the regression guard for the destructive
+	// re-trigger loop: if the annotation removal at start/finish ever loses a
+	// race, just clear the annotation and stay terminal. Re-running a migration
+	// requires clearing status.factorMigration first.
+	if fm != nil && (fm.Phase == fmPhaseCompleted || fm.Phase == fmPhaseFailed) {
+		if ann != "" {
+			return ctrl.Result{}, r.removeAnnotations(ctx, cluster, garagev1beta1.AnnotationPurgeClusterLayout)
+		}
+		return ctrl.Result{}, nil
+	}
+
+	inFlight := fm != nil && fm.Phase != ""
+
+	// Fresh start: a present annotation is a new request. Capture its intent into
+	// status and CONSUME (remove) the annotation immediately so it can't re-trigger.
+	if !inFlight {
+		if ann == "" {
+			return ctrl.Result{}, nil
+		}
+		toFactor, force, perr := parsePurgeAnnotation(ann)
 		now := metav1.Now()
+		if perr != nil {
+			r.setFactorMigration(ctx, cluster, func(m *garagev1beta2.FactorMigrationStatus) {
+				*m = garagev1beta2.FactorMigrationStatus{Phase: fmPhaseFailed, Message: perr.Error(), StartedAt: &now, CompletedAt: &now}
+			})
+			return ctrl.Result{}, r.removeAnnotations(ctx, cluster, garagev1beta1.AnnotationPurgeClusterLayout)
+		}
 		r.setFactorMigration(ctx, cluster, func(m *garagev1beta2.FactorMigrationStatus) {
-			*m = garagev1beta2.FactorMigrationStatus{Phase: fmPhaseValidating, StartedAt: &now}
+			*m = garagev1beta2.FactorMigrationStatus{Phase: fmPhaseValidating, ToFactor: toFactor, Force: force, StartedAt: &now}
 		})
-		fm = cluster.Status.FactorMigration
+		return ctrl.Result{Requeue: true}, r.removeAnnotations(ctx, cluster, garagev1beta1.AnnotationPurgeClusterLayout)
+	}
+
+	// In-flight: the annotation should already be consumed; remove it defensively
+	// if a crash left it behind (idempotent).
+	if ann != "" {
+		if err := r.removeAnnotations(ctx, cluster, garagev1beta1.AnnotationPurgeClusterLayout); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	switch fm.Phase {
@@ -124,21 +159,19 @@ func (r *GarageClusterReconciler) reconcileFactorMigration(ctx context.Context, 
 	return ctrl.Result{}, nil
 }
 
-// fmValidate runs all hard safety guards before any destructive action.
+// fmValidate runs all hard safety guards before any destructive action. The
+// target factor + force flag were captured into status when the annotation was
+// consumed, so it reads them from status rather than the (now-removed) annotation.
 func (r *GarageClusterReconciler) fmValidate(ctx context.Context, cluster *garagev1beta2.GarageCluster) (ctrl.Result, error) {
-	val := cluster.Annotations[garagev1beta1.AnnotationPurgeClusterLayout]
-	toFactor, force, perr := parsePurgeAnnotation(val)
-	if perr != nil {
-		return r.failFactorMigration(ctx, cluster, perr.Error())
-	}
+	fm := cluster.Status.FactorMigration
+	toFactor := fm.ToFactor
+	force := fm.Force
 
 	if cluster.Spec.Replication == nil || cluster.Spec.Replication.Factor != toFactor {
 		// The annotation and the spec.replication.factor edit are usually two
-		// separate API operations; the operator may briefly observe the
-		// annotation before the factor change propagates. Tolerate that race by
-		// requeueing within a short grace window before failing — otherwise a
-		// benign ordering flake would permanently fail (and strip the annotation).
-		fm := cluster.Status.FactorMigration
+		// separate API operations; the operator may briefly observe the request
+		// before the factor change propagates. Tolerate that race by requeueing
+		// within a short grace window before failing.
 		if fm != nil && fm.StartedAt != nil && time.Since(fm.StartedAt.Time) < fmValidateGrace {
 			r.setFactorMigration(ctx, cluster, func(m *garagev1beta2.FactorMigrationStatus) {
 				m.Message = fmt.Sprintf("waiting for spec.replication.factor to match annotation factor=%d (currently %d)",
@@ -178,11 +211,10 @@ func (r *GarageClusterReconciler) fmValidate(ctx context.Context, cluster *garag
 			fmt.Sprintf("%d storage nodes < requested factor %d — layout would be unappliable", len(nodes), toFactor))
 	}
 
-	r.setFactorMigration(ctx, cluster, func(fm *garagev1beta2.FactorMigrationStatus) {
-		fm.Phase = fmPhaseScalingDown
-		fm.ToFactor = toFactor
-		fm.PurgeID = purgeIDFromStart(fm)
-		fm.Message = fmt.Sprintf("validated; reducing/setting replication factor to %d across %d storage nodes", toFactor, len(nodes))
+	r.setFactorMigration(ctx, cluster, func(m *garagev1beta2.FactorMigrationStatus) {
+		m.Phase = fmPhaseScalingDown
+		m.PurgeID = purgeIDFromStart(m)
+		m.Message = fmt.Sprintf("validated; reducing/setting replication factor to %d across %d storage nodes", toFactor, len(nodes))
 	})
 	return ctrl.Result{Requeue: true}, nil
 }
@@ -357,7 +389,9 @@ func (r *GarageClusterReconciler) fmConverge(ctx context.Context, cluster *garag
 		m.Message = fmt.Sprintf("replication factor migrated to %d; full re-replication proceeds in the background", m.ToFactor)
 	})
 	log.Info("Factor migration completed", "factor", cluster.Status.FactorMigration.ToFactor)
-	return ctrl.Result{}, r.removeAnnotations(ctx, cluster, garagev1beta1.AnnotationPurgeClusterLayout)
+	// The trigger annotation was consumed at start, so there's nothing to remove
+	// here — the terminal Completed phase prevents any re-trigger.
+	return ctrl.Result{}, nil
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -589,8 +623,9 @@ func (r *GarageClusterReconciler) setFactorMigration(ctx context.Context, cluste
 	}
 }
 
-// failFactorMigration records a Failed phase and removes the trigger annotation
-// (validation failures are user errors — retrying without a fix won't help).
+// failFactorMigration records a terminal Failed phase. The trigger annotation
+// was consumed when the migration started, so the terminal phase alone prevents
+// any re-trigger — re-running requires the user to re-apply the annotation.
 func (r *GarageClusterReconciler) failFactorMigration(ctx context.Context, cluster *garagev1beta2.GarageCluster, message string) (ctrl.Result, error) {
 	logf.FromContext(ctx).Info("Factor migration failed", "message", message)
 	now := metav1.Now()
@@ -599,7 +634,7 @@ func (r *GarageClusterReconciler) failFactorMigration(ctx context.Context, clust
 		fm.Message = message
 		fm.CompletedAt = &now
 	})
-	return ctrl.Result{}, r.removeAnnotations(ctx, cluster, garagev1beta1.AnnotationPurgeClusterLayout)
+	return ctrl.Result{}, nil
 }
 
 // removeAnnotations deletes the given annotations from the cluster with conflict retry.

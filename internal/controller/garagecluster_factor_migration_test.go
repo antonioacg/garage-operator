@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -144,8 +145,39 @@ func fmBuild(t *testing.T, objs ...client.Object) *GarageClusterReconciler {
 	return &GarageClusterReconciler{Client: b.Build(), Scheme: s}
 }
 
-func TestFactorMigration_ValidationGuards(t *testing.T) {
+// fmDrive reconciles the named cluster repeatedly (re-fetching each pass, like the
+// real controller) until the migration reaches a terminal/ScalingDown phase or a
+// grace requeue, returning the final cluster + last result. The first reconcile
+// consumes the annotation and sets Validating; subsequent ones run the guards.
+func fmDrive(t *testing.T, r *GarageClusterReconciler, name string) (*garagev1beta2.GarageCluster, ctrl.Result) {
+	t.Helper()
 	ctx := context.Background()
+	var last ctrl.Result
+	for i := 0; i < 8; i++ {
+		c := &garagev1beta2.GarageCluster{}
+		if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: fmNS}, c); err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		res, err := r.reconcileFactorMigration(ctx, c)
+		if err != nil {
+			t.Fatalf("reconcileFactorMigration: %v", err)
+		}
+		last = res
+		if fm := c.Status.FactorMigration; fm != nil {
+			if fm.Phase == fmPhaseFailed || fm.Phase == fmPhaseCompleted || fm.Phase == fmPhaseScalingDown {
+				break
+			}
+		}
+		if res.RequeueAfter > 0 {
+			break // grace requeue — settled for test purposes
+		}
+	}
+	out := &garagev1beta2.GarageCluster{}
+	_ = r.Get(ctx, types.NamespacedName{Name: name, Namespace: fmNS}, out)
+	return out, last
+}
+
+func TestFactorMigration_ValidationGuards(t *testing.T) {
 	tests := []struct {
 		name    string
 		mutate  func(*garagev1beta2.GarageCluster)
@@ -199,27 +231,22 @@ func TestFactorMigration_ValidationGuards(t *testing.T) {
 			objs = append(objs, tt.extra...)
 			r := fmBuild(t, objs...)
 
-			if _, err := r.reconcileFactorMigration(ctx, c); err != nil {
-				t.Fatalf("reconcileFactorMigration: %v", err)
-			}
-			got := &garagev1beta2.GarageCluster{}
-			_ = r.Get(ctx, types.NamespacedName{Name: "c1", Namespace: fmNS}, got)
+			got, _ := fmDrive(t, r, "c1")
 			if got.Status.FactorMigration == nil || got.Status.FactorMigration.Phase != fmPhaseFailed {
 				t.Fatalf("expected Failed phase, got %+v", got.Status.FactorMigration)
 			}
 			if !strings.Contains(got.Status.FactorMigration.Message, tt.wantMsg) {
 				t.Fatalf("message %q does not contain %q", got.Status.FactorMigration.Message, tt.wantMsg)
 			}
-			// On validation failure the annotation must be removed.
+			// The annotation is consumed when the migration starts.
 			if _, ok := got.Annotations[garagev1beta1.AnnotationPurgeClusterLayout]; ok {
-				t.Fatal("expected purge annotation to be removed after validation failure")
+				t.Fatal("expected purge annotation to be consumed at start")
 			}
 		})
 	}
 }
 
 func TestFactorMigration_FactorMismatchRequeuesWithinGrace(t *testing.T) {
-	ctx := context.Background()
 	// Annotation says factor=2 but spec is still 3 (propagation race). On a fresh
 	// migration this must REQUEUE (not permanently fail + strip the annotation).
 	c := fmCluster("cr1", func(c *garagev1beta2.GarageCluster) {
@@ -232,32 +259,28 @@ func TestFactorMigration_FactorMismatchRequeuesWithinGrace(t *testing.T) {
 	}
 	r := fmBuild(t, objs...)
 
-	res, err := r.reconcileFactorMigration(ctx, c)
-	if err != nil {
-		t.Fatalf("reconcileFactorMigration: %v", err)
-	}
+	got, res := fmDrive(t, r, "cr1")
 	if res.RequeueAfter == 0 {
 		t.Fatal("expected a requeue while the factor propagates")
 	}
-	got := &garagev1beta2.GarageCluster{}
-	_ = r.Get(ctx, types.NamespacedName{Name: "cr1", Namespace: fmNS}, got)
 	if got.Status.FactorMigration.Phase != fmPhaseValidating {
 		t.Fatalf("expected to stay in Validating, got %s", got.Status.FactorMigration.Phase)
 	}
-	if _, ok := got.Annotations[garagev1beta1.AnnotationPurgeClusterLayout]; !ok {
-		t.Fatal("annotation must be retained during the grace window")
+	if got.Status.FactorMigration.ToFactor != 2 {
+		t.Fatalf("ToFactor should be captured at start, got %d", got.Status.FactorMigration.ToFactor)
 	}
 }
 
 func TestFactorMigration_FactorMismatchFailsAfterGrace(t *testing.T) {
-	ctx := context.Background()
 	c := fmCluster("cr2", func(c *garagev1beta2.GarageCluster) {
 		c.Annotations[garagev1beta1.AnnotationPurgeClusterLayout] = fmFactor2
 		c.Spec.Replication.Factor = 3
 	})
-	// StartedAt 3 minutes ago → past the grace window → permanent failure.
+	// In-flight (Validating) with StartedAt 3 minutes ago → past the grace window
+	// → permanent failure. ToFactor was captured when the annotation was consumed.
 	c.Status.FactorMigration = &garagev1beta2.FactorMigrationStatus{
 		Phase:     fmPhaseValidating,
+		ToFactor:  2,
 		StartedAt: ptr.To(metav1.NewTime(time.Now().Add(-3 * time.Minute))),
 	}
 	objs := []client.Object{c}
@@ -266,11 +289,7 @@ func TestFactorMigration_FactorMismatchFailsAfterGrace(t *testing.T) {
 	}
 	r := fmBuild(t, objs...)
 
-	if _, err := r.reconcileFactorMigration(ctx, c); err != nil {
-		t.Fatalf("reconcileFactorMigration: %v", err)
-	}
-	got := &garagev1beta2.GarageCluster{}
-	_ = r.Get(ctx, types.NamespacedName{Name: "cr2", Namespace: fmNS}, got)
+	got, _ := fmDrive(t, r, "cr2")
 	if got.Status.FactorMigration.Phase != fmPhaseFailed {
 		t.Fatalf("expected Failed after the grace window, got %s", got.Status.FactorMigration.Phase)
 	}
@@ -279,8 +298,35 @@ func TestFactorMigration_FactorMismatchFailsAfterGrace(t *testing.T) {
 	}
 }
 
-func TestFactorMigration_ValidationPassAdvancesToScalingDown(t *testing.T) {
+func TestFactorMigration_CompletedDoesNotRetrigger(t *testing.T) {
 	ctx := context.Background()
+	// A Completed migration whose trigger annotation still lingers (e.g. the
+	// removal write lost a race) must NOT restart the destructive operation — it
+	// must just clear the annotation and stay Completed. Regression guard for the
+	// re-trigger loop that purged + rebuilt repeatedly.
+	c := fmCluster("cdone", func(c *garagev1beta2.GarageCluster) {
+		c.Annotations[garagev1beta1.AnnotationPurgeClusterLayout] = "factor=1"
+		c.Spec.Replication.Factor = 1
+	})
+	c.Status.FactorMigration = &garagev1beta2.FactorMigrationStatus{
+		Phase: fmPhaseCompleted, ToFactor: 1, StartedAt: ptr.To(metav1.Now()), CompletedAt: ptr.To(metav1.Now()),
+	}
+	r := fmBuild(t, c, fmStorageNode("cdone", 0, "ida"))
+
+	if _, err := r.reconcileFactorMigration(ctx, c); err != nil {
+		t.Fatalf("reconcileFactorMigration: %v", err)
+	}
+	got := &garagev1beta2.GarageCluster{}
+	_ = r.Get(ctx, types.NamespacedName{Name: "cdone", Namespace: fmNS}, got)
+	if got.Status.FactorMigration.Phase != fmPhaseCompleted {
+		t.Fatalf("a Completed migration must not re-enter the state machine, got %s", got.Status.FactorMigration.Phase)
+	}
+	if _, ok := got.Annotations[garagev1beta1.AnnotationPurgeClusterLayout]; ok {
+		t.Fatal("the lingering annotation must be cleared")
+	}
+}
+
+func TestFactorMigration_ValidationPassAdvancesToScalingDown(t *testing.T) {
 	c := fmCluster("c2", func(c *garagev1beta2.GarageCluster) {
 		c.Annotations[garagev1beta1.AnnotationPurgeClusterLayout] = fmFactor2
 	})
@@ -290,11 +336,7 @@ func TestFactorMigration_ValidationPassAdvancesToScalingDown(t *testing.T) {
 	}
 	r := fmBuild(t, objs...)
 
-	if _, err := r.reconcileFactorMigration(ctx, c); err != nil {
-		t.Fatalf("reconcileFactorMigration: %v", err)
-	}
-	got := &garagev1beta2.GarageCluster{}
-	_ = r.Get(ctx, types.NamespacedName{Name: "c2", Namespace: fmNS}, got)
+	got, _ := fmDrive(t, r, "c2")
 	if got.Status.FactorMigration == nil || got.Status.FactorMigration.Phase != fmPhaseScalingDown {
 		t.Fatalf("expected ScalingDown, got %+v", got.Status.FactorMigration)
 	}
