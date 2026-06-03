@@ -219,20 +219,18 @@ var _ = Describe("GarageCluster Controller", func() {
 			Expect(sts.Spec.Replicas).NotTo(BeNil())
 			Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
 
-			// Gateway pods must carry a SERVING-AWARE readiness probe — they're
-			// behind the tier-scoped <cr>-gateway Service whose
-			// PublishNotReadyAddresses is false, so the probe gates the endpoint
-			// slice. It is httpGet /health on the admin port (not a bare TCP
-			// check): a gateway that can't reach a storage quorum goes 503 ->
-			// NotReady and drops out, so anycast clients fail over to a healthy
-			// region. /health returns 200 for Degraded, so losing only local
-			// storage keeps the pod Ready (it still serves via remote storage).
+			// This is an EDGE gateway (ConnectTo, no local storage), so it gets the
+			// bind-only TCP readiness probe — NOT the serving-aware /health. An edge
+			// gateway's /health reflects the REMOTE storage cluster it only reaches
+			// after RPC convergence, so gating on it would keep the pod NotReady
+			// (phase never Running) until convergence; it must stay routable while
+			// the operator drives the connection. (Unified-cluster gateways get the
+			// /health serving probe — see TestBuildGaragePodSpec_GatewayReadinessProbe.)
 			Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			probe := sts.Spec.Template.Spec.Containers[0].ReadinessProbe
 			Expect(probe).NotTo(BeNil(), "gateway pod must have a readiness probe")
-			Expect(probe.HTTPGet).NotTo(BeNil(), "gateway readiness must be httpGet /health, not a bare TCP check")
-			Expect(probe.HTTPGet.Path).To(Equal("/health"))
-			Expect(probe.HTTPGet.Port.StrVal).To(Equal(adminPortName))
+			Expect(probe.TCPSocket).NotTo(BeNil(), "edge gateway readiness must be bind-only TCP (remote-independent)")
+			Expect(probe.TCPSocket.Port.StrVal).To(Equal(s3PortName))
 		})
 
 		It("should provision a 1Gi metadata PVC for gateway pods by default", func() {

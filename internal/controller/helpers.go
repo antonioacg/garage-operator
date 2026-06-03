@@ -584,8 +584,15 @@ type PodSpecConfig struct {
 	ContainerSecurityContext  *corev1.SecurityContext
 	TopologySpreadConstraints []corev1.TopologySpreadConstraint
 	IsGateway                 bool
+	// GatewayServingReadiness selects the gateway readiness DEFAULT (ignored when
+	// ReadinessProbe is set). True for a unified-cluster gateway (co-located with
+	// storage) => serving-aware httpGet /health, since /health reflects reachable
+	// local storage quorum. False for an edge gateway (gateway-only + connectTo)
+	// => bind-only tcpSocket :3900, because an edge gateway's /health depends on a
+	// REMOTE cluster and must not gate routability during RPC convergence.
+	GatewayServingReadiness bool
 	// ReadinessProbe overrides the gateway tier's readiness probe (gateway only).
-	// nil => the serving-aware httpGet /health default below.
+	// nil => the GatewayServingReadiness-selected default below.
 	ReadinessProbe *corev1.Probe
 	Logging        *garagev1beta2.LoggingConfig
 	// Env is a list of user-supplied environment variables to append AFTER the
@@ -645,23 +652,30 @@ func buildGaragePodSpec(
 		container.SecurityContext = cfg.ContainerSecurityContext
 	}
 
-	// Readiness probe on the gateway tier only. It is SERVING-AWARE: an HTTP GET
-	// of the unauthenticated admin /health endpoint. Garage maps Healthy and
-	// Degraded -> 200 and only Unavailable (no partition has write-quorum of up
-	// nodes) -> 503, so:
-	//   - losing only the LOCAL storage tier keeps the pod Ready (the gateway
-	//     still serves via a remote region's storage; read_quorum=1), which is
-	//     exactly what we want — do NOT withdraw a region that can still serve;
-	//   - a gateway that can reach NO storage quorum goes 503 -> NotReady, drops
-	//     from its Service endpoints, and (for a Tailscale-anycast gateway
-	//     Service with publishNotReadyAddresses=false) is withdrawn from
-	//     advertisement so clients fail over to a healthy region.
-	// A bare TCP-on-:3900 check would stay green on a wedged gateway and defeat
-	// that failover. A cluster may override via spec.gateway.readinessProbe
-	// (cfg.ReadinessProbe) — e.g. a probe that keeps serving reads past the
-	// write-quorum threshold. Storage pods intentionally get no probe here: their
-	// headless RPC Service sets PublishNotReadyAddresses=true for federation
-	// bootstrap, so readiness would be ignored anyway.
+	// Readiness probe on the gateway tier only. Two defaults, selected by
+	// GatewayServingReadiness, with an optional spec.gateway.readinessProbe
+	// override (cfg.ReadinessProbe):
+	//
+	//   UNIFIED gateway (GatewayServingReadiness=true): SERVING-AWARE — an HTTP GET
+	//   of the unauthenticated admin /health. Garage maps Healthy and Degraded ->
+	//   200 and only Unavailable (no partition has write-quorum of up nodes) ->
+	//   503, so losing only the LOCAL storage tier keeps the pod Ready (it still
+	//   serves via a remote region's storage; read_quorum=1) while a gateway that
+	//   can reach no storage quorum goes NotReady, drops from its Service
+	//   endpoints, and (behind a publishNotReadyAddresses=false Service such as the
+	//   Tailscale anycast) is withdrawn so clients fail over. A bare TCP check
+	//   would stay green on a wedged gateway and defeat that failover.
+	//
+	//   EDGE gateway (GatewayServingReadiness=false): bind-only tcpSocket :3900.
+	//   An edge gateway's /health reflects a REMOTE storage cluster it only reaches
+	//   after RPC convergence, so gating readiness on /health would keep it
+	//   NotReady (phase never Running) until convergence — it must stay routable
+	//   while the operator drives the connection. This preserves the original
+	//   health-independent edge-gateway readiness.
+	//
+	// Storage pods intentionally get no probe: their headless RPC Service sets
+	// PublishNotReadyAddresses=true for federation bootstrap, so readiness is
+	// ignored anyway.
 	//
 	// preStop is intentionally absent: the upstream `dxflrs/garage` image is
 	// distroless (no `sh`, no `sleep`), so an exec preStop can't delay
@@ -671,9 +685,10 @@ func buildGaragePodSpec(
 	// that's a documented edge case requiring a non-distroless base image
 	// to fix properly.
 	if cfg.IsGateway {
-		if cfg.ReadinessProbe != nil {
+		switch {
+		case cfg.ReadinessProbe != nil:
 			container.ReadinessProbe = cfg.ReadinessProbe
-		} else {
+		case cfg.GatewayServingReadiness:
 			container.ReadinessProbe = &corev1.Probe{
 				ProbeHandler: corev1.ProbeHandler{
 					HTTPGet: &corev1.HTTPGetAction{
@@ -686,6 +701,18 @@ func buildGaragePodSpec(
 				PeriodSeconds:       5,
 				TimeoutSeconds:      3,
 				FailureThreshold:    3,
+			}
+		default:
+			container.ReadinessProbe = &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					TCPSocket: &corev1.TCPSocketAction{
+						Port: intstr.FromString(s3PortName),
+					},
+				},
+				InitialDelaySeconds: 2,
+				PeriodSeconds:       5,
+				TimeoutSeconds:      3,
+				FailureThreshold:    6,
 			}
 		}
 	}
