@@ -275,6 +275,20 @@ type GatewaySpec struct {
 	// +optional
 	PodDisruptionBudget *PodDisruptionBudgetConfig `json:"podDisruptionBudget,omitempty"`
 
+	// ReadinessProbe overrides the gateway tier's readiness probe. When unset,
+	// the operator applies a serving-aware default: an HTTP GET of the
+	// unauthenticated admin /health endpoint, so a gateway that cannot reach a
+	// storage quorum (Unavailable -> 503) is removed from its Service endpoints
+	// and, for a Tailscale-anycast gateway Service, withdrawn from advertisement
+	// so clients fail over to a healthy region. Note /health returns 200 for both
+	// Healthy and Degraded, so losing only the LOCAL storage tier (the gateway
+	// still serves via a remote region's storage) keeps the pod Ready — correct.
+	// Set this to gate on a different signal (e.g. an exec probe reading
+	// partitions_quorum from GetClusterHealth to keep serving reads past the
+	// write-quorum threshold).
+	// +optional
+	ReadinessProbe *corev1.Probe `json:"readinessProbe,omitempty"`
+
 	// PodTemplate carries pod scheduling and metadata for the gateway tier.
 	PodTemplate `json:",inline"`
 }

@@ -1101,3 +1101,39 @@ func TestBuildGaragePodSpec_UserEnv(t *testing.T) {
 		t.Errorf("user override at index %d must appear AFTER built-in at index %d", overrideIdx, builtInIdx)
 	}
 }
+
+// The gateway tier gets a serving-aware default readiness probe (httpGet /health
+// on the admin port), a cluster may override it, and storage pods get none.
+func TestBuildGaragePodSpec_GatewayReadinessProbe(t *testing.T) {
+	// Default gateway probe: httpGet /health on the admin port, not a bare TCP check.
+	gw := buildGaragePodSpec(PodSpecConfig{Image: defaultGarageImage, IsGateway: true}, nil, nil, nil)
+	rp := gw.Containers[0].ReadinessProbe
+	if rp == nil || rp.HTTPGet == nil {
+		t.Fatalf("gateway default readiness probe should be httpGet, got %+v", rp)
+	}
+	if rp.HTTPGet.Path != "/health" {
+		t.Errorf("expected /health path, got %q", rp.HTTPGet.Path)
+	}
+	if rp.HTTPGet.Port.StrVal != adminPortName {
+		t.Errorf("expected probe on admin port %q, got %q", adminPortName, rp.HTTPGet.Port.StrVal)
+	}
+	if rp.TCPSocket != nil {
+		t.Errorf("gateway readiness must not be a bare TCP check (defeats failover): %+v", rp.TCPSocket)
+	}
+
+	// Override wins verbatim (e.g. a read-survival exec probe).
+	custom := &corev1.Probe{
+		ProbeHandler:  corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"/check-quorum"}}},
+		PeriodSeconds: 7,
+	}
+	ov := buildGaragePodSpec(PodSpecConfig{Image: defaultGarageImage, IsGateway: true, ReadinessProbe: custom}, nil, nil, nil)
+	if ov.Containers[0].ReadinessProbe != custom {
+		t.Errorf("spec.gateway.readinessProbe override should win, got %+v", ov.Containers[0].ReadinessProbe)
+	}
+
+	// Storage pods (non-gateway) get no readiness probe.
+	st := buildGaragePodSpec(PodSpecConfig{Image: defaultGarageImage, IsGateway: false}, nil, nil, nil)
+	if st.Containers[0].ReadinessProbe != nil {
+		t.Errorf("storage pod should have no readiness probe, got %+v", st.Containers[0].ReadinessProbe)
+	}
+}
