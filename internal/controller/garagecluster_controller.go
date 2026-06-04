@@ -486,6 +486,16 @@ func (r *GarageClusterReconciler) collectGarageNodeIDs(ctx context.Context, clus
 		if node.Spec.ClusterRef.Name != cluster.Name {
 			continue
 		}
+		// Only evict OPERATOR-MANAGED nodes from the layout on cluster teardown.
+		// User-owned (Manual) GarageNodes outlive the cluster CR and own their
+		// layout lifecycle via their own finalizer; layout-evicting them here on a
+		// cluster delete would yank still-running user nodes out of the layout
+		// (they have no controllerRef to the cluster, so K8s GC never deletes
+		// them). Auto-mode children carry managed-by=operator; ejected/user nodes
+		// do not.
+		if node.Labels[labelAppManagedBy] != managedByOperatorValue {
+			continue
+		}
 		// Prefer status (auto-discovered), fall back to spec (manually set)
 		if node.Status.NodeID != "" {
 			nodeIDs[node.Status.NodeID] = true

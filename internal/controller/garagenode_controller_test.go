@@ -68,7 +68,7 @@ var _ = Describe("GarageNode Controller", func() {
 			}
 		})
 
-		It("should set error status when cluster doesn't exist", func() {
+		It("should set Pending status (self-heal) when cluster doesn't exist", func() {
 			By("Creating a GarageNode referencing non-existent cluster")
 			capacity := resource.MustParse("100Gi")
 			dataSize := resource.MustParse("100Gi")
@@ -101,14 +101,19 @@ var _ = Describe("GarageNode Controller", func() {
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
-			// Controller returns requeue result, not error, when cluster not found
+			// Controller returns requeue result, not error, when cluster not found.
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 
-			By("Verifying status phase is Error")
+			By("Verifying status phase is Pending (transient/self-heal, not Failed)")
+			// A GarageNode whose referenced cluster is absent but is NOT being
+			// deleted keeps its StatefulSet/pods/PVCs running; the operator surfaces
+			// Pending and requeues so it self-heals when the cluster reappears,
+			// rather than flapping to Failed (which would also let a cluster delete
+			// look like a node failure).
 			updatedNode := &garagev1beta1.GarageNode{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedNode)).To(Succeed())
-			Expect(updatedNode.Status.Phase).To(Equal(PhaseFailed))
+			Expect(updatedNode.Status.Phase).To(Equal(PhasePending))
 		})
 
 		It("should reject GarageNode reconciliation unless the cluster is Manual", func() {
