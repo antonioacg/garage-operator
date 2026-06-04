@@ -196,6 +196,23 @@ type StorageSpec struct {
 	// +required
 	Data *VolumeConfig `json:"data"`
 
+	// RPCPublicAddr is the externally-routable rpc_public_addr advertised by
+	// storage pods so peers in other regions can dial them by hostname.
+	//
+	// With replicas > 1 a single shared address only ever routes to one pod
+	// (e.g. behind a Tailscale VIP), leaving the others unreachable
+	// cross-region. Use an `{ordinal}` placeholder — the operator substitutes
+	// each pod's ordinal (0, 1, ...), symmetric with the gateway tier's
+	// rpcPublicAddr and with remoteClusters[].storageRpcEndpointTemplate on the
+	// consuming side — so every pod advertises its own address. An address
+	// without the placeholder is rendered verbatim (fine for a single-replica
+	// storage tier). When a per-node publicEndpoint (LoadBalancer perNode) is in
+	// effect, that address wins and this field is ignored.
+	//
+	// Example: "us-east-storage-{ordinal}.example.ts.net:3901"
+	// +optional
+	RPCPublicAddr string `json:"rpcPublicAddr,omitempty"`
+
 	// MetadataSnapshotsDir specifies directory for metadata snapshots
 	// +optional
 	MetadataSnapshotsDir string `json:"metadataSnapshotsDir,omitempty"`
@@ -227,6 +244,18 @@ type StorageSpec struct {
 	// PodDisruptionBudget configures a PDB for the storage StatefulSet.
 	// +optional
 	PodDisruptionBudget *PodDisruptionBudgetConfig `json:"podDisruptionBudget,omitempty"`
+
+	// LayoutPolicy overrides the cluster-level spec.layoutPolicy for the STORAGE
+	// tier only. This lets a cluster hand-manage storage GarageNodes (Manual)
+	// while the gateway tier stays operator-managed (Auto) — e.g. a region with
+	// heterogeneous per-node storage arrays defined in gitops, keeping the
+	// operator's gateway automation (per-ordinal rpc_public_addr, tombstone
+	// reaper, per-pod LBs). Defaults to spec.layoutPolicy when empty. Auto->Manual
+	// is one-way (operator ejects its storage nodes; Manual->Auto is rejected by
+	// the webhook), matching the cluster-level field.
+	// +kubebuilder:validation:Enum=Auto;Manual
+	// +optional
+	LayoutPolicy string `json:"layoutPolicy,omitempty"`
 
 	// PodTemplate carries pod scheduling and metadata for the storage tier.
 	PodTemplate `json:",inline"`
@@ -1020,6 +1049,23 @@ type RemoteClusterConnection struct {
 	// Example: "ottawa-garage-gw-{ordinal}.keiretsu.ts.net:3901"
 	// +optional
 	GatewayRPCEndpointTemplate string `json:"gatewayRpcEndpointTemplate,omitempty"`
+
+	// StorageRPCEndpointTemplate is a hostname:port template used by federation
+	// to connect to remote STORAGE pods individually, mirroring
+	// GatewayRPCEndpointTemplate. The literal `{ordinal}` is replaced with each
+	// remote storage pod's ordinal (0, 1, ...) parsed from the layout role's
+	// pod-name tag (e.g. `garage-storage-0`).
+	//
+	// Needed when a remote region runs more than one storage pod behind a single
+	// admin hostname (e.g. a Tailscale VIP): the default storage↔storage connect
+	// loop dials every remote node at that one shared hostname, which only ever
+	// lands one pod, leaving the rest unreachable cross-region. Set this together
+	// with the remote region's spec.storage.rpcPublicAddr `{ordinal}` template so
+	// each storage pod is both advertised and dialed per-pod.
+	//
+	// Example: "ottawa-storage-{ordinal}.keiretsu.ts.net:3901"
+	// +optional
+	StorageRPCEndpointTemplate string `json:"storageRpcEndpointTemplate,omitempty"`
 }
 
 // ConnectToConfig specifies how a gateway cluster connects to a remote storage cluster.

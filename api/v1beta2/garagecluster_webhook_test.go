@@ -78,7 +78,7 @@ func TestGarageClusterValidator_RejectsManualToAutoTransition(t *testing.T) {
 	old := &GarageCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "tx", Namespace: testNamespace},
 		Spec: GarageClusterSpec{
-			LayoutPolicy: "Manual",
+			LayoutPolicy: layoutPolicyManual,
 			Storage: &StorageSpec{
 				Replicas: 1,
 				Metadata: &VolumeConfig{},
@@ -88,7 +88,7 @@ func TestGarageClusterValidator_RejectsManualToAutoTransition(t *testing.T) {
 		},
 	}
 	newer := old.DeepCopy()
-	newer.Spec.LayoutPolicy = "Auto"
+	newer.Spec.LayoutPolicy = layoutPolicyAuto
 
 	if _, err := v.ValidateUpdate(context.Background(), old, newer); err == nil {
 		t.Fatalf("ValidateUpdate accepted Manual→Auto transition, want error")
@@ -101,12 +101,67 @@ func TestGarageClusterValidator_RejectsManualToAutoTransition(t *testing.T) {
 	}
 }
 
+func TestEffectiveStorageLayoutPolicy(t *testing.T) {
+	cases := []struct {
+		name        string
+		clusterPol  string
+		storage     *StorageSpec
+		wantStorage string
+	}{
+		{"storage override wins", layoutPolicyAuto, &StorageSpec{LayoutPolicy: layoutPolicyManual}, layoutPolicyManual},
+		{"storage unset -> cluster default", layoutPolicyAuto, &StorageSpec{}, layoutPolicyAuto},
+		{"no storage tier -> cluster default", layoutPolicyManual, nil, layoutPolicyManual},
+	}
+	for _, tc := range cases {
+		c := &GarageCluster{Spec: GarageClusterSpec{LayoutPolicy: tc.clusterPol, Storage: tc.storage}}
+		if got := c.EffectiveStorageLayoutPolicy(); got != tc.wantStorage {
+			t.Errorf("%s: EffectiveStorageLayoutPolicy()=%q want %q", tc.name, got, tc.wantStorage)
+		}
+	}
+}
+
+// Per-tier policy: storage can go Manual while the cluster (and thus gateway)
+// stays Auto, but storage Manual->Auto is still one-way.
+func TestGarageClusterValidator_RejectsStorageManualToAuto(t *testing.T) {
+	v := &GarageClusterValidator{}
+	old := &GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "tier-tx", Namespace: testNamespace},
+		Spec: GarageClusterSpec{
+			LayoutPolicy: layoutPolicyAuto,
+			Storage: &StorageSpec{
+				Replicas:     1,
+				LayoutPolicy: layoutPolicyManual,
+				Metadata:     &VolumeConfig{},
+				Data:         &VolumeConfig{Type: VolumeTypeEmptyDir},
+			},
+			Replication: &ReplicationConfig{Factor: 1},
+		},
+	}
+	// storage Manual -> Auto must be rejected even though cluster policy is Auto.
+	toAuto := old.DeepCopy()
+	toAuto.Spec.Storage.LayoutPolicy = layoutPolicyAuto
+	if _, err := v.ValidateUpdate(context.Background(), old, toAuto); err == nil {
+		t.Fatalf("ValidateUpdate accepted storage Manual→Auto, want error")
+	}
+	// Clearing the override falls back to cluster Auto — also a Manual->Auto.
+	cleared := old.DeepCopy()
+	cleared.Spec.Storage.LayoutPolicy = ""
+	if _, err := v.ValidateUpdate(context.Background(), old, cleared); err == nil {
+		t.Fatalf("ValidateUpdate accepted clearing storage Manual override (-> cluster Auto), want error")
+	}
+	// storage Manual -> Manual is fine.
+	same := old.DeepCopy()
+	if _, err := v.ValidateUpdate(context.Background(), old, same); err != nil {
+		t.Fatalf("ValidateUpdate rejected storage Manual→Manual: %v", err)
+	}
+}
+
 func TestGarageClusterValidator_AllowsAutoToManualTransition(t *testing.T) {
 	v := &GarageClusterValidator{}
 	old := &GarageCluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "tx", Namespace: testNamespace},
 		Spec: GarageClusterSpec{
-			LayoutPolicy: "Auto",
+			LayoutPolicy: layoutPolicyAuto,
 			Storage: &StorageSpec{
 				Replicas: 1,
 				Metadata: &VolumeConfig{},
@@ -116,7 +171,7 @@ func TestGarageClusterValidator_AllowsAutoToManualTransition(t *testing.T) {
 		},
 	}
 	newer := old.DeepCopy()
-	newer.Spec.LayoutPolicy = "Manual"
+	newer.Spec.LayoutPolicy = layoutPolicyManual
 
 	if _, err := v.ValidateUpdate(context.Background(), old, newer); err != nil {
 		t.Fatalf("ValidateUpdate rejected Auto→Manual: %v", err)
@@ -195,6 +250,46 @@ func TestGarageClusterValidator_WarnsGatewayMetadataEmptyDir(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected gateway.metadata EmptyDir identity warning, got %v", warnings)
+	}
+}
+
+// TestGarageClusterValidator_WarnsSharedStorageRPCAddr guards the multi-replica
+// storage tier sharing one rpc_public_addr (reachable cross-region at one pod).
+func TestGarageClusterValidator_WarnsSharedStorageRPCAddr(t *testing.T) {
+	base := func(addr string) *GarageCluster {
+		return &GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "stg", Namespace: testNamespace},
+			Spec: GarageClusterSpec{
+				Storage: &StorageSpec{
+					Replicas:      3,
+					RPCPublicAddr: addr,
+					Metadata:      &VolumeConfig{Type: VolumeTypeEmptyDir},
+					Data:          &VolumeConfig{Type: VolumeTypeEmptyDir},
+				},
+				Replication: &ReplicationConfig{Factor: 2},
+			},
+		}
+	}
+	hasWarn := func(c *GarageCluster) bool {
+		warnings, err := c.validateGarageCluster()
+		if err != nil {
+			t.Fatalf("validateGarageCluster: unexpected error %v", err)
+		}
+		for _, w := range warnings {
+			if strings.Contains(w, "spec.storage.rpcPublicAddr is a single address") {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasWarn(base("storage.example.ts.net:3901")) {
+		t.Fatal("expected shared-storage-rpcaddr warning for multi-replica storage without {ordinal}")
+	}
+	if hasWarn(base("storage-{ordinal}.example.ts.net:3901")) {
+		t.Fatal("must NOT warn when {ordinal} placeholder is present")
+	}
+	if hasWarn(base("")) {
+		t.Fatal("must NOT warn when rpcPublicAddr is unset")
 	}
 }
 

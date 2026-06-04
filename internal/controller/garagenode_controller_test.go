@@ -68,7 +68,7 @@ var _ = Describe("GarageNode Controller", func() {
 			}
 		})
 
-		It("should set error status when cluster doesn't exist", func() {
+		It("should set Pending status (self-heal) when cluster doesn't exist", func() {
 			By("Creating a GarageNode referencing non-existent cluster")
 			capacity := resource.MustParse("100Gi")
 			dataSize := resource.MustParse("100Gi")
@@ -101,14 +101,19 @@ var _ = Describe("GarageNode Controller", func() {
 			result, err := reconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
-			// Controller returns requeue result, not error, when cluster not found
+			// Controller returns requeue result, not error, when cluster not found.
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 
-			By("Verifying status phase is Error")
+			By("Verifying status phase is Pending (transient/self-heal, not Failed)")
+			// A GarageNode whose referenced cluster is absent but is NOT being
+			// deleted keeps its StatefulSet/pods/PVCs running; the operator surfaces
+			// Pending and requeues so it self-heals when the cluster reappears,
+			// rather than flapping to Failed (which would also let a cluster delete
+			// look like a node failure).
 			updatedNode := &garagev1beta1.GarageNode{}
 			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedNode)).To(Succeed())
-			Expect(updatedNode.Status.Phase).To(Equal(PhaseFailed))
+			Expect(updatedNode.Status.Phase).To(Equal(PhasePending))
 		})
 
 		It("should reject GarageNode reconciliation unless the cluster is Manual", func() {
@@ -167,6 +172,75 @@ var _ = Describe("GarageNode Controller", func() {
 
 			err = k8sClient.Get(ctx, types.NamespacedName{Name: resourceName, Namespace: testNamespace}, &appsv1.StatefulSet{})
 			Expect(errors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("should accept a user storage node when spec.storage.layoutPolicy=Manual even if cluster is Auto", func() {
+			// Per-tier policy: storage Manual + cluster (gateway) Auto. A user-owned
+			// storage GarageNode must pass the policy gate (its StatefulSet gets
+			// created), unlike the cluster-wide-Auto rejection case above.
+			clusterName := "tier-manual-cluster"
+			cluster := &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: testNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					LayoutPolicy: "Auto",
+					Storage: &garagev1beta2.StorageSpec{
+						Replicas:     1,
+						LayoutPolicy: "Manual",
+						Metadata:     &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("1Gi"))},
+						Data:         &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("10Gi"))},
+					},
+					Replication: &garagev1beta2.ReplicationConfig{Factor: 1},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			defer func() {
+				cluster.Finalizers = nil
+				_ = k8sClient.Update(ctx, cluster)
+				_ = k8sClient.Delete(ctx, cluster)
+			}()
+
+			capacity := resource.MustParse("100Gi")
+			dataSize := resource.MustParse("100Gi")
+			node := &garagev1beta1.GarageNode{
+				ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: testNamespace},
+				Spec: garagev1beta1.GarageNodeSpec{
+					ClusterRef: garagev1beta1.ClusterReference{Name: clusterName},
+					Zone:       testNodeZone,
+					Capacity:   &capacity,
+					Storage: &garagev1beta1.NodeStorageConfig{
+						Data: &garagev1beta1.NodeVolumeConfig{Size: &dataSize},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, node)).To(Succeed())
+			defer func() {
+				fresh := &garagev1beta1.GarageNode{}
+				if err := k8sClient.Get(ctx, typeNamespacedName, fresh); err == nil {
+					fresh.Finalizers = nil
+					_ = k8sClient.Update(ctx, fresh)
+					_ = k8sClient.Delete(ctx, fresh)
+				}
+			}()
+
+			reconciler := &GarageNodeReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			// Passed the policy gate: the StatefulSet gets created (the rejection
+			// path returns before StatefulSet creation). The first reconcile adds
+			// the finalizer; a later pass creates the STS — so reconcile until it
+			// appears (later steps may error in envtest with no Garage admin API,
+			// but the STS is created before that point).
+			Eventually(func(g Gomega) {
+				_, _ = reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName, Namespace: testNamespace}, sts)).To(Succeed())
+			}).Should(Succeed())
+
+			// And it was never rejected by the per-tier policy gate.
+			updatedNode := &garagev1beta1.GarageNode{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, updatedNode)).To(Succeed())
+			for _, c := range updatedNode.Status.Conditions {
+				Expect(c.Message).NotTo(ContainSubstring("requires its tier layoutPolicy: Manual"),
+					"storage node with storage.layoutPolicy=Manual must not be rejected by the policy gate")
+			}
 		})
 
 		It("should handle node creation spec with tags", func() {

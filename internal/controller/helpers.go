@@ -95,6 +95,14 @@ const (
 	LayoutPolicyAuto   = "Auto"
 )
 
+// effectiveStorageLayoutPolicy returns the layout policy governing the STORAGE
+// tier: spec.storage.layoutPolicy when set, otherwise the cluster-level
+// spec.layoutPolicy. This lets a cluster hand-manage storage GarageNodes
+// (Manual) while the gateway tier follows the cluster policy (e.g. stays Auto).
+func effectiveStorageLayoutPolicy(cluster *garagev1beta2.GarageCluster) string {
+	return cluster.EffectiveStorageLayoutPolicy()
+}
+
 // Common secret keys
 const (
 	DefaultAdminTokenKey   = "admin-token"

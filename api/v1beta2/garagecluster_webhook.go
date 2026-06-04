@@ -119,6 +119,14 @@ func (v *GarageClusterValidator) ValidateUpdate(ctx context.Context, oldObj, new
 	if oldPolicy == layoutPolicyManual && newPolicy != "" && newPolicy != layoutPolicyManual {
 		return warnings, fmt.Errorf("layoutPolicy transition from Manual to Auto is not supported (one-way only) — see issue #190")
 	}
+	// Same one-way rule for the per-tier storage override: once storage is
+	// Manual (user owns the storage GarageNodes), the operator can't safely
+	// re-adopt them.
+	oldStorage := oldObj.EffectiveStorageLayoutPolicy()
+	newStorage := newObj.EffectiveStorageLayoutPolicy()
+	if oldStorage == layoutPolicyManual && newStorage != "" && newStorage != layoutPolicyManual {
+		return warnings, fmt.Errorf("spec.storage.layoutPolicy transition from Manual to Auto is not supported (one-way only) — see issue #190")
+	}
 
 	oldFactor := 0
 	if oldObj.Spec.Replication != nil {
@@ -233,6 +241,16 @@ func (r *GarageCluster) validateGarageCluster() (admission.Warnings, error) {
 			"spec.gateway.rpcPublicAddr is a single address shared by all gateway pods; with gateway.replicas > 1 "+
 				"remote regions can reach only one pod. Use an {ordinal} placeholder (e.g. gw-{ordinal}.example.ts.net:3901) "+
 				"for per-pod cross-region reachability")
+	}
+
+	// Same per-pod reachability trap on the storage tier: a multi-replica storage
+	// tier sharing one rpc_public_addr is reachable cross-region at only one pod.
+	if r.HasStorageTier() && r.Spec.Storage.Replicas > 1 &&
+		r.Spec.Storage.RPCPublicAddr != "" && !strings.Contains(r.Spec.Storage.RPCPublicAddr, "{ordinal}") {
+		warnings = append(warnings,
+			"spec.storage.rpcPublicAddr is a single address shared by all storage pods; with storage.replicas > 1 "+
+				"remote regions can reach only one pod. Use an {ordinal} placeholder (e.g. storage-{ordinal}.example.ts.net:3901) "+
+				"and set remoteClusters[].storageRpcEndpointTemplate on consuming clusters for per-pod cross-region reachability")
 	}
 
 	if r.HasStorageTier() && r.Spec.Storage.PodDisruptionBudget != nil && r.Spec.Storage.PodDisruptionBudget.Enabled &&
