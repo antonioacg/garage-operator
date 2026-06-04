@@ -22,6 +22,20 @@ func (g *GarageCluster) HasGatewayTier() bool {
 	return g != nil && g.Spec.Gateway != nil
 }
 
+// EffectiveStorageLayoutPolicy returns the layout policy governing the STORAGE
+// tier: spec.storage.layoutPolicy when set, otherwise the cluster-level
+// spec.layoutPolicy. This lets a cluster hand-manage storage GarageNodes
+// (Manual) while the gateway tier follows the cluster policy (e.g. stays Auto).
+func (g *GarageCluster) EffectiveStorageLayoutPolicy() string {
+	if g == nil {
+		return ""
+	}
+	if g.Spec.Storage != nil && g.Spec.Storage.LayoutPolicy != "" {
+		return g.Spec.Storage.LayoutPolicy
+	}
+	return g.Spec.LayoutPolicy
+}
+
 // IsEdgeGateway returns true when this cluster is a gateway-only cluster that
 // connects to a remote storage cluster (no local storage tier, but `connectTo`
 // references an external Garage cluster).

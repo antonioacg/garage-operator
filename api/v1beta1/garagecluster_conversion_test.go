@@ -111,6 +111,7 @@ func TestConvert_StorageRPCPublicAddrRoundTrip(t *testing.T) {
 				Metadata:      &VolumeConfig{Size: ptrQuantity(resource.MustParse(test10Gi))},
 				Data:          &VolumeConfig{Size: ptrQuantity(resource.MustParse("100Gi"))},
 				RPCPublicAddr: addr,
+				LayoutPolicy:  layoutPolicyManual,
 			},
 		},
 	}
@@ -125,6 +126,9 @@ func TestConvert_StorageRPCPublicAddrRoundTrip(t *testing.T) {
 	if up.Spec.Storage.RPCPublicAddr != addr {
 		t.Fatalf("v1beta2 storage.rpcPublicAddr: got %q want %q", up.Spec.Storage.RPCPublicAddr, addr)
 	}
+	if up.Spec.Storage.LayoutPolicy != layoutPolicyManual {
+		t.Fatalf("v1beta2 storage.layoutPolicy: got %q want Manual", up.Spec.Storage.LayoutPolicy)
+	}
 
 	down := &GarageCluster{}
 	if err := down.ConvertFrom(up); err != nil {
@@ -132,6 +136,9 @@ func TestConvert_StorageRPCPublicAddrRoundTrip(t *testing.T) {
 	}
 	if down.Spec.Storage.RPCPublicAddr != addr {
 		t.Fatalf("round-trip lost storage.rpcPublicAddr: got %q want %q", down.Spec.Storage.RPCPublicAddr, addr)
+	}
+	if down.Spec.Storage.LayoutPolicy != layoutPolicyManual {
+		t.Fatalf("round-trip lost storage.layoutPolicy: got %q want Manual", down.Spec.Storage.LayoutPolicy)
 	}
 }
 

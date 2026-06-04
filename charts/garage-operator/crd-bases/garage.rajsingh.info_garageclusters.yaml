@@ -3212,6 +3212,11 @@ spec:
                   dataFsync:
                     description: DataFsync enables fsync for data block writes
                     type: boolean
+                  layoutPolicy:
+                    description: |-
+                      LayoutPolicy overrides the cluster layoutPolicy for the storage tier only
+                      (Auto/Manual). Round-trips losslessly with v1beta2 spec.storage.layoutPolicy.
+                    type: string
                   metadata:
                     description: Metadata configures metadata storage
                     properties:
@@ -10423,6 +10428,20 @@ spec:
                           x-kubernetes-map-type: atomic
                       type: object
                     type: array
+                  layoutPolicy:
+                    description: |-
+                      LayoutPolicy overrides the cluster-level spec.layoutPolicy for the STORAGE
+                      tier only. This lets a cluster hand-manage storage GarageNodes (Manual)
+                      while the gateway tier stays operator-managed (Auto) — e.g. a region with
+                      heterogeneous per-node storage arrays defined in gitops, keeping the
+                      operator's gateway automation (per-ordinal rpc_public_addr, tombstone
+                      reaper, per-pod LBs). Defaults to spec.layoutPolicy when empty. Auto->Manual
+                      is one-way (operator ejects its storage nodes; Manual->Auto is rejected by
+                      the webhook), matching the cluster-level field.
+                    enum:
+                    - Auto
+                    - Manual
+                    type: string
                   metadata:
                     description: Metadata configures the metadata PVC (Garage node
                       identity + index DB).

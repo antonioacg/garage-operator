@@ -223,7 +223,11 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// In both cases the cluster-level storage StatefulSet (`<name>`) is no
 	// longer created post-#190. The gateway tier is untouched and continues to
 	// use a single Deployment with EmptyDir.
-	if cluster.Spec.LayoutPolicy != LayoutPolicyManual {
+	// Storage tier — gated on the STORAGE tier's effective layout policy
+	// (spec.storage.layoutPolicy, else the cluster default). Decoupled from the
+	// gateway tier so a cluster can hand-manage storage (Manual, per-node
+	// GarageNodes in gitops) while the gateway tier stays operator-managed.
+	if effectiveStorageLayoutPolicy(cluster) != LayoutPolicyManual {
 		// Auto mode: migrate any pre-#190 legacy storage STS, then reconcile
 		// the per-node GarageNodes that replace it.
 		if cluster.HasStorageTier() {
@@ -243,17 +247,24 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				return r.updateStatus(ctx, cluster, PhaseFailed, err)
 			}
 		}
+	} else if err := r.ejectAutoModeStorageNodes(ctx, cluster); err != nil {
+		// Manual storage: if the previous policy was Auto and operator-owned
+		// storage GarageNodes still exist, eject them so the user can take over.
+		return r.updateStatus(ctx, cluster, PhaseFailed, fmt.Errorf("ejecting Auto-mode storage GarageNodes: %w", err))
+	}
 
-		// Gateway tier dispatch:
-		//   - Unified cluster (storage + gateway): the gateway tier runs as
-		//     per-node GarageNodes (gateway:true) whose layout lives on the LOCAL
-		//     cluster, exactly like the storage tier. The legacy cluster-level
-		//     gateway StatefulSet is removed; gateway pods get capacity=nil layout
-		//     roles via the GarageNode controller (the #209 fix).
-		//   - Edge / standalone gateway (gateway-only + connectTo): the layout
-		//     lives on a REMOTE storage cluster, so we keep the cluster-level
-		//     StatefulSet + gateway-connection path that already handles remote
-		//     admin routing.
+	// Gateway tier — gated on the cluster-level layout policy (no per-tier
+	// override; the gateway tier follows spec.layoutPolicy).
+	//   - Unified cluster (storage + gateway): the gateway tier runs as
+	//     per-node GarageNodes (gateway:true) whose layout lives on the LOCAL
+	//     cluster, exactly like the storage tier. The legacy cluster-level
+	//     gateway StatefulSet is removed; gateway pods get capacity=nil layout
+	//     roles via the GarageNode controller (the #209 fix).
+	//   - Edge / standalone gateway (gateway-only + connectTo): the layout
+	//     lives on a REMOTE storage cluster, so we keep the cluster-level
+	//     StatefulSet + gateway-connection path that already handles remote
+	//     admin routing.
+	if cluster.Spec.LayoutPolicy != LayoutPolicyManual {
 		if cluster.HasGatewayTier() {
 			if cluster.HasStorageTier() {
 				// #221: before tearing down the pre-#210 cluster-level gateway STS,
@@ -286,16 +297,8 @@ func (r *GarageClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				return r.updateStatus(ctx, cluster, PhaseFailed, err)
 			}
 		}
-	} else {
-		// Manual mode: if the previous policy was Auto and operator-owned
-		// GarageNodes still exist, eject them so the user can take over. Both
-		// tiers are ejected so the hand-off is atomic.
-		if err := r.ejectAutoModeStorageNodes(ctx, cluster); err != nil {
-			return r.updateStatus(ctx, cluster, PhaseFailed, fmt.Errorf("ejecting Auto-mode GarageNodes: %w", err))
-		}
-		if err := r.ejectAutoModeGatewayNodes(ctx, cluster); err != nil {
-			return r.updateStatus(ctx, cluster, PhaseFailed, fmt.Errorf("ejecting Auto-mode gateway GarageNodes: %w", err))
-		}
+	} else if err := r.ejectAutoModeGatewayNodes(ctx, cluster); err != nil {
+		return r.updateStatus(ctx, cluster, PhaseFailed, fmt.Errorf("ejecting Auto-mode gateway GarageNodes: %w", err))
 	}
 
 	// Bootstrap cluster nodes if pods are running but cluster isn't formed.

@@ -376,6 +376,11 @@ type StorageConfig struct {
 	// +optional
 	RPCPublicAddr string `json:"rpcPublicAddr,omitempty"`
 
+	// LayoutPolicy overrides the cluster layoutPolicy for the storage tier only
+	// (Auto/Manual). Round-trips losslessly with v1beta2 spec.storage.layoutPolicy.
+	// +optional
+	LayoutPolicy string `json:"layoutPolicy,omitempty"`
+
 	// MetadataSnapshotsDir specifies directory for metadata snapshots
 	// +optional
 	MetadataSnapshotsDir string `json:"metadataSnapshotsDir,omitempty"`

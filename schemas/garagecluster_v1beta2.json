@@ -5114,6 +5114,14 @@
               },
               "type": "array"
             },
+            "layoutPolicy": {
+              "description": "LayoutPolicy overrides the cluster-level spec.layoutPolicy for the STORAGE\ntier only. This lets a cluster hand-manage storage GarageNodes (Manual)\nwhile the gateway tier stays operator-managed (Auto) \u2014 e.g. a region with\nheterogeneous per-node storage arrays defined in gitops, keeping the\noperator's gateway automation (per-ordinal rpc_public_addr, tombstone\nreaper, per-pod LBs). Defaults to spec.layoutPolicy when empty. Auto->Manual\nis one-way (operator ejects its storage nodes; Manual->Auto is rejected by\nthe webhook), matching the cluster-level field.",
+              "enum": [
+                "Auto",
+                "Manual"
+              ],
+              "type": "string"
+            },
             "metadata": {
               "description": "Metadata configures the metadata PVC (Garage node identity + index DB).",
               "properties": {

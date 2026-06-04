@@ -245,6 +245,18 @@ type StorageSpec struct {
 	// +optional
 	PodDisruptionBudget *PodDisruptionBudgetConfig `json:"podDisruptionBudget,omitempty"`
 
+	// LayoutPolicy overrides the cluster-level spec.layoutPolicy for the STORAGE
+	// tier only. This lets a cluster hand-manage storage GarageNodes (Manual)
+	// while the gateway tier stays operator-managed (Auto) — e.g. a region with
+	// heterogeneous per-node storage arrays defined in gitops, keeping the
+	// operator's gateway automation (per-ordinal rpc_public_addr, tombstone
+	// reaper, per-pod LBs). Defaults to spec.layoutPolicy when empty. Auto->Manual
+	// is one-way (operator ejects its storage nodes; Manual->Auto is rejected by
+	// the webhook), matching the cluster-level field.
+	// +kubebuilder:validation:Enum=Auto;Manual
+	// +optional
+	LayoutPolicy string `json:"layoutPolicy,omitempty"`
+
 	// PodTemplate carries pod scheduling and metadata for the storage tier.
 	PodTemplate `json:",inline"`
 }

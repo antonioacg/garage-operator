@@ -119,6 +119,14 @@ func (v *GarageClusterValidator) ValidateUpdate(ctx context.Context, oldObj, new
 	if oldPolicy == layoutPolicyManual && newPolicy != "" && newPolicy != layoutPolicyManual {
 		return warnings, fmt.Errorf("layoutPolicy transition from Manual to Auto is not supported (one-way only) — see issue #190")
 	}
+	// Same one-way rule for the per-tier storage override: once storage is
+	// Manual (user owns the storage GarageNodes), the operator can't safely
+	// re-adopt them.
+	oldStorage := oldObj.EffectiveStorageLayoutPolicy()
+	newStorage := newObj.EffectiveStorageLayoutPolicy()
+	if oldStorage == layoutPolicyManual && newStorage != "" && newStorage != layoutPolicyManual {
+		return warnings, fmt.Errorf("spec.storage.layoutPolicy transition from Manual to Auto is not supported (one-way only) — see issue #190")
+	}
 
 	oldFactor := 0
 	if oldObj.Spec.Replication != nil {
