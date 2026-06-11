@@ -2278,11 +2278,14 @@ func (r *GarageClusterReconciler) updateStatusFromCluster(ctx context.Context, c
 			storageDesired = cluster.StorageReplicas()
 			gatewayDesired = cluster.GatewayReplicas()
 
+			// Match nodes by spec.clusterRef (like the Manual branch above), NOT by
+			// the operator's cluster label. A per-tier Manual storage policy means
+			// hand-written GarageNode CRs that may not carry the label; selecting on
+			// the label makes those nodes invisible here, pinning readyReplicas
+			// below desired and the phase at Degraded forever — which in turn gated
+			// GarageKey provisioning (#237).
 			gnList := &garagev1beta1.GarageNodeList{}
-			if err := r.List(ctx, gnList,
-				client.InNamespace(cluster.Namespace),
-				client.MatchingLabels(map[string]string{labelCluster: cluster.Name}),
-			); err != nil {
+			if err := r.List(ctx, gnList, client.InNamespace(cluster.Namespace)); err != nil {
 				log.Error(err, "Failed to list child GarageNodes for status aggregation")
 			} else {
 				for _, n := range gnList.Items {

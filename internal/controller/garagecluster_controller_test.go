@@ -394,6 +394,69 @@ var _ = Describe("GarageCluster Controller", func() {
 			Expect(updated.Status.Selector).To(Equal(labelCluster + "=" + resourceName))
 		})
 
+		It("counts unlabeled clusterRef-matched GarageNodes toward readiness in Auto mode (#237)", func() {
+			// Mirrors the robbinsdale incident: cluster-level Auto with a Manual
+			// storage tier. The storage GarageNodes are hand-written and do NOT
+			// carry the operator's cluster label; the gateway nodes (operator-
+			// generated) do. Selecting children by label made the storage nodes
+			// invisible to status aggregation: ready=2(gw) < desired=3 pinned the
+			// phase at Degraded forever, which gated GarageKey provisioning.
+			const cName = "unlabeled-manual-storage-cluster"
+			cNN := types.NamespacedName{Name: cName, Namespace: testNamespace}
+			cluster := &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: cName, Namespace: testNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					LayoutPolicy: LayoutPolicyAuto,
+					Storage: &garagev1beta2.StorageSpec{
+						Replicas:     1,
+						LayoutPolicy: LayoutPolicyManual,
+						Metadata:     &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("1Gi"))},
+						Data:         &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("10Gi"))},
+					},
+					Gateway:     &garagev1beta2.GatewaySpec{Replicas: 2},
+					Replication: &garagev1beta2.ReplicationConfig{Factor: 1},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, cluster) })
+
+			mkNode := func(name string, gateway bool, labels map[string]string) {
+				node := &garagev1beta1.GarageNode{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, Labels: labels},
+					Spec: garagev1beta1.GarageNodeSpec{
+						ClusterRef: garagev1beta1.ClusterReference{Name: cName},
+						Gateway:    gateway,
+					},
+				}
+				if !gateway {
+					node.Spec.Capacity = ptrQuantity(resource.MustParse("10Gi"))
+				}
+				Expect(k8sClient.Create(ctx, node)).To(Succeed())
+				DeferCleanup(func() { _ = k8sClient.Delete(ctx, node) })
+				node.Status.Connected = true
+				Expect(k8sClient.Status().Update(ctx, node)).To(Succeed())
+			}
+
+			// Operator-generated gateway nodes carry the cluster label.
+			mkNode(cName+"-gateway-0", true, map[string]string{labelCluster: cName})
+			mkNode(cName+"-gateway-1", true, map[string]string{labelCluster: cName})
+			// Hand-managed Manual storage node: clusterRef matches, no labels.
+			mkNode(cName+"-storage-smb", false, nil)
+
+			reconciler := &GarageClusterReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			_, err := reconciler.updateStatusFromCluster(ctx, cluster)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &garagev1beta2.GarageCluster{}
+			Expect(k8sClient.Get(ctx, cNN, updated)).To(Succeed())
+			Expect(updated.Status.StorageReadyReplicas).To(Equal(int32(1)),
+				"unlabeled storage GarageNode with matching clusterRef must count as ready")
+			Expect(updated.Status.GatewayReadyReplicas).To(Equal(int32(2)))
+			Expect(updated.Status.ReadyReplicas).To(Equal(int32(3)))
+			Expect(updated.Status.Phase).To(Equal(PhaseRunning),
+				"phase must not be pinned Degraded by label-less Manual storage nodes")
+		})
+
 		It("preserves computed status across a status-update conflict", func() {
 			// Unique cluster name so the status computation (which counts this
 			// cluster's GarageNodes) is not contaminated by operator-owned nodes
