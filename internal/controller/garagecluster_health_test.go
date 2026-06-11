@@ -160,22 +160,27 @@ func TestSetClusterHealthConditions_NoFederationClearsConditions(t *testing.T) {
 
 func TestComputeUnreachablePeers(t *testing.T) {
 	up := func(secs uint64) *uint64 { return &secs }
-	roled := &garage.NodeAssignedRole{Zone: "z"}
+	cap1 := uint64(1 << 30)
+	storageRole := &garage.NodeAssignedRole{Zone: "z", Capacity: &cap1} // storage (capacity != nil)
+	gatewayRole := &garage.NodeAssignedRole{Zone: "z"}                  // gateway (capacity == nil)
 	nodes := []garage.NodeInfo{
-		{ID: "aaaaaaaaaaaaaaaaaaaa", IsUp: true},                                          // up → ignored
-		{ID: "bbbbbbbbbbbbbbbbbbbb", IsUp: false, LastSeenSecsAgo: up(120), Role: roled},  // 2m down → transient
-		{ID: "cccccccccccccccccccc", IsUp: false, LastSeenSecsAgo: up(1800), Role: roled}, // 30m down, roled → flagged
-		// never seen but holds a layout role → expected member, flagged
-		{ID: "dddddddddddddddddddd", IsUp: false, LastSeenSecsAgo: nil, Role: roled},
+		{ID: "aaaaaaaaaaaaaaaaaaaa", IsUp: true},                                                // up → ignored
+		{ID: "bbbbbbbbbbbbbbbbbbbb", IsUp: false, LastSeenSecsAgo: up(120), Role: storageRole},  // 2m down → transient
+		{ID: "cccccccccccccccccccc", IsUp: false, LastSeenSecsAgo: up(1800), Role: storageRole}, // 30m down, storage → flagged
+		// never seen but holds a storage layout role → expected member, flagged
+		{ID: "dddddddddddddddddddd", IsUp: false, LastSeenSecsAgo: nil, Role: storageRole},
 		// never seen and roleless → bootstrap discovery noise, skipped
 		{ID: "eeeeeeeeeeeeeeeeeeee", IsUp: false, LastSeenSecsAgo: nil},
-		// SUSTAINED down but roleless → a discarded identity Garage still remembers
-		// (e.g. a recreated-PVC gateway orphan); not actionable, must be skipped (#224-class noise).
+		// SUSTAINED down but roleless → a discarded identity Garage still remembers;
+		// not actionable, must be skipped (#224-class noise).
 		{ID: "ffffffffffffffffffff", IsUp: false, LastSeenSecsAgo: up(70000)},
 		// SUSTAINED down + DRAINING → a storage node mid-removal (role==nil + draining
 		// in a prior layout version); a STUCK drain is exactly when the warning matters,
 		// so it must still be flagged despite role==nil.
 		{ID: "gggggggggggggggggggg", IsUp: false, LastSeenSecsAgo: up(1800), Draining: true},
+		// SUSTAINED down gateway peer (capacity==nil) → reaped by reconcileGatewayTombstones,
+		// not ConnectClusterNodes; must be skipped to avoid misleading noise (#237).
+		{ID: "hhhhhhhhhhhhhhhhhhhh", IsUp: false, LastSeenSecsAgo: up(1800), Role: gatewayRole},
 	}
 	got := computeUnreachablePeers(nodes)
 	if len(got) != 3 {
@@ -196,6 +201,9 @@ func TestComputeUnreachablePeers(t *testing.T) {
 	}
 	if !strings.Contains(joined, "gggggggggggggggg") {
 		t.Fatal("sustained-down draining node must still be flagged (stuck-drain visibility)")
+	}
+	if strings.Contains(joined, "hhhhhhhhhhhhhhhh") {
+		t.Fatal("sustained-down gateway peer (capacity=nil) must be skipped — tombstone reaper handles them")
 	}
 }
 

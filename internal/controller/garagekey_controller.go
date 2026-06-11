@@ -102,12 +102,17 @@ func (r *GarageKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return r.updateStatus(ctx, key, PhaseFailed, fmt.Errorf("cluster not found: %w", clusterErr))
 	}
 
-	// Guard against calling the Garage API before the cluster layout has converged,
-	// or when the cluster is being deleted (avoids "connection refused" from a dying admin API).
+	// Guard against calling the Garage API before the cluster has any pods at all
+	// (Pending = all pods down, admin API unreachable) or when the cluster has failed.
+	// Degraded (readyReplicas < desired but > 0) is intentionally allowed: the admin
+	// API is still reachable via running pods, so key provisioning succeeds. Blocking
+	// on Phase != Running prevents key operations during routine rolling restarts or
+	// when dead gateway peers cause a cosmetic Degraded (gateway peers don't affect
+	// write quorum or the admin API).
 	if !key.DeletionTimestamp.IsZero() {
 		// Allow deletions to proceed regardless of cluster health.
-	} else if !cluster.DeletionTimestamp.IsZero() || cluster.Status.Phase != PhaseRunning {
-		msg := "waiting for cluster to reach Running phase"
+	} else if !cluster.DeletionTimestamp.IsZero() || cluster.Status.Phase == PhasePending || cluster.Status.Phase == PhaseFailed {
+		msg := "waiting for cluster to start (phase: " + cluster.Status.Phase + ")"
 		if !cluster.DeletionTimestamp.IsZero() {
 			msg = "garage cluster is being deleted"
 		}
