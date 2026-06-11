@@ -4636,13 +4636,19 @@ func (r *GarageClusterReconciler) removeStaleRemoteNodes(
 ) error {
 	log := logf.FromContext(ctx)
 
-	// Build set of node IDs that exist in remote cluster
+	// Build map of remote node status for both existence and liveness checks.
 	remoteNodeIDs := make(map[string]bool)
-	for _, node := range remoteStatus.Nodes {
-		remoteNodeIDs[node.ID] = true
+	remoteNodeByID := make(map[string]*garage.NodeInfo, len(remoteStatus.Nodes))
+	for i := range remoteStatus.Nodes {
+		n := &remoteStatus.Nodes[i]
+		remoteNodeIDs[n.ID] = true
+		remoteNodeByID[n.ID] = n
 	}
 
-	// Find nodes in local layout that are tagged with remote cluster name but don't exist in remote
+	// Find nodes in local layout that are tagged with remote cluster name but don't exist in remote,
+	// OR are dead gateway roles (capacity=nil) that have been down beyond the reachability threshold.
+	// Gateway roles carry no data, so removal is always safe — the replacement pod re-imports itself
+	// automatically once it reports IsUp. Storage roles are never speculatively removed.
 	var staleNodes []garage.NodeRoleChange
 	for _, role := range layout.Roles {
 		// Check if this node is tagged as belonging to the remote cluster
@@ -4653,15 +4659,35 @@ func (r *GarageClusterReconciler) removeStaleRemoteNodes(
 				break
 			}
 		}
+		if !isFromRemote {
+			continue
+		}
 
-		if isFromRemote && !remoteNodeIDs[role.ID] {
+		if !remoteNodeIDs[role.ID] {
+			// Node no longer exists in remote Garage's peer list at all.
 			log.Info("Found stale remote node in layout (no longer exists in remote cluster)",
 				"nodeID", shortID(role.ID), "remoteCluster", remote.Name, "zone", role.Zone)
-			staleNodes = append(staleNodes, garage.NodeRoleChange{
-				ID:     role.ID,
-				Remove: true,
-			})
+			staleNodes = append(staleNodes, garage.NodeRoleChange{ID: role.ID, Remove: true})
+			continue
 		}
+
+		// Node is in remote status but may be a dead gateway role (capacity=nil).
+		// Garage keeps dead peers in its node list indefinitely, so a replaced gateway
+		// identity never disappears from remoteNodeIDs — we need the sustained-down check.
+		remoteNode := remoteNodeByID[role.ID]
+		if remoteNode.IsUp || role.Capacity != nil {
+			continue // alive, or a storage role (data-bearing — never speculative-remove)
+		}
+		if remoteNode.LastSeenSecsAgo == nil {
+			continue // never seen = bootstrap noise, not a replaced gateway
+		}
+		if time.Duration(*remoteNode.LastSeenSecsAgo)*time.Second < peerUnreachableThreshold {
+			continue // transient blip
+		}
+		log.Info("Found dead remote gateway role beyond reachability threshold, removing",
+			"nodeID", shortID(role.ID), "remoteCluster", remote.Name,
+			"downSeconds", *remoteNode.LastSeenSecsAgo)
+		staleNodes = append(staleNodes, garage.NodeRoleChange{ID: role.ID, Remove: true})
 	}
 
 	if len(staleNodes) == 0 {
