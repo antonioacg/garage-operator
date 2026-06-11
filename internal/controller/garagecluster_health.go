@@ -42,14 +42,16 @@ const peerUnreachableThreshold = 10 * time.Minute
 
 // computeUnreachablePeers returns "<shortId> (down <duration>)" descriptions for
 // peers that are not up and were last seen longer ago than the threshold. Only
-// storage peers that matter are flagged: a peer that holds a capacity role in the
-// CURRENT layout (n.Role != nil && n.Role.Capacity != nil) or one that is draining
-// (held a capacity role in a prior layout version — Garage reports such a node with
-// role==nil + draining==true). Gateway peers (capacity==nil) are excluded: dead
-// gateway identities are reaped by reconcileGatewayTombstones, and ConnectClusterNodes
-// can't reconnect a replaced identity anyway, so flagging them is misleading noise.
-// Roleless, non-draining down peers are also excluded (discovery noise / discarded
-// identity with no data responsibility).
+// peers that matter are flagged: a peer that holds a role in the CURRENT layout
+// (n.Role != nil) or one that is draining (held a capacity role in a prior layout
+// version and is being removed — Garage reports such a node with role==nil +
+// draining==true). A roleless, non-draining down peer is NOT an actionable member:
+// it is either bootstrap/federation discovery noise (never seen) or a discarded
+// identity Garage still remembers (e.g. a gateway whose metadata PVC was recreated,
+// leaving the old node ID in the peer list) — the ConnectClusterNodes recovery
+// nudge can never reconnect it, so flagging it is misleading noise. Keeping draining
+// nodes preserves visibility into a STUCK drain (node dead, drain not completing),
+// which is exactly when an operator wants the warning.
 func computeUnreachablePeers(nodes []garage.NodeInfo) []string {
 	var out []string
 	for _, n := range nodes {
@@ -58,12 +60,6 @@ func computeUnreachablePeers(nodes []garage.NodeInfo) []string {
 		}
 		if n.Role == nil && !n.Draining {
 			continue // roleless and not draining: discovery noise or a discarded identity — not actionable
-		}
-		// Gateway peers (capacity=nil) are reaped by reconcileGatewayTombstones.
-		// ConnectClusterNodes can't reconnect a replaced gateway identity, so
-		// PeerUnreachable for them is actionable noise.
-		if n.Role != nil && n.Role.Capacity == nil && !n.Draining {
-			continue
 		}
 		secs := uint64(0)
 		if n.LastSeenSecsAgo != nil {

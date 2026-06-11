@@ -582,6 +582,81 @@ var _ = Describe("GarageCluster Auto-mode (#190)", func() {
 			Expect(updated.Status.Phase).To(Equal("Degraded"))
 		})
 
+		It("counts unlabeled Manual storage GarageNodes toward readyReplicas (#240)", func() {
+			// Regression: Auto-mode status aggregation used a labelCluster label selector,
+			// so GarageNodes created without that label (e.g. hand-managed Manual nodes
+			// after an Auto→Manual migration) were invisible and pinned the phase Degraded.
+			// Mirror the live incident: cluster has storage + gateway tiers; the 2 labeled
+			// gateway CRs were visible but the 1 unlabeled Manual storage CR was not,
+			// giving readyReplicas 2/3 and phase Degraded.
+			clusterNN = types.NamespacedName{Name: uniqueClusterName("auto-status-unlabeled"), Namespace: testNamespace}
+			cluster = &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: clusterNN.Name, Namespace: testNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					LayoutPolicy: LayoutPolicyAuto,
+					Zone:         testZone,
+					Storage: &garagev1beta2.StorageSpec{
+						Replicas: 1,
+						Metadata: &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("1Gi"))},
+						Data:     &garagev1beta2.VolumeConfig{Size: ptrQuantity(resource.MustParse("10Gi"))},
+					},
+					Gateway:     &garagev1beta2.GatewaySpec{Replicas: 2},
+					Replication: &garagev1beta2.ReplicationConfig{Factor: 1},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+
+			// 2 labeled gateway GarageNodes (operator-owned, have the cluster label)
+			for i := 0; i < 2; i++ {
+				nodeName := fmt.Sprintf("%s-gateway-%d", clusterNN.Name, i)
+				gn := &garagev1beta1.GarageNode{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      nodeName,
+						Namespace: testNamespace,
+						Labels: map[string]string{
+							labelCluster:      clusterNN.Name,
+							labelTier:         tierGateway,
+							labelAppManagedBy: managedByOperatorValue,
+						},
+					},
+					Spec: garagev1beta1.GarageNodeSpec{
+						ClusterRef: garagev1beta1.ClusterReference{Name: clusterNN.Name},
+						Zone:       testZone,
+						Gateway:    true,
+					},
+				}
+				Expect(k8sClient.Create(ctx, gn)).To(Succeed())
+				gn.Status.Connected = true
+				Expect(k8sClient.Status().Update(ctx, gn)).To(Succeed())
+			}
+
+			// 1 unlabeled Manual storage GarageNode (hand-managed, no labelCluster label)
+			unlabeled := &garagev1beta1.GarageNode{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterNN.Name + "-manual-storage",
+					Namespace: testNamespace,
+					// deliberately no labelCluster label — the pre-fix selector missed this
+				},
+				Spec: garagev1beta1.GarageNodeSpec{
+					ClusterRef: garagev1beta1.ClusterReference{Name: clusterNN.Name},
+					Zone:       testZone,
+					Capacity:   ptrQuantity(resource.MustParse("10Gi")),
+				},
+			}
+			Expect(k8sClient.Create(ctx, unlabeled)).To(Succeed())
+			unlabeled.Status.Connected = true
+			Expect(k8sClient.Status().Update(ctx, unlabeled)).To(Succeed())
+
+			_, err := reconciler.updateStatusFromCluster(ctx, cluster)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated := &garagev1beta2.GarageCluster{}
+			Expect(k8sClient.Get(ctx, clusterNN, updated)).To(Succeed())
+			// desiredReplicas = storage(1) + gateway(2) = 3; readyReplicas must also be 3
+			Expect(updated.Status.ReadyReplicas).To(Equal(int32(3)), "unlabeled Manual node must be counted")
+			Expect(updated.Status.Phase).To(Equal("Running"), "phase must not pin Degraded due to missing label")
+		})
+
 		It("strips the retry-migration annotation through a Conflict on first Update", func() {
 			// Regression for bug #3: when a competing reconcile bumps
 			// ResourceVersion between the migration status write and the

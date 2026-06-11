@@ -2278,11 +2278,13 @@ func (r *GarageClusterReconciler) updateStatusFromCluster(ctx context.Context, c
 			storageDesired = cluster.StorageReplicas()
 			gatewayDesired = cluster.GatewayReplicas()
 
+			// List by namespace only and filter on spec.clusterRef in the loop.
+			// A label selector on labelCluster would miss GarageNodes that were
+			// created without the label (e.g. hand-managed Manual nodes, or nodes
+			// from an Auto→Manual migration before the label was standardised),
+			// causing readyReplicas to under-count and pinning the cluster Degraded.
 			gnList := &garagev1beta1.GarageNodeList{}
-			if err := r.List(ctx, gnList,
-				client.InNamespace(cluster.Namespace),
-				client.MatchingLabels(map[string]string{labelCluster: cluster.Name}),
-			); err != nil {
+			if err := r.List(ctx, gnList, client.InNamespace(cluster.Namespace)); err != nil {
 				log.Error(err, "Failed to list child GarageNodes for status aggregation")
 			} else {
 				for _, n := range gnList.Items {
@@ -4572,6 +4574,14 @@ func (r *GarageClusterReconciler) addRemoteNodesToLayout(
 		newRoles = append(newRoles, role)
 	}
 
+	// Stale-node cleanup runs unconditionally (not gated on len(newRoles)) so it fires
+	// in steady state too, not just on bootstrap when new nodes are being imported.
+	if remoteStatus != nil {
+		if err := r.removeStaleRemoteNodes(ctx, localClient, layout, remoteStatus, remote); err != nil {
+			log.Error(err, "Failed to remove stale remote nodes", "cluster", remote.Name)
+		}
+	}
+
 	if len(newRoles) == 0 {
 		log.V(1).Info("All remote nodes already in layout", "cluster", remote.Name)
 		return nil
@@ -4580,12 +4590,9 @@ func (r *GarageClusterReconciler) addRemoteNodesToLayout(
 	// Stage changes with zone redundancy parameters from cluster spec
 	log.Info("Adding remote nodes to layout", "cluster", remote.Name, "count", len(newRoles))
 
-	// Build layout update request with zone redundancy if configured
 	layoutReq := garage.UpdateClusterLayoutRequest{
 		Roles: newRoles,
 	}
-
-	// Include zone redundancy from cluster spec for consistency
 	if zr := buildZoneRedundancy(cluster.Spec.Replication); zr != nil {
 		layoutReq.Parameters = &garage.LayoutParameters{ZoneRedundancy: zr}
 		log.V(1).Info("Including zone redundancy in layout update", "zoneRedundancy", zr)
@@ -4602,7 +4609,7 @@ func (r *GarageClusterReconciler) addRemoteNodesToLayout(
 	}
 
 	if len(layout.StagedRoleChanges) == 0 {
-		return nil // Nothing to apply
+		return nil
 	}
 
 	// Apply layout (race-tolerant: apply rejection is a generic 500, not a 409).
@@ -4611,16 +4618,6 @@ func (r *GarageClusterReconciler) addRemoteNodesToLayout(
 	}
 
 	log.Info("Applied federated layout", "cluster", remote.Name, "nodesAdded", len(newRoles))
-
-	// After adding nodes, check for stale remote nodes that were removed from the remote cluster.
-	// Only possible when we have a fresh remote status to compare against.
-	if remoteStatus != nil {
-		if err := r.removeStaleRemoteNodes(ctx, localClient, layout, remoteStatus, remote); err != nil {
-			// Don't fail the reconcile for stale node cleanup - just log
-			log.Error(err, "Failed to remove stale remote nodes", "cluster", remote.Name)
-		}
-	}
-
 	return nil
 }
 
@@ -4636,22 +4633,16 @@ func (r *GarageClusterReconciler) removeStaleRemoteNodes(
 ) error {
 	log := logf.FromContext(ctx)
 
-	// Build map of remote node status for both existence and liveness checks.
+	// Build set of node IDs that exist in remote cluster
 	remoteNodeIDs := make(map[string]bool)
-	remoteNodeByID := make(map[string]*garage.NodeInfo, len(remoteStatus.Nodes))
-	for i := range remoteStatus.Nodes {
-		n := &remoteStatus.Nodes[i]
-		remoteNodeIDs[n.ID] = true
-		remoteNodeByID[n.ID] = n
+	for _, node := range remoteStatus.Nodes {
+		remoteNodeIDs[node.ID] = true
 	}
 
-	// Find nodes in local layout that are tagged with remote cluster name but don't exist in remote,
-	// OR are dead gateway roles (capacity=nil) that have been down beyond the reachability threshold.
-	// Gateway roles carry no data, so removal is always safe — the replacement pod re-imports itself
-	// automatically once it reports IsUp. Storage roles are never speculatively removed.
+	// Find nodes in local layout that are tagged with remote cluster name but no longer
+	// exist in that remote cluster's Garage peer list at all.
 	var staleNodes []garage.NodeRoleChange
 	for _, role := range layout.Roles {
-		// Check if this node is tagged as belonging to the remote cluster
 		isFromRemote := false
 		for _, tag := range role.Tags {
 			if tag == remote.Name {
@@ -4659,35 +4650,15 @@ func (r *GarageClusterReconciler) removeStaleRemoteNodes(
 				break
 			}
 		}
-		if !isFromRemote {
-			continue
-		}
 
-		if !remoteNodeIDs[role.ID] {
-			// Node no longer exists in remote Garage's peer list at all.
+		if isFromRemote && !remoteNodeIDs[role.ID] {
 			log.Info("Found stale remote node in layout (no longer exists in remote cluster)",
 				"nodeID", shortID(role.ID), "remoteCluster", remote.Name, "zone", role.Zone)
-			staleNodes = append(staleNodes, garage.NodeRoleChange{ID: role.ID, Remove: true})
-			continue
+			staleNodes = append(staleNodes, garage.NodeRoleChange{
+				ID:     role.ID,
+				Remove: true,
+			})
 		}
-
-		// Node is in remote status but may be a dead gateway role (capacity=nil).
-		// Garage keeps dead peers in its node list indefinitely, so a replaced gateway
-		// identity never disappears from remoteNodeIDs — we need the sustained-down check.
-		remoteNode := remoteNodeByID[role.ID]
-		if remoteNode.IsUp || role.Capacity != nil {
-			continue // alive, or a storage role (data-bearing — never speculative-remove)
-		}
-		if remoteNode.LastSeenSecsAgo == nil {
-			continue // never seen = bootstrap noise, not a replaced gateway
-		}
-		if time.Duration(*remoteNode.LastSeenSecsAgo)*time.Second < peerUnreachableThreshold {
-			continue // transient blip
-		}
-		log.Info("Found dead remote gateway role beyond reachability threshold, removing",
-			"nodeID", shortID(role.ID), "remoteCluster", remote.Name,
-			"downSeconds", *remoteNode.LastSeenSecsAgo)
-		staleNodes = append(staleNodes, garage.NodeRoleChange{ID: role.ID, Remove: true})
 	}
 
 	if len(staleNodes) == 0 {

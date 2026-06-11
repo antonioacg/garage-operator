@@ -111,7 +111,7 @@ func (r *GarageKeyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// write quorum or the admin API).
 	if !key.DeletionTimestamp.IsZero() {
 		// Allow deletions to proceed regardless of cluster health.
-	} else if !cluster.DeletionTimestamp.IsZero() || cluster.Status.Phase == PhasePending || cluster.Status.Phase == PhaseFailed {
+	} else if !cluster.DeletionTimestamp.IsZero() || cluster.Status.Phase == PhasePending || cluster.Status.Phase == PhaseFailed || cluster.Status.Phase == "" {
 		msg := "waiting for cluster to start (phase: " + cluster.Status.Phase + ")"
 		if !cluster.DeletionTimestamp.IsZero() {
 			msg = "garage cluster is being deleted"
