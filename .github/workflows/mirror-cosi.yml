@@ -1,0 +1,27 @@
+name: Mirror COSI controller image
+# One-shot mirror of the kubernetes-sigs COSI staging controller image into
+# our registry (EPIC-16/INFRA-56): the upstream pin lives in
+# gcr.io/k8s-staging-sig-storage, which is subject to registry GC.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to mirror"
+        required: true
+        default: "v20260406-controllerv0.2.0-rc1-281-gb838dbf"
+permissions:
+  packages: write
+  contents: read
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+      - name: Login to ghcr
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Copy multi-arch image
+        run: |
+          crane copy \
+            "gcr.io/k8s-staging-sig-storage/objectstorage-controller:${{ inputs.tag }}" \
+            "ghcr.io/${{ github.repository_owner }}/objectstorage-controller:${{ inputs.tag }}"
