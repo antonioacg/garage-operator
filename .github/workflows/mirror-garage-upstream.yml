@@ -1,0 +1,43 @@
+# Mirror UPSTREAM garage-operator artifacts into our registry (INFRA-56
+# vendoring: upstream is bus-factor-1, the platform pulls only from
+# ghcr.io/antonioacg). Used when a plain re-pin retires a patched fork carry —
+# digest-faithful crane copies of the exact artifacts validated, no rebuild.
+# First use (2026-07-14): image v0.6.23 + chart 0.6.22 (the v0.6.23 release
+# content — upstream didn't bump the chart version for that tag), retiring the
+# v0.6.18-fix.1 carry (BUG-11/UP-08 #271 and BUG-12 #275 both upstream now).
+name: Mirror upstream garage-operator image + chart
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Upstream operator image tag to mirror"
+        required: true
+        default: "v0.6.23"
+      chart_version:
+        description: "Upstream OCI chart version to mirror"
+        required: true
+        default: "0.6.22"
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install crane
+        uses: imjasonh/setup-crane@v0.4
+      - name: Login to ghcr
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | crane auth login ghcr.io -u ${{ github.actor }} --password-stdin
+      - name: Copy multi-arch operator image
+        run: |
+          crane copy \
+            "ghcr.io/rajsinghtech/garage-operator:${{ inputs.image_tag }}" \
+            "ghcr.io/${{ github.repository_owner }}/garage-operator:${{ inputs.image_tag }}"
+      - name: Copy OCI helm chart
+        run: |
+          crane copy \
+            "ghcr.io/rajsinghtech/charts/garage-operator:${{ inputs.chart_version }}" \
+            "ghcr.io/${{ github.repository_owner }}/charts/garage-operator:${{ inputs.chart_version }}"
