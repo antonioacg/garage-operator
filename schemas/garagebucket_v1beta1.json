@@ -23,7 +23,7 @@
           "description": "ClusterRef references the GarageCluster this bucket belongs to",
           "properties": {
             "kubeConfigSecretRef": {
-              "description": "KubeConfigSecretRef references a secret containing a kubeconfig for a remote Kubernetes cluster.\nOnly needed for multi-cluster federation where the GarageCluster lives in a different\nKubernetes cluster entirely (not just a different namespace).",
+              "description": "KubeConfigSecretRef is reserved for a future remote Kubernetes client integration.\nIt is currently rejected by admission because the operator does not use it.",
               "properties": {
                 "key": {
                   "description": "The key of the secret to select from.  Must be a valid secret key.",
@@ -51,7 +51,7 @@
               "type": "string"
             },
             "namespace": {
-              "description": "Namespace of the GarageCluster. Defaults to the referencing resource's namespace.\nCross-namespace references require a GarageReferenceGrant in the target namespace.\nNot supported on GarageNode.",
+              "description": "Namespace of the GarageCluster. Defaults to the referencing resource's namespace.\nCross-namespace references require a GarageReferenceGrant where supported by\nthe owning resource. GarageNode and GarageAdminToken reject them.",
               "type": "string"
             }
           },
@@ -60,6 +60,15 @@
           ],
           "type": "object",
           "additionalProperties": false
+        },
+        "deletionPolicy": {
+          "default": "Delete",
+          "description": "DeletionPolicy controls whether deleting this resource also deletes the\ncorresponding Garage bucket. The default is Delete.",
+          "enum": [
+            "Delete",
+            "Retain"
+          ],
+          "type": "string"
         },
         "globalAlias": {
           "description": "GlobalAlias is the global alias for this bucket (optional)\nIf not set, the bucket name from metadata.name is used",
@@ -254,6 +263,167 @@
           },
           "type": "object",
           "additionalProperties": false
+        },
+        "websiteExposure": {
+          "description": "WebsiteExposure optionally exposes a website-enabled bucket through\nKubernetes HTTP routing: an Ingress or a Gateway API HTTPRoute, created\nin this bucket's namespace and pointing at the referenced cluster's web\nAPI Service. At most one of Ingress and Gateway may be set. Requires\nspec.website.enabled. See the websiteExposure documentation for the\nhostname semantics (Garage resolves the bucket from the Host header).",
+          "properties": {
+            "backendRef": {
+              "description": "BackendRef overrides the Service the exposure routes to. When unset,\nthe operator targets the referenced cluster's web API Service\n(<cluster>-gateway for unified clusters, <cluster> otherwise). For an\nIngress the referent must be a core/v1 Service in the bucket's\nnamespace (Ingress backends cannot cross namespaces). For an\nHTTPRoute any referent valid for spec.rules[].backendRefs is\naccepted, including cross-namespace ones (which additionally need a\ngateway API ReferenceGrant).",
+              "properties": {
+                "group": {
+                  "description": "Group of the referent. Defaults to \"\" (the core API group).",
+                  "maxLength": 253,
+                  "type": "string"
+                },
+                "kind": {
+                  "description": "Kind of the referent. Defaults to Service.",
+                  "maxLength": 253,
+                  "type": "string"
+                },
+                "name": {
+                  "description": "Name of the referent.",
+                  "maxLength": 253,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "namespace": {
+                  "description": "Namespace of the referent. Defaults to the bucket's namespace (the\nexposure resource's namespace). For an Ingress it must stay the\nbucket's namespace: Ingress backends cannot cross namespaces.",
+                  "maxLength": 63,
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name"
+              ],
+              "type": "object",
+              "additionalProperties": false
+            },
+            "gateway": {
+              "description": "Gateway configures the generated Gateway API HTTPRoute. Mutually\nexclusive with Ingress. Requires the Gateway API CRDs to be installed;\nwithout them the operator reports a condition and does not fail the\nbucket.",
+              "properties": {
+                "annotations": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "description": "Annotations to add to the HTTPRoute.",
+                  "type": "object"
+                },
+                "labels": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "description": "Labels to add to the HTTPRoute (for example external-dns or\nargo-rollouts annotations). Operator-managed labels take precedence\non conflict.",
+                  "type": "object"
+                },
+                "parentRefs": {
+                  "description": "ParentRefs are passed through verbatim to the HTTPRoute's\nspec.parentRefs (Gateway names, optional sectionName, and optional\ncross-namespace references). At least one is required.",
+                  "items": {
+                    "description": "ParentReference identifies an API object (usually a Gateway) that can be considered\na parent of this resource (usually a route). There are two kinds of parent resources\nwith \"Core\" support:\n\n* Gateway (Gateway conformance profile)\n* Service (Mesh conformance profile, ClusterIP Services only)\n\nThis API may be extended in the future to support additional kinds of parent\nresources.\n\nThe API object must be valid in the cluster; the Group and Kind must\nbe registered in the cluster for this reference to be valid.",
+                    "properties": {
+                      "group": {
+                        "default": "gateway.networking.k8s.io",
+                        "description": "Group is the group of the referent.\nWhen unspecified, \"gateway.networking.k8s.io\" is inferred.\nTo set the core API group (such as for a \"Service\" kind referent),\nGroup must be explicitly set to \"\" (empty string).\n\nSupport: Core",
+                        "maxLength": 253,
+                        "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
+                        "type": "string"
+                      },
+                      "kind": {
+                        "default": "Gateway",
+                        "description": "Kind is kind of the referent.\n\nThere are two kinds of parent resources with \"Core\" support:\n\n* Gateway (Gateway conformance profile)\n* Service (Mesh conformance profile, ClusterIP Services only)\n\nSupport for other resources is Implementation-Specific.",
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "pattern": "^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$",
+                        "type": "string"
+                      },
+                      "name": {
+                        "description": "Name is the name of the referent.\n\nSupport: Core",
+                        "maxLength": 253,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "namespace": {
+                        "description": "Namespace is the namespace of the referent. When unspecified, this refers\nto the local namespace of the Route.\n\nNote that there are specific rules for ParentRefs which cross namespace\nboundaries. Cross-namespace references are only valid if they are explicitly\nallowed by something in the namespace they are referring to. For example:\nGateway has the AllowedRoutes field, and ReferenceGrant provides a\ngeneric way to enable any other kind of cross-namespace reference.\n\n<gateway:experimental:description>\nParentRefs from a Route to a Service in the same namespace are \"producer\"\nroutes, which apply default routing rules to inbound connections from\nany namespace to the Service.\n\nParentRefs from a Route to a Service in a different namespace are\n\"consumer\" routes, and these routing rules are only applied to outbound\nconnections originating from the same namespace as the Route, for which\nthe intended destination of the connections are a Service targeted as a\nParentRef of the Route.\n</gateway:experimental:description>\n\nSupport: Core",
+                        "maxLength": 63,
+                        "minLength": 1,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+                        "type": "string"
+                      },
+                      "port": {
+                        "description": "Port is the network port this Route targets. It can be interpreted\ndifferently based on the type of parent resource.\n\nWhen the parent resource is a Gateway, this targets all listeners\nlistening on the specified port that also support this kind of Route(and\nselect this Route). It's not recommended to set `Port` unless the\nnetworking behaviors specified in a Route must apply to a specific port\nas opposed to a listener(s) whose port(s) may be changed. When both Port\nand SectionName are specified, the name and port of the selected listener\nmust match both specified values.\n\n<gateway:experimental:description>\nWhen the parent resource is a Service, this targets a specific port in the\nService spec. When both Port (experimental) and SectionName are specified,\nthe name and port of the selected port must match both specified values.\n</gateway:experimental:description>\n\nImplementations MAY choose to support other parent resources.\nImplementations supporting other types of parent resources MUST clearly\ndocument how/if Port is interpreted.\n\nFor the purpose of status, an attachment is considered successful as\nlong as the parent resource accepts it partially. For example, Gateway\nlisteners can restrict which Routes can attach to them by Route kind,\nnamespace, or hostname. If 1 of 2 Gateway listeners accept attachment\nfrom the referencing Route, the Route MUST be considered successfully\nattached. If no Gateway listeners accept attachment from this Route,\nthe Route MUST be considered detached from the Gateway.\n\nSupport: Extended",
+                        "format": "int32",
+                        "maximum": 65535,
+                        "minimum": 1,
+                        "type": "integer"
+                      },
+                      "sectionName": {
+                        "description": "SectionName is the name of a section within the target resource. In the\nfollowing resources, SectionName is interpreted as the following:\n\n* Gateway: Listener name. When both Port (experimental) and SectionName\nare specified, the name and port of the selected listener must match\nboth specified values.\n* Service: Port name. When both Port (experimental) and SectionName\nare specified, the name and port of the selected listener must match\nboth specified values.\n\nImplementations MAY choose to support attaching Routes to other resources.\nIf that is the case, they MUST clearly document how SectionName is\ninterpreted.\n\nWhen unspecified (empty string), this will reference the entire resource.\nFor the purpose of status, an attachment is considered successful if at\nleast one section in the parent resource accepts it. For example, Gateway\nlisteners can restrict which Routes can attach to them by Route kind,\nnamespace, or hostname. If 1 of 2 Gateway listeners accept attachment from\nthe referencing Route, the Route MUST be considered successfully\nattached. If no Gateway listeners accept attachment from this Route, the\nRoute MUST be considered detached from the Gateway.\n\nSupport: Core",
+                        "maxLength": 253,
+                        "minLength": 1,
+                        "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object",
+                    "additionalProperties": false
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "parentRefs"
+              ],
+              "type": "object",
+              "additionalProperties": false
+            },
+            "hostnames": {
+              "description": "Hostnames are the external hostnames the exposure routes on. When\nempty, the operator uses the single canonical hostname\n<globalAlias><webApi.rootDomain>. Wildcards and duplicates are not\nsupported (duplicates are rejected by the validating webhook; the CRD\nschema cannot express uniqueItems).\n\nFor an HTTPRoute any hostname is accepted: a hostname that is neither\ncanonical nor the global alias gets a URLRewrite filter rewriting the\nHost header back to the canonical host, so Garage still resolves it to\nthis bucket. For an Ingress, only the canonical hostname and the\nglobal alias are accepted \u2014 an Ingress cannot rewrite the Host header,\nso any other hostname is refused on the WebsiteExposed condition.",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 16,
+              "type": "array"
+            },
+            "ingress": {
+              "description": "Ingress configures the generated Kubernetes Ingress. Mutually\nexclusive with Gateway. Only valid when the bucket and the referenced\ncluster share a namespace.",
+              "properties": {
+                "annotations": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "description": "Annotations to add to the Ingress (for example the TLS or\nproxy-protocol annotations your ingress controller expects).",
+                  "type": "object"
+                },
+                "ingressClassName": {
+                  "description": "IngressClassName is the ingress class the Ingress must match\n(spec.ingressClassName). When empty, the Ingress is left without a\nclass so the cluster's default ingress controller picks it up.",
+                  "maxLength": 253,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "labels": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "description": "Labels to add to the Ingress. Operator-managed labels take precedence\non conflict.",
+                  "type": "object"
+                },
+                "tlsSecretName": {
+                  "description": "TLSSecretName is the name of a TLS Secret in the bucket's namespace\n(where the generated Ingress lives), attached to the Ingress\n(spec.tls). The Secret must already exist; the operator does not\nprovision certificates.",
+                  "maxLength": 253,
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "type": "object",
+              "additionalProperties": false
+            }
+          },
+          "type": "object",
+          "additionalProperties": false
         }
       },
       "required": [
@@ -441,10 +611,37 @@
           },
           "type": "array"
         },
+        "managedGlobalAlias": {
+          "description": "ManagedGlobalAlias is the global alias reserved or successfully managed from\nspec.globalAlias (or the bucket name when spec.globalAlias is empty).\nIt is separate from GlobalAlias, which reports observed Garage state, so\naliases created outside the operator are never removed accidentally.",
+          "type": "string"
+        },
         "managedKeyGrants": {
-          "description": "ManagedKeyGrants lists the access key IDs this bucket's spec.keyPermissions\nlast granted access to. Used to revoke grants when a keyRef is dropped\nfrom the spec, without disturbing grants made via a GarageKey's\nbucketPermissions/allBuckets or by hand.",
+          "description": "ManagedKeyGrants lists access key IDs with reserved or active operator\nownership from this bucket's spec.keyPermissions. IDs are recorded before\nthe first remote mutation and removed only after exact convergence, allowing\ncrash-safe revocation when a declaration is dropped without disturbing\ngrants managed through GarageKey or by hand.",
           "items": {
             "type": "string"
+          },
+          "type": "array"
+        },
+        "managedLocalAliases": {
+          "description": "ManagedLocalAliases lists the per-key aliases reserved or successfully\nmanaged from spec.localAliases. IDs are recorded before the first remote\nadd so an interrupted add can still be removed safely.",
+          "items": {
+            "description": "LocalAliasStatus shows the status of a local alias for this bucket",
+            "properties": {
+              "alias": {
+                "description": "Alias is the local alias name",
+                "type": "string"
+              },
+              "keyId": {
+                "description": "KeyID is the access key ID that owns this alias",
+                "type": "string"
+              },
+              "keyName": {
+                "description": "KeyName is the friendly name of the key",
+                "type": "string"
+              }
+            },
+            "type": "object",
+            "additionalProperties": false
           },
           "type": "array"
         },
@@ -452,6 +649,10 @@
           "description": "ObservedGeneration is the last observed generation",
           "format": "int64",
           "type": "integer"
+        },
+        "pendingGlobalAlias": {
+          "description": "PendingGlobalAlias reserves a replacement before its first remote add.\nManagedGlobalAlias retains the old alias until the replacement succeeds,\nso a failed rename never leaves the bucket without its prior alias.",
+          "type": "string"
         },
         "phase": {
           "description": "Phase represents the current phase",
@@ -524,6 +725,63 @@
         "websiteEnabled": {
           "description": "WebsiteEnabled indicates if website hosting is currently enabled",
           "type": "boolean"
+        },
+        "websiteExposure": {
+          "description": "WebsiteExposure reports the operator-generated HTTP routing resource\n(Ingress or HTTPRoute) when spec.websiteExposure is set.",
+          "properties": {
+            "hostnames": {
+              "description": "Hostnames are the hostnames the generated resource routes on.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "name": {
+              "description": "Name is the name of the generated resource, in the bucket's namespace.",
+              "type": "string"
+            },
+            "parents": {
+              "description": "Parents mirrors the route's status.parents for an HTTPRoute: the\nper-parent Accepted/ResolvedRefs/Ready conditions the Gateway\ncontrollers publish. Empty for an Ingress, which has no per-parent\nreadiness model.",
+              "items": {
+                "description": "WebsiteParentStatus is the per-parent readiness of a generated HTTPRoute,\nmirroring gateway.networking.k8s.io/v1 RouteParentStatus conditions.",
+                "properties": {
+                  "accepted": {
+                    "description": "Accepted is true when the parent accepted the route\n(status.parents[].conditions[Accepted]=True).",
+                    "type": "boolean"
+                  },
+                  "message": {
+                    "description": "Message carries the parent's condition message when not ready.",
+                    "type": "string"
+                  },
+                  "parent": {
+                    "description": "Parent is the parent Gateway (or other parent) as namespace/name.",
+                    "type": "string"
+                  },
+                  "ready": {
+                    "description": "Ready is true when the parent reports the route Ready\n(status.parents[].conditions[Ready]=True).",
+                    "type": "boolean"
+                  },
+                  "resolvedRefs": {
+                    "description": "ResolvedRefs is true when the route's backend references resolved on\nthat parent (status.parents[].conditions[ResolvedRefs]=True).",
+                    "type": "boolean"
+                  }
+                },
+                "type": "object",
+                "additionalProperties": false
+              },
+              "type": "array"
+            },
+            "type": {
+              "description": "Type is the kind of routing resource the operator manages for this\nbucket: Ingress or HTTPRoute.",
+              "enum": [
+                "Ingress",
+                "HTTPRoute"
+              ],
+              "type": "string"
+            }
+          },
+          "type": "object",
+          "additionalProperties": false
         },
         "websiteUrl": {
           "description": "WebsiteURL is the computed website URL (if website hosting is enabled)",

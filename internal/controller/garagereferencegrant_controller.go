@@ -18,9 +18,12 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
+	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -43,6 +46,7 @@ type GarageReferenceGrantReconciler struct {
 // +kubebuilder:rbac:groups=garage.rajsingh.info,resources=garagekeys,verbs=list;watch
 // +kubebuilder:rbac:groups=garage.rajsingh.info,resources=garagebuckets,verbs=list;watch
 // +kubebuilder:rbac:groups=garage.rajsingh.info,resources=garageadmintokens,verbs=list;watch
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 
 func (r *GarageReferenceGrantReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
@@ -98,15 +102,62 @@ func (r *GarageReferenceGrantReconciler) Reconcile(ctx context.Context, req ctrl
 
 func (r *GarageReferenceGrantReconciler) findUsers(ctx context.Context, grant *garagev1beta1.GarageReferenceGrant) ([]garagev1beta1.ReferenceGrantUser, error) {
 	var users []garagev1beta1.ReferenceGrantUser
+	type namespaceLabelsResult struct {
+		labels map[string]string
+		found  bool
+	}
+	namespaceLabels := map[string]namespaceLabelsResult{}
+	labelsFor := func(namespace string) (map[string]string, bool, error) {
+		if cached, ok := namespaceLabels[namespace]; ok {
+			return cached.labels, cached.found, nil
+		}
+
+		var sourceNamespace corev1.Namespace
+		if err := r.Get(ctx, client.ObjectKey{Name: namespace}, &sourceNamespace); err != nil {
+			if apierrors.IsNotFound(err) {
+				namespaceLabels[namespace] = namespaceLabelsResult{}
+				return nil, false, nil
+			}
+			return nil, false, fmt.Errorf("get source Namespace %q: %w", namespace, err)
+		}
+		namespaceLabels[namespace] = namespaceLabelsResult{labels: sourceNamespace.Labels, found: true}
+		return sourceNamespace.Labels, true, nil
+	}
+	permits := func(fromKind, fromNamespace, toKind, toName string) (bool, error) {
+		if garagev1beta1.GrantPermits(grant, fromKind, fromNamespace, toKind, toName) {
+			return true, nil
+		}
+		if !grantUsesNamespaceSelector(grant, fromKind) {
+			return false, nil
+		}
+		labels, found, err := labelsFor(fromNamespace)
+		if err != nil || !found {
+			return false, err
+		}
+		return garagev1beta1.GrantPermitsForNamespace(grant, fromKind, fromNamespace, toKind, toName, labels), nil
+	}
+	add := func(kind, name, namespace string, matched *bool) {
+		if *matched {
+			return
+		}
+		users = append(users, garagev1beta1.ReferenceGrantUser{Kind: kind, Name: name, Namespace: namespace})
+		*matched = true
+	}
 
 	var keys garagev1beta1.GarageKeyList
 	if err := r.List(ctx, &keys); err != nil {
 		return nil, err
 	}
 	for _, k := range keys.Items {
+		matched := false
 		if crossNSRefsGrant(&k.Spec.ClusterRef, k.Namespace, grant) {
-			users = append(users, garagev1beta1.ReferenceGrantUser{Kind: "GarageKey", Name: k.Name, Namespace: k.Namespace})
-			continue
+			allowed, err := permits(garageKeyKind, k.Namespace, "GarageCluster", k.Spec.ClusterRef.Name)
+			if err != nil {
+				return nil, err
+			}
+			if allowed {
+				add(garageKeyKind, k.Name, k.Namespace, &matched)
+			}
 		}
 		for _, bp := range k.Spec.BucketPermissions {
 			if bp.BucketRef != nil {
@@ -115,8 +166,14 @@ func (r *GarageReferenceGrantReconciler) findUsers(ctx context.Context, grant *g
 					ns = k.Namespace
 				}
 				if ns == grant.Namespace && k.Namespace != grant.Namespace {
-					users = append(users, garagev1beta1.ReferenceGrantUser{Kind: "GarageKey", Name: k.Name, Namespace: k.Namespace})
-					break
+					allowed, err := permits(garageKeyKind, k.Namespace, "GarageBucket", bp.BucketRef.Name)
+					if err != nil {
+						return nil, err
+					}
+					if allowed {
+						add(garageKeyKind, k.Name, k.Namespace, &matched)
+						break
+					}
 				}
 			}
 		}
@@ -127,8 +184,31 @@ func (r *GarageReferenceGrantReconciler) findUsers(ctx context.Context, grant *g
 		return nil, err
 	}
 	for _, b := range buckets.Items {
+		matched := false
 		if crossNSRefsGrant(&b.Spec.ClusterRef, b.Namespace, grant) {
-			users = append(users, garagev1beta1.ReferenceGrantUser{Kind: "GarageBucket", Name: b.Name, Namespace: b.Namespace})
+			allowed, err := permits("GarageBucket", b.Namespace, "GarageCluster", b.Spec.ClusterRef.Name)
+			if err != nil {
+				return nil, err
+			}
+			if allowed {
+				add("GarageBucket", b.Name, b.Namespace, &matched)
+			}
+		}
+		for _, permission := range b.Spec.KeyPermissions {
+			ns := permission.KeyRef.Namespace
+			if ns == "" {
+				ns = b.Namespace
+			}
+			if ns == grant.Namespace && b.Namespace != grant.Namespace {
+				allowed, err := permits("GarageBucket", b.Namespace, garageKeyKind, permission.KeyRef.Name)
+				if err != nil {
+					return nil, err
+				}
+				if allowed {
+					add("GarageBucket", b.Name, b.Namespace, &matched)
+					break
+				}
+			}
 		}
 	}
 
@@ -138,7 +218,13 @@ func (r *GarageReferenceGrantReconciler) findUsers(ctx context.Context, grant *g
 	}
 	for _, tok := range tokens.Items {
 		if crossNSRefsGrant(&tok.Spec.ClusterRef, tok.Namespace, grant) {
-			users = append(users, garagev1beta1.ReferenceGrantUser{Kind: "GarageAdminToken", Name: tok.Name, Namespace: tok.Namespace})
+			allowed, err := permits(kindGarageAdminToken, tok.Namespace, "GarageCluster", tok.Spec.ClusterRef.Name)
+			if err != nil {
+				return nil, err
+			}
+			if allowed {
+				users = append(users, garagev1beta1.ReferenceGrantUser{Kind: kindGarageAdminToken, Name: tok.Name, Namespace: tok.Namespace})
+			}
 		}
 	}
 
@@ -153,6 +239,43 @@ func (r *GarageReferenceGrantReconciler) findUsers(ctx context.Context, grant *g
 	})
 
 	return users, nil
+}
+
+func grantUsesNamespaceSelector(grant *garagev1beta1.GarageReferenceGrant, fromKind string) bool {
+	for _, from := range grant.Spec.From {
+		if from.Kind == fromKind && from.Namespace == "" && from.NamespaceSelector != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func grantHasNamespaceSelector(grant *garagev1beta1.GarageReferenceGrant) bool {
+	for _, from := range grant.Spec.From {
+		if from.Namespace == "" && from.NamespaceSelector != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// namespaceSelectorGrantRequests returns every grant with a namespace
+// selector. A Namespace label update can add or remove a match, so checking
+// only selectors that match the post-update labels would leave stale inUseBy
+// entries behind.
+func namespaceSelectorGrantRequests(ctx context.Context, c client.Client) []reconcile.Request {
+	var grants garagev1beta1.GarageReferenceGrantList
+	if err := c.List(ctx, &grants); err != nil {
+		return nil
+	}
+	reqs := make([]reconcile.Request, 0, len(grants.Items))
+	for i := range grants.Items {
+		if !grantHasNamespaceSelector(&grants.Items[i]) {
+			continue
+		}
+		reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&grants.Items[i])})
+	}
+	return reqs
 }
 
 // crossNSRefsGrant returns true when the ClusterReference targets the grant's namespace
@@ -199,6 +322,9 @@ func grantTargetNamespaces(obj client.Object) []string {
 		}
 	case *garagev1beta1.GarageBucket:
 		add(o.Spec.ClusterRef.Namespace)
+		for _, permission := range o.Spec.KeyPermissions {
+			add(permission.KeyRef.Namespace)
+		}
 	case *garagev1beta1.GarageAdminToken:
 		add(o.Spec.ClusterRef.Namespace)
 	}
@@ -231,6 +357,9 @@ func (r *GarageReferenceGrantReconciler) SetupWithManager(mgr ctrl.Manager) erro
 		}
 		return reqs
 	}
+	mapNamespaceToSelectorGrants := func(ctx context.Context, _ client.Object) []reconcile.Request {
+		return namespaceSelectorGrantRequests(ctx, mgr.GetClient())
+	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&garagev1beta1.GarageReferenceGrant{}).
@@ -239,6 +368,8 @@ func (r *GarageReferenceGrantReconciler) SetupWithManager(mgr ctrl.Manager) erro
 		Watches(&garagev1beta1.GarageBucket{}, handler.EnqueueRequestsFromMapFunc(mapToGrants),
 			builder.WithPredicates()).
 		Watches(&garagev1beta1.GarageAdminToken{}, handler.EnqueueRequestsFromMapFunc(mapToGrants),
+			builder.WithPredicates()).
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(mapNamespaceToSelectorGrants),
 			builder.WithPredicates()).
 		Complete(r)
 }

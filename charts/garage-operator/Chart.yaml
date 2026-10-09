@@ -2,8 +2,8 @@ apiVersion: v2
 name: garage-operator
 description: A Kubernetes operator for managing Garage distributed S3-compatible object storage
 type: application
-version: 0.6.21
-appVersion: "0.6.21"
+version: 0.8.2
+appVersion: "0.8.2"
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/rajsinghtech/garage-operator
 sources:
@@ -46,9 +46,9 @@ annotations:
       version: v1beta1
       name: garageadmintokens.garage.rajsingh.info
       displayName: Garage Admin Token
-      description: Manages admin API tokens
+      description: Manages static Admin API bootstrap Secret material
     - kind: GarageReferenceGrant
       version: v1beta1
       name: garagereferencegrants.garage.rajsingh.info
       displayName: Garage Reference Grant
-      description: Grants cross-namespace access to GarageCluster and GarageBucket resources
+      description: Grants selected cross-namespace access to GarageCluster, GarageBucket, and GarageKey resources

@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.20.1
+    controller-gen.kubebuilder.io/version: v0.22.0
   name: garagenodes.garage.rajsingh.info
 spec:
   group: garage.rajsingh.info
@@ -27,7 +27,7 @@ spec:
     - jsonPath: .spec.clusterRef.name
       name: Cluster
       type: string
-    - jsonPath: .spec.zone
+    - jsonPath: .status.zone
       name: Zone
       type: string
     - jsonPath: .spec.capacity
@@ -71,9 +71,10 @@ spec:
             description: |-
               GarageNodeSpec defines the desired state of GarageNode.
 
-              GarageNode is only used when the parent GarageCluster has layoutPolicy: Manual.
-              In Manual mode, the cluster StatefulSet is not created — instead, each GarageNode
-              creates its own single-replica StatefulSet with independent storage configuration.
+              A GarageNode represents one durable Garage process identity and layout role.
+              In Manual mode users create GarageNodes directly. Auto-mode default storage,
+              unified gateways, and named node-local pools also use operator-owned GarageNodes
+              internally so every identity follows the same layout and drain lifecycle.
 
               Use Manual layout when you need:
                 - Heterogeneous storage (different size or storage class per node)
@@ -81,8 +82,8 @@ spec:
                 - Fine-grained zone assignment within a cluster
                 - External nodes (VMs, bare metal, or nodes in another K8s cluster)
 
-              For uniform clusters, prefer layoutPolicy: Auto — the operator handles everything
-              without creating GarageNode resources.
+              For a uniform default PVC group, prefer layoutPolicy: Auto — the operator creates
+              and manages the GarageNode resources.
 
               Pod configuration fields are inherited from the parent GarageCluster and can be
               overridden per-node. Fields not specified here fall through to the cluster default.
@@ -1001,6 +1002,18 @@ spec:
                         x-kubernetes-list-type: atomic
                     type: object
                 type: object
+              backing:
+                description: |-
+                  Backing selects the workload that backs this node's pod.
+                  StatefulSet (default when empty): this GarageNode owns a single-replica
+                  StatefulSet. NodeLocalPool: the pod comes from a cluster-owned node-local workload
+                  in spec.storage.nodeLocalPools — no StatefulSet, ConfigMap, or Service is
+                  created by this GarageNode; it only manages the Garage layout role for the
+                  Kubernetes Node and membership set named below. Immutable after creation.
+                enum:
+                - StatefulSet
+                - NodeLocalPool
+                type: string
               capacity:
                 anyOf:
                 - type: integer
@@ -1017,9 +1030,8 @@ spec:
                 properties:
                   kubeConfigSecretRef:
                     description: |-
-                      KubeConfigSecretRef references a secret containing a kubeconfig for a remote Kubernetes cluster.
-                      Only needed for multi-cluster federation where the GarageCluster lives in a different
-                      Kubernetes cluster entirely (not just a different namespace).
+                      KubeConfigSecretRef is reserved for a future remote Kubernetes client integration.
+                      It is currently rejected by admission because the operator does not use it.
                     properties:
                       key:
                         description: The key of the secret to select from.  Must be
@@ -1048,8 +1060,8 @@ spec:
                   namespace:
                     description: |-
                       Namespace of the GarageCluster. Defaults to the referencing resource's namespace.
-                      Cross-namespace references require a GarageReferenceGrant in the target namespace.
-                      Not supported on GarageNode.
+                      Cross-namespace references require a GarageReferenceGrant where supported by
+                      the owning resource. GarageNode and GarageAdminToken reject them.
                     type: string
                 required:
                 - name
@@ -1249,7 +1261,10 @@ spec:
                 description: |-
                   Env overrides environment variables for this node's container. Merged with
                   cluster-level env (from spec.storage.env or spec.gateway.env, depending on
-                  tier); per-node entries take precedence on key collision.
+                  tier); per-node entries take precedence on ordinary key collisions.
+                  Garage config-path and RPC/Admin/metrics credential variables are
+                  operator-reserved because drain safety and mesh identity rely on the
+                  rendered config and pinned immutable Secrets.
                 items:
                   description: EnvVar represents an environment variable present in
                     a Container.
@@ -1279,7 +1294,9 @@ spec:
                           description: Selects a key of a ConfigMap.
                           properties:
                             key:
-                              description: The key to select.
+                              description: |-
+                                The key to select from the ConfigMap's Data field.
+                                Keys in the BinaryData field are not currently propagated to container env vars.
                               type: string
                             name:
                               default: ""
@@ -1408,7 +1425,8 @@ spec:
               envFrom:
                 description: |-
                   EnvFrom overrides envFrom sources for this node's container. Replaces (does
-                  not merge) the cluster-level envFrom when set.
+                  not merge) the cluster-level envFrom when set. A source prefix must not be
+                  capable of injecting an operator-reserved Garage variable.
                 items:
                   description: EnvFromSource represents the source of a set of ConfigMaps
                     or Secrets
@@ -1471,14 +1489,15 @@ spec:
                     minimum: 1
                     type: integer
                   remoteClusterRef:
-                    description: RemoteClusterRef references a GarageCluster in another
-                      namespace/cluster
+                    description: |-
+                      RemoteClusterRef is retained for API compatibility but is not supported.
+                      Setting it is rejected because the operator has no remote-cluster client
+                      integration for GarageNode reconciliation.
                     properties:
                       kubeConfigSecretRef:
                         description: |-
-                          KubeConfigSecretRef references a secret containing a kubeconfig for a remote Kubernetes cluster.
-                          Only needed for multi-cluster federation where the GarageCluster lives in a different
-                          Kubernetes cluster entirely (not just a different namespace).
+                          KubeConfigSecretRef is reserved for a future remote Kubernetes client integration.
+                          It is currently rejected by admission because the operator does not use it.
                         properties:
                           key:
                             description: The key of the secret to select from.  Must
@@ -1507,8 +1526,8 @@ spec:
                       namespace:
                         description: |-
                           Namespace of the GarageCluster. Defaults to the referencing resource's namespace.
-                          Cross-namespace references require a GarageReferenceGrant in the target namespace.
-                          Not supported on GarageNode.
+                          Cross-namespace references require a GarageReferenceGrant where supported by
+                          the owning resource. GarageNode and GarageAdminToken reject them.
                         type: string
                     required:
                     - name
@@ -1516,10 +1535,74 @@ spec:
                 required:
                 - address
                 type: object
+              extraContainers:
+                description: |-
+                  ExtraContainers run beside the Garage container in the same pod and network
+                  namespace. They cannot mount operator-owned volumes.
+                items:
+                  description: |-
+                    PodExtraContainer is one user-supplied container. The CRD schema declares
+                    only name and preserves all other fields; the complete object is validated
+                    by the admission webhook and re-validated by the controller by strictly
+                    decoding it into a corev1.Container (Resolve). This keeps the CRD small:
+                    a fully typed corev1.Container would add ~120 KB per occurrence.
+                  properties:
+                    name:
+                      description: |-
+                        Name of the container. It must be unique across initContainers and
+                        extraContainers, a DNS-1123 label, and not an operator-reserved name.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                  required:
+                  - name
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: container name is operator-reserved
+                  rule: self.all(c, c.name != 'garage' && c.name != 'purge-cluster-layout'
+                    && !c.name.startsWith('garage-operator-'))
+              extraVolumes:
+                description: |-
+                  ExtraVolumes are added to the pod. Operator-owned volume names are reserved
+                  (config, metadata, data, data-<N>, rpc-secret, admin-token, metrics-token).
+                items:
+                  description: |-
+                    PodExtraVolume is one user-supplied pod volume; same contract as
+                    PodExtraContainer, resolved as a corev1.Volume.
+                  properties:
+                    name:
+                      description: |-
+                        Name of the volume. It must be unique across extraVolumes, a DNS-1123
+                        label, and not an operator-reserved volume name.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                  required:
+                  - name
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                maxItems: 32
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: volume name is operator-reserved
+                  rule: self.all(v, !(v.name in ['config','metadata','data','rpc-secret','admin-token','metrics-token'])
+                    && !v.name.matches('^data-[0-9]+$'))
               gateway:
                 description: |-
                   Gateway marks this node as a gateway-only node (no storage).
-                  Gateway nodes handle API requests but don't store data blocks.
+                  Gateway nodes handle API requests but don't store data blocks. Immutable:
+                  delete and drain the old identity before changing its storage tier.
                 type: boolean
               image:
                 description: |-
@@ -1562,6 +1645,48 @@ spec:
                   If not specified, inherits from GarageCluster.
                   Ignored if image is set.
                 type: string
+              initContainers:
+                description: |-
+                  InitContainers run before the Garage container, after any operator-injected
+                  init containers. Entries with restartPolicy: Always are native sidecars
+                  (Kubernetes 1.29+ beta, GA in 1.33). Names garage, purge-cluster-layout and
+                  the prefix garage-operator- are reserved.
+                items:
+                  description: |-
+                    PodExtraContainer is one user-supplied container. The CRD schema declares
+                    only name and preserves all other fields; the complete object is validated
+                    by the admission webhook and re-validated by the controller by strictly
+                    decoding it into a corev1.Container (Resolve). This keeps the CRD small:
+                    a fully typed corev1.Container would add ~120 KB per occurrence.
+                  properties:
+                    name:
+                      description: |-
+                        Name of the container. It must be unique across initContainers and
+                        extraContainers, a DNS-1123 label, and not an operator-reserved name.
+                      maxLength: 63
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                      type: string
+                  required:
+                  - name
+                  type: object
+                  x-kubernetes-preserve-unknown-fields: true
+                maxItems: 16
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: container name is operator-reserved
+                  rule: self.all(c, c.name != 'garage' && c.name != 'purge-cluster-layout'
+                    && !c.name.startsWith('garage-operator-'))
+              kubernetesNodeName:
+                description: |-
+                  KubernetesNodeName is the name of the Kubernetes node this GarageNode
+                  represents. Required when backing is NodeLocalPool: node_id discovery
+                  selects the managed node-local-pool Pod scheduled on this Kubernetes node.
+                  Immutable for node-local-pool-backed GarageNodes.
+                type: string
               logging:
                 description: |-
                   Logging overrides cluster-level spec.logging for this node. A non-nil field
@@ -1598,13 +1723,25 @@ spec:
                       Overrides the cluster-level network.rpcPublicAddr for this specific node.
                       When publicEndpoint is also set to LoadBalancer and this is empty, the operator
                       derives rpc_public_addr from the assigned LoadBalancer ingress IP automatically.
+                      On a node-local-pool-backed node it is published only in the replicated layout
+                      tags; the shared DaemonSet ConfigMap cannot carry per-node settings.
                     type: string
                 type: object
               nodeId:
                 description: |-
-                  NodeID is the public key of the Garage node.
-                  If not specified, the operator will auto-discover from the pod.
+                  NodeID is the public key of the Garage node. For an external node it is
+                  authoritative because there is no managed Pod. For a managed node it is
+                  only an expected identity pin: before any layout or status mutation the
+                  operator directly queries the exact owned Pod and requires equality. If
+                  omitted, the operator discovers the identity from that Pod.
                 pattern: ^[a-fA-F0-9]{64}$
+                type: string
+              nodeLocalPoolName:
+                description: |-
+                  NodeLocalPoolName is the name of the parent GarageCluster's
+                  spec.storage.nodeLocalPools entry that owns this node. Required and
+                  immutable when backing is NodeLocalPool; omitted for StatefulSet-backed and
+                  external GarageNodes.
                 type: string
               nodeSelector:
                 additionalProperties:
@@ -1640,17 +1777,20 @@ spec:
                   assigned ingress IP automatically.
                 properties:
                   externalIP:
-                    description: ExternalIP configuration
+                    description: |-
+                      ExternalIP is retained for API compatibility but is not supported.
+                      Setting it is rejected because the operator does not consume the explicit
+                      address mapping or template.
                     properties:
                       addressTemplate:
-                        description: |-
-                          AddressTemplate uses go template to generate addresses from pod info
-                          Example: "garage-{{.Index}}.example.com"
+                        description: AddressTemplate is retained for API compatibility
+                          but is unsupported.
                         type: string
                       addresses:
                         additionalProperties:
                           type: string
-                        description: Addresses maps pod names to external IPs
+                        description: Addresses is retained for API compatibility but
+                          is unsupported.
                         type: object
                     type: object
                   loadBalancer:
@@ -1879,11 +2019,8 @@ spec:
                       Eligible volumes are in-tree FibreChannel and iSCSI volumes, and all CSI volumes
                       whose CSI driver announces SELinux support by setting spec.seLinuxMount: true in their
                       CSIDriver instance. Other volumes are always re-labelled recursively.
-                      "MountOption" value is allowed only when SELinuxMount feature gate is enabled.
 
-                      If not specified and SELinuxMount feature gate is enabled, "MountOption" is used.
-                      If not specified and SELinuxMount feature gate is disabled, "MountOption" is used for ReadWriteOncePod volumes
-                      and "Recursive" for all other volumes.
+                      If not specified, "MountOption" is used.
 
                       This field affects only Pods that have SELinux label set, either in PodSecurityContext or in SecurityContext of all containers.
 
@@ -2039,10 +2176,51 @@ spec:
                         items:
                           type: string
                         type: array
+                      annotations:
+                        additionalProperties:
+                          type: string
+                        description: Annotations to set on dynamically provisioned
+                          PVCs.
+                        type: object
+                      dataSourceRef:
+                        description: |-
+                          DataSourceRef is the opt-in restore source for this node's newly created PVC.
+                          Auto-generated nodes inherit the parent volume's source. Manual nodes may set
+                          it on a new claim; it cannot be combined with existingClaim.
+                        properties:
+                          apiGroup:
+                            description: |-
+                              APIGroup is the group for the resource being referenced.
+                              If APIGroup is not specified, the specified Kind must be in the core API group.
+                              For any other third-party types, APIGroup is required.
+                            type: string
+                          kind:
+                            description: Kind is the type of resource being referenced
+                            type: string
+                          name:
+                            description: Name is the name of resource being referenced
+                            type: string
+                          namespace:
+                            description: |-
+                              Namespace is the namespace of resource being referenced
+                              Note that when a namespace is specified, a gateway.networking.k8s.io/ReferenceGrant object is required in the referent namespace to allow that namespace's owner to accept the reference. See the ReferenceGrant documentation for details.
+                              (Alpha) This field requires the CrossNamespaceVolumeDataSource feature gate to be enabled.
+                            type: string
+                        required:
+                        - kind
+                        - name
+                        type: object
                       existingClaim:
-                        description: ExistingClaim references a pre-existing PVC by
-                          name in the cluster namespace.
+                        description: |-
+                          ExistingClaim references a pre-existing PVC by name in the cluster namespace.
+                          GarageNode cycle automation never reuses or infers a replacement from this
+                          claim; create a distinct replacement GarageNode and drain this identity.
                         type: string
+                      labels:
+                        additionalProperties:
+                          type: string
+                        description: Labels to set on dynamically provisioned PVCs.
+                        type: object
                       path:
                         description: |-
                           Path is the in-container mount path for this volume. Only honored on
@@ -2058,8 +2236,60 @@ spec:
                         description: |-
                           ReadOnly marks the entry as a legacy read-only path on multi-HDD
                           `storage.dataPaths[]`. Renders as garage.toml `read_only = true`;
-                          no `capacity` is emitted. Ignored on `storage.{metadata,data}`.
+                          no `capacity` is emitted. New use on `storage.{metadata,data}` is rejected;
+                          unchanged released objects are tolerated only for cleanup and migration.
                         type: boolean
+                      selector:
+                        description: |-
+                          Selector matches pre-provisioned PersistentVolumes for a newly created
+                          claim. Kubernetes does not dynamically provision a PV when this is set;
+                          StorageClassName must also match the target PV. It is immutable for a live
+                          GarageNode because changing an already bound claim cannot move the durable
+                          node_key or block data safely.
+                        properties:
+                          matchExpressions:
+                            description: matchExpressions is a list of label selector
+                              requirements. The requirements are ANDed.
+                            items:
+                              description: |-
+                                A label selector requirement is a selector that contains values, a key, and an operator that
+                                relates the key and values.
+                              properties:
+                                key:
+                                  description: key is the label key that the selector
+                                    applies to.
+                                  type: string
+                                operator:
+                                  description: |-
+                                    operator represents a key's relationship to a set of values.
+                                    Valid operators are In, NotIn, Exists and DoesNotExist.
+                                  type: string
+                                values:
+                                  description: |-
+                                    values is an array of string values. If the operator is In or NotIn,
+                                    the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                    the values array must be empty. This array is replaced during a strategic
+                                    merge patch.
+                                  items:
+                                    type: string
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                              required:
+                              - key
+                              - operator
+                              type: object
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          matchLabels:
+                            additionalProperties:
+                              type: string
+                            description: |-
+                              matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                              map is equivalent to an element of matchExpressions, whose key field is "key", the
+                              operator is "In", and the values array contains only "value". The requirements are ANDed.
+                            type: object
+                        type: object
+                        x-kubernetes-map-type: atomic
                       size:
                         anyOf:
                         - type: integer
@@ -2083,7 +2313,32 @@ spec:
                         - PersistentVolumeClaim
                         - EmptyDir
                         type: string
+                      volumeAttributesClassName:
+                        description: |-
+                          VolumeAttributesClassName is the name of a cluster-scoped Kubernetes
+                          VolumeAttributesClass applied to every PVC generated for this volume role.
+                          The class's driver must match the StorageClass provisioner; the operator
+                          does not check that or whether the class exists. Valid only for
+                          PersistentVolumeClaim volumes. Unlike storageClassName it may be changed
+                          while replicas are live: the operator updates bound claims in place, which
+                          asks the CSI driver to modify the volume. Requires Kubernetes 1.34+ (or
+                          1.31-1.33 with the VolumeAttributesClass feature enabled) and a driver that
+                          supports ModifyVolume. Removing a configured value from a live volume is
+                          rejected.
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
                     type: object
+                    x-kubernetes-validations:
+                    - message: volumeAttributesClassName is only valid for PersistentVolumeClaim
+                        volumes
+                      rule: '!has(self.volumeAttributesClassName) || !has(self.type)
+                        || self.type != ''EmptyDir'''
+                    - message: 'volumeAttributesClassName cannot be combined with
+                        existingClaim: the referenced claim is user-managed'
+                      rule: '!has(self.volumeAttributesClassName) || !has(self.existingClaim)
+                        || size(self.existingClaim) == 0'
                   dataFsync:
                     description: |-
                       DataFsync enables fsync on data block writes for this node.
@@ -2099,7 +2354,8 @@ spec:
                       description: |-
                         NodeVolumeConfig defines the source of a storage volume for a GarageNode.
                         Parallel to GarageCluster's VolumeConfig, extended with existingClaim for
-                        pre-provisioned PVCs. Either ExistingClaim or Size must be specified.
+                        pre-provisioned PVCs. A volume must name an ExistingClaim, request a Size,
+                        or explicitly use EmptyDir; ReadOnly alone is not a Kubernetes volume source.
 
                         ExistingClaim and Size may also be set together inside a multi-HDD
                         `storage.dataPaths[]` entry — there ExistingClaim binds the PVC and Size
@@ -2114,10 +2370,51 @@ spec:
                           items:
                             type: string
                           type: array
+                        annotations:
+                          additionalProperties:
+                            type: string
+                          description: Annotations to set on dynamically provisioned
+                            PVCs.
+                          type: object
+                        dataSourceRef:
+                          description: |-
+                            DataSourceRef is the opt-in restore source for this node's newly created PVC.
+                            Auto-generated nodes inherit the parent volume's source. Manual nodes may set
+                            it on a new claim; it cannot be combined with existingClaim.
+                          properties:
+                            apiGroup:
+                              description: |-
+                                APIGroup is the group for the resource being referenced.
+                                If APIGroup is not specified, the specified Kind must be in the core API group.
+                                For any other third-party types, APIGroup is required.
+                              type: string
+                            kind:
+                              description: Kind is the type of resource being referenced
+                              type: string
+                            name:
+                              description: Name is the name of resource being referenced
+                              type: string
+                            namespace:
+                              description: |-
+                                Namespace is the namespace of resource being referenced
+                                Note that when a namespace is specified, a gateway.networking.k8s.io/ReferenceGrant object is required in the referent namespace to allow that namespace's owner to accept the reference. See the ReferenceGrant documentation for details.
+                                (Alpha) This field requires the CrossNamespaceVolumeDataSource feature gate to be enabled.
+                              type: string
+                          required:
+                          - kind
+                          - name
+                          type: object
                         existingClaim:
-                          description: ExistingClaim references a pre-existing PVC
-                            by name in the cluster namespace.
+                          description: |-
+                            ExistingClaim references a pre-existing PVC by name in the cluster namespace.
+                            GarageNode cycle automation never reuses or infers a replacement from this
+                            claim; create a distinct replacement GarageNode and drain this identity.
                           type: string
+                        labels:
+                          additionalProperties:
+                            type: string
+                          description: Labels to set on dynamically provisioned PVCs.
+                          type: object
                         path:
                           description: |-
                             Path is the in-container mount path for this volume. Only honored on
@@ -2133,8 +2430,60 @@ spec:
                           description: |-
                             ReadOnly marks the entry as a legacy read-only path on multi-HDD
                             `storage.dataPaths[]`. Renders as garage.toml `read_only = true`;
-                            no `capacity` is emitted. Ignored on `storage.{metadata,data}`.
+                            no `capacity` is emitted. New use on `storage.{metadata,data}` is rejected;
+                            unchanged released objects are tolerated only for cleanup and migration.
                           type: boolean
+                        selector:
+                          description: |-
+                            Selector matches pre-provisioned PersistentVolumes for a newly created
+                            claim. Kubernetes does not dynamically provision a PV when this is set;
+                            StorageClassName must also match the target PV. It is immutable for a live
+                            GarageNode because changing an already bound claim cannot move the durable
+                            node_key or block data safely.
+                          properties:
+                            matchExpressions:
+                              description: matchExpressions is a list of label selector
+                                requirements. The requirements are ANDed.
+                              items:
+                                description: |-
+                                  A label selector requirement is a selector that contains values, a key, and an operator that
+                                  relates the key and values.
+                                properties:
+                                  key:
+                                    description: key is the label key that the selector
+                                      applies to.
+                                    type: string
+                                  operator:
+                                    description: |-
+                                      operator represents a key's relationship to a set of values.
+                                      Valid operators are In, NotIn, Exists and DoesNotExist.
+                                    type: string
+                                  values:
+                                    description: |-
+                                      values is an array of string values. If the operator is In or NotIn,
+                                      the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                      the values array must be empty. This array is replaced during a strategic
+                                      merge patch.
+                                    items:
+                                      type: string
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - key
+                                - operator
+                                type: object
+                              type: array
+                              x-kubernetes-list-type: atomic
+                            matchLabels:
+                              additionalProperties:
+                                type: string
+                              description: |-
+                                matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                operator is "In", and the values array contains only "value". The requirements are ANDed.
+                              type: object
+                          type: object
+                          x-kubernetes-map-type: atomic
                         size:
                           anyOf:
                           - type: integer
@@ -2158,7 +2507,32 @@ spec:
                           - PersistentVolumeClaim
                           - EmptyDir
                           type: string
+                        volumeAttributesClassName:
+                          description: |-
+                            VolumeAttributesClassName is the name of a cluster-scoped Kubernetes
+                            VolumeAttributesClass applied to every PVC generated for this volume role.
+                            The class's driver must match the StorageClass provisioner; the operator
+                            does not check that or whether the class exists. Valid only for
+                            PersistentVolumeClaim volumes. Unlike storageClassName it may be changed
+                            while replicas are live: the operator updates bound claims in place, which
+                            asks the CSI driver to modify the volume. Requires Kubernetes 1.34+ (or
+                            1.31-1.33 with the VolumeAttributesClass feature enabled) and a driver that
+                            supports ModifyVolume. Removing a configured value from a live volume is
+                            rejected.
+                          maxLength: 253
+                          minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                          type: string
                       type: object
+                      x-kubernetes-validations:
+                      - message: volumeAttributesClassName is only valid for PersistentVolumeClaim
+                          volumes
+                        rule: '!has(self.volumeAttributesClassName) || !has(self.type)
+                          || self.type != ''EmptyDir'''
+                      - message: 'volumeAttributesClassName cannot be combined with
+                          existingClaim: the referenced claim is user-managed'
+                        rule: '!has(self.volumeAttributesClassName) || !has(self.existingClaim)
+                          || size(self.existingClaim) == 0'
                     type: array
                   metadata:
                     description: Metadata volume for node identity and cluster state.
@@ -2170,10 +2544,51 @@ spec:
                         items:
                           type: string
                         type: array
+                      annotations:
+                        additionalProperties:
+                          type: string
+                        description: Annotations to set on dynamically provisioned
+                          PVCs.
+                        type: object
+                      dataSourceRef:
+                        description: |-
+                          DataSourceRef is the opt-in restore source for this node's newly created PVC.
+                          Auto-generated nodes inherit the parent volume's source. Manual nodes may set
+                          it on a new claim; it cannot be combined with existingClaim.
+                        properties:
+                          apiGroup:
+                            description: |-
+                              APIGroup is the group for the resource being referenced.
+                              If APIGroup is not specified, the specified Kind must be in the core API group.
+                              For any other third-party types, APIGroup is required.
+                            type: string
+                          kind:
+                            description: Kind is the type of resource being referenced
+                            type: string
+                          name:
+                            description: Name is the name of resource being referenced
+                            type: string
+                          namespace:
+                            description: |-
+                              Namespace is the namespace of resource being referenced
+                              Note that when a namespace is specified, a gateway.networking.k8s.io/ReferenceGrant object is required in the referent namespace to allow that namespace's owner to accept the reference. See the ReferenceGrant documentation for details.
+                              (Alpha) This field requires the CrossNamespaceVolumeDataSource feature gate to be enabled.
+                            type: string
+                        required:
+                        - kind
+                        - name
+                        type: object
                       existingClaim:
-                        description: ExistingClaim references a pre-existing PVC by
-                          name in the cluster namespace.
+                        description: |-
+                          ExistingClaim references a pre-existing PVC by name in the cluster namespace.
+                          GarageNode cycle automation never reuses or infers a replacement from this
+                          claim; create a distinct replacement GarageNode and drain this identity.
                         type: string
+                      labels:
+                        additionalProperties:
+                          type: string
+                        description: Labels to set on dynamically provisioned PVCs.
+                        type: object
                       path:
                         description: |-
                           Path is the in-container mount path for this volume. Only honored on
@@ -2189,8 +2604,60 @@ spec:
                         description: |-
                           ReadOnly marks the entry as a legacy read-only path on multi-HDD
                           `storage.dataPaths[]`. Renders as garage.toml `read_only = true`;
-                          no `capacity` is emitted. Ignored on `storage.{metadata,data}`.
+                          no `capacity` is emitted. New use on `storage.{metadata,data}` is rejected;
+                          unchanged released objects are tolerated only for cleanup and migration.
                         type: boolean
+                      selector:
+                        description: |-
+                          Selector matches pre-provisioned PersistentVolumes for a newly created
+                          claim. Kubernetes does not dynamically provision a PV when this is set;
+                          StorageClassName must also match the target PV. It is immutable for a live
+                          GarageNode because changing an already bound claim cannot move the durable
+                          node_key or block data safely.
+                        properties:
+                          matchExpressions:
+                            description: matchExpressions is a list of label selector
+                              requirements. The requirements are ANDed.
+                            items:
+                              description: |-
+                                A label selector requirement is a selector that contains values, a key, and an operator that
+                                relates the key and values.
+                              properties:
+                                key:
+                                  description: key is the label key that the selector
+                                    applies to.
+                                  type: string
+                                operator:
+                                  description: |-
+                                    operator represents a key's relationship to a set of values.
+                                    Valid operators are In, NotIn, Exists and DoesNotExist.
+                                  type: string
+                                values:
+                                  description: |-
+                                    values is an array of string values. If the operator is In or NotIn,
+                                    the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                    the values array must be empty. This array is replaced during a strategic
+                                    merge patch.
+                                  items:
+                                    type: string
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                              required:
+                              - key
+                              - operator
+                              type: object
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          matchLabels:
+                            additionalProperties:
+                              type: string
+                            description: |-
+                              matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                              map is equivalent to an element of matchExpressions, whose key field is "key", the
+                              operator is "In", and the values array contains only "value". The requirements are ANDed.
+                            type: object
+                        type: object
+                        x-kubernetes-map-type: atomic
                       size:
                         anyOf:
                         - type: integer
@@ -2214,7 +2681,32 @@ spec:
                         - PersistentVolumeClaim
                         - EmptyDir
                         type: string
+                      volumeAttributesClassName:
+                        description: |-
+                          VolumeAttributesClassName is the name of a cluster-scoped Kubernetes
+                          VolumeAttributesClass applied to every PVC generated for this volume role.
+                          The class's driver must match the StorageClass provisioner; the operator
+                          does not check that or whether the class exists. Valid only for
+                          PersistentVolumeClaim volumes. Unlike storageClassName it may be changed
+                          while replicas are live: the operator updates bound claims in place, which
+                          asks the CSI driver to modify the volume. Requires Kubernetes 1.34+ (or
+                          1.31-1.33 with the VolumeAttributesClass feature enabled) and a driver that
+                          supports ModifyVolume. Removing a configured value from a live volume is
+                          rejected.
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
                     type: object
+                    x-kubernetes-validations:
+                    - message: volumeAttributesClassName is only valid for PersistentVolumeClaim
+                        volumes
+                      rule: '!has(self.volumeAttributesClassName) || !has(self.type)
+                        || self.type != ''EmptyDir'''
+                    - message: 'volumeAttributesClassName cannot be combined with
+                        existingClaim: the referenced claim is user-managed'
+                      rule: '!has(self.volumeAttributesClassName) || !has(self.existingClaim)
+                        || size(self.existingClaim) == 0'
                   metadataAutoSnapshotInterval:
                     description: |-
                       MetadataAutoSnapshotInterval overrides the cluster-level
@@ -2465,6 +2957,30 @@ spec:
                   Zone is the zone assignment for this node.
                   Used for data placement and fault tolerance.
                 type: string
+              zoneFrom:
+                description: |-
+                  ZoneFrom derives the layout zone from a label on the Kubernetes Node this
+                  node's pod is scheduled to, instead of using the static Zone above. Zone
+                  stays required and is the fallback before the pod is scheduled or when the
+                  readable Node does not carry the label. If the operator cannot read the
+                  required Kubernetes Node, reconciliation fails closed; it does not silently
+                  substitute Zone. Cluster-scoped installation is required.
+
+                  The resolved value is reported as status.zone.
+
+                  Not valid on external nodes — there is no pod, so there is no Kubernetes
+                  Node to read a label from.
+                properties:
+                  nodeLabel:
+                    description: |-
+                      NodeLabel is the label key on the Kubernetes Node whose value becomes the
+                      Garage layout zone.
+                    maxLength: 316
+                    minLength: 1
+                    type: string
+                required:
+                - nodeLabel
+                type: object
             required:
             - clusterRef
             - zone
@@ -2472,6 +2988,10 @@ spec:
             x-kubernetes-validations:
             - message: capacity is required for non-gateway managed nodes
               rule: self.gateway || has(self.external) || has(self.capacity)
+            - message: initContainers and extraContainers names must be unique across
+                both lists
+              rule: '!has(self.initContainers) || !has(self.extraContainers) || !self.initContainers.exists(i,
+                self.extraContainers.exists(e, e.name == i.name))'
           status:
             description: GarageNodeStatus defines the observed state of GarageNode
             properties:
@@ -2479,8 +2999,9 @@ spec:
                 description: Address is the node's address in the cluster
                 type: string
               blockErrors:
-                description: BlockErrors is the count of blocks with sync errors on
-                  this node
+                description: |-
+                  BlockErrors is retained for API compatibility but is not currently populated;
+                  Garage's node-status API does not expose a per-node block error count.
                 format: int32
                 type: integer
               clusterAdminEndpoint:
@@ -2601,8 +3122,9 @@ spec:
                 type: string
               cycleSiblingNodeId:
                 description: |-
-                  CycleSiblingNodeID is the discovered Garage node ID of the cycle sibling,
-                  used to check its layout sync tracker before this node is removed.
+                  CycleSiblingNodeID is the exact discovered Garage node ID of the cycle
+                  sibling. It binds later promotion to the identity that was admitted into the
+                  settled layout and the source's durable drain destination proof.
                 type: string
               dataPartition:
                 description: |-
@@ -2630,12 +3152,14 @@ spec:
                     type: integer
                 type: object
               dbEngine:
-                description: DBEngine is the database engine used by this node (lmdb,
-                  sqlite, fjall)
+                description: |-
+                  DBEngine is retained for API compatibility but is not currently populated;
+                  Garage's node-status API does not report the active database engine.
                 type: string
               garageFeatures:
-                description: GarageFeatures lists the enabled Cargo features on this
-                  node
+                description: |-
+                  GarageFeatures is retained for API compatibility but is not currently
+                  populated because Garage's node-status API does not report build features.
                 items:
                   type: string
                 type: array
@@ -2655,6 +3179,47 @@ spec:
                   added
                 format: int64
                 type: integer
+              managedPVCs:
+                description: |-
+                  ManagedPVCs records convention-named PVC reservations made by this
+                  controller. A pending entry contains only a one-way nonce commitment; a
+                  bound entry contains the exact server-assigned UID. Names and public
+                  annotations are not ownership proof. Legacy claims are pinned here once
+                  while their exact live StatefulSet and Pod still prove continuity.
+                items:
+                  description: |-
+                    ManagedNodePVCStatus is the controller-owned identity reservation for one
+                    convention-named GarageNode PVC.
+                  properties:
+                    name:
+                      description: Name is the exact PersistentVolumeClaim name.
+                      type: string
+                    pendingReservationHash:
+                      description: |-
+                        PendingReservationHash is a SHA-256 commitment to a cryptographically
+                        random nonce stamped on a PVC before its UID can be observed. It closes
+                        the create/status-update crash window without making the public status
+                        value sufficient to forge a controller reservation.
+                        Exactly one of UID and PendingReservationHash is set.
+                      pattern: ^[a-f0-9]{64}$
+                      type: string
+                    uid:
+                      description: |-
+                        UID is the immutable API-server identity observed when the claim was
+                        created or safely migrated.
+                        Exactly one of UID and PendingReservationHash is set.
+                      type: string
+                  required:
+                  - name
+                  type: object
+                  x-kubernetes-validations:
+                  - message: exactly one of uid and pendingReservationHash must be
+                      set
+                    rule: has(self.uid) != has(self.pendingReservationHash)
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               metadataPartition:
                 description: MetadataPartition contains disk space info for the metadata
                   partition
@@ -2686,6 +3251,23 @@ spec:
                 description: ObservedGeneration is the last observed generation
                 format: int64
                 type: integer
+              observedPodUid:
+                description: |-
+                  ObservedPodUID is the UID of the workload pod whose Garage identity was
+                  directly observed. The operator persists it with the first authenticated
+                  NodeID and refreshes it with status so a replacement pod cannot inherit
+                  stale identity, connectivity, or layout evidence from its predecessor.
+                type: string
+              parentDeletionRequestGeneration:
+                description: |-
+                  ParentDeletionRequestGeneration is a controller-owned handoff from the
+                  GarageCluster reconciler. A non-zero value means that parent generation
+                  still intends to delete this GarageNode after reversible drain preparation.
+                  Binding the request to the parent generation makes a spec change cancel the
+                  request before any role is removed. A user-set drain annotation never sets
+                  this field and therefore remains prepare-only.
+                format: int64
+                type: integer
               partitions:
                 description: Partitions is the number of partitions assigned to this
                   node
@@ -2704,19 +3286,25 @@ spec:
                 - Unknown
                 type: string
               repairInProgress:
-                description: RepairInProgress indicates if a repair operation is running
+                description: |-
+                  RepairInProgress is retained for API compatibility but is not currently
+                  populated because Garage's Admin API exposes no per-node repair status.
                 type: boolean
               repairProgress:
-                description: RepairProgress is a human-readable repair progress description
+                description: RepairProgress is retained for API compatibility but
+                  is not currently populated.
                 type: string
               repairType:
-                description: RepairType is the type of repair operation in progress
+                description: RepairType is retained for API compatibility but is not
+                  currently populated.
                 type: string
               storedData:
                 anyOf:
                 - type: integer
                 - type: string
-                description: StoredData is the amount of data stored on this node
+                description: |-
+                  StoredData is retained for API compatibility but is not currently populated;
+                  Garage reports assigned partitions and disk free space, not per-node stored bytes.
                 pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                 x-kubernetes-int-or-string: true
               tags:
@@ -2726,6 +3314,12 @@ spec:
                 type: array
               version:
                 description: Version is the Garage version on this node
+                type: string
+              zone:
+                description: |-
+                  Zone is the layout zone actually assigned to this node. Equal to
+                  spec.zone unless spec.zoneFrom resolved a different value from the
+                  Kubernetes Node the pod is scheduled to.
                 type: string
             type: object
         required:

@@ -17,44 +17,261 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"fmt"
+	"maps"
+	"reflect"
+	"sort"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
 
+func testConfigMapForBase(
+	ctx context.Context,
+	c client.Client,
+	namespace,
+	baseName string,
+) (*corev1.ConfigMap, error) {
+	return testConfigMapForBaseMatching(ctx, c, namespace, baseName, func(*corev1.ConfigMap) bool { return true })
+}
+
+func testConfigMapForBaseMatching(
+	ctx context.Context,
+	c client.Client,
+	namespace,
+	baseName string,
+	matchesContent func(*corev1.ConfigMap) bool,
+) (*corev1.ConfigMap, error) {
+	list := &corev1.ConfigMapList{}
+	if err := c.List(ctx, list, client.InNamespace(namespace)); err != nil {
+		return nil, err
+	}
+	matches := make([]corev1.ConfigMap, 0, 1)
+	for i := range list.Items {
+		item := &list.Items[i]
+		if item.DeletionTimestamp.IsZero() && item.Annotations[annotationGarageConfigBaseName] == baseName && matchesContent(item) {
+			matches = append(matches, *item)
+		}
+	}
+	if len(matches) != 1 {
+		names := make([]string, 0, len(matches))
+		for i := range matches {
+			names = append(names, matches[i].Name)
+		}
+		return nil, fmt.Errorf("found %d live ConfigMap revisions for base %s/%s: %v", len(matches), namespace, baseName, names)
+	}
+	return &matches[0], nil
+}
+
+func publishTestClusterConfig(
+	ctx context.Context,
+	c client.Client,
+	cluster *garagev1beta2.GarageCluster,
+) error {
+	_, _, err := (&GarageClusterReconciler{Client: c, Scheme: c.Scheme()}).reconcileConfigMap(ctx, cluster)
+	return err
+}
+
+func testNodeConfigMap(
+	ctx context.Context,
+	c client.Client,
+	cluster *garagev1beta2.GarageCluster,
+	node *garagev1beta1.GarageNode,
+) (*corev1.ConfigMap, error) {
+	return testConfigMapForBase(ctx, c, cluster.Namespace, garageNodeConfigBaseName(cluster, node))
+}
+
+func deleteTestGarageConfigResourcesForCluster(
+	ctx context.Context,
+	c client.Client,
+	clusterName string,
+) error {
+	namespace := testNamespace
+	belongs := func(annotations map[string]string) bool {
+		base := annotations[annotationGarageConfigBaseName]
+		return base == clusterName+"-config" || strings.HasPrefix(base, clusterName+"-")
+	}
+	configMaps := &corev1.ConfigMapList{}
+	if err := c.List(ctx, configMaps, client.InNamespace(namespace)); err != nil {
+		return err
+	}
+	for i := range configMaps.Items {
+		if belongs(configMaps.Items[i].Annotations) {
+			if err := c.Delete(ctx, &configMaps.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
+	}
+	secrets := &corev1.SecretList{}
+	if err := c.List(ctx, secrets, client.InNamespace(namespace)); err != nil {
+		return err
+	}
+	for i := range secrets.Items {
+		if belongs(secrets.Items[i].Annotations) {
+			if err := c.Delete(ctx, &secrets.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func deleteTestManagedSecretsForCluster(
+	ctx context.Context,
+	c client.Client,
+	namespace,
+	clusterName string,
+) error {
+	secrets := &corev1.SecretList{}
+	if err := c.List(
+		ctx,
+		secrets,
+		client.InNamespace(namespace),
+		client.MatchingLabels{labelCluster: clusterName},
+	); err != nil {
+		return err
+	}
+	for i := range secrets.Items {
+		if err := c.Delete(ctx, &secrets.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func deleteTestGarageNodesForCluster(
+	ctx context.Context,
+	c client.Client,
+	namespace,
+	clusterName string,
+) error {
+	nodes := &garagev1beta1.GarageNodeList{}
+	if err := c.List(ctx, nodes, client.InNamespace(namespace)); err != nil {
+		return err
+	}
+	for i := range nodes.Items {
+		node := &nodes.Items[i]
+		if node.Spec.ClusterRef.Name != clusterName ||
+			(node.Spec.ClusterRef.Namespace != "" && node.Spec.ClusterRef.Namespace != namespace) {
+			continue
+		}
+		if len(node.Finalizers) > 0 {
+			node.Finalizers = nil
+			if err := c.Update(ctx, node); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
+		if err := c.Delete(ctx, node); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestValidateManagedTierReplicasRuntimeBackstop(t *testing.T) {
+	if err := validateManagedTierReplicas(50, "spec.storage.replicas"); err != nil {
+		t.Fatalf("supported maximum rejected: %v", err)
+	}
+	if err := validateManagedTierReplicas(51, "spec.storage.replicas"); err == nil || !strings.Contains(err.Error(), "at most 50") {
+		t.Fatalf("unsafe replica count accepted by controller backstop: %v", err)
+	}
+}
+
 const (
-	testClusterName         = "test-cluster"
-	testNonExistentCluster  = "non-existent-cluster"
-	testNonExistent         = "non-existent"
-	testExternalRPCSecret   = "external-rpc-secret"
-	testStorageClass        = "fast-ssd"
-	testIPv4Addr            = "10.0.0.1"
-	testIPv4RPCAddr         = "10.0.0.1:3901"
-	testEndpointKey         = "endpoint"
-	testHostKey             = "host"
-	testAccessKeyID         = "AKIAIOSFODNN7EXAMPLE"
-	testCustomKey           = "custom-key"
-	testImageFull           = "custom/garage:v1.0.0"
-	testImageRepo           = "my-mirror/garage"
-	testImageFull2          = "custom/garage:v3.0.0"
-	testNodeImageRepo       = "node-mirror/garage"
-	testAccessKeyIDKey      = "access-key-id"
-	testSecretAccessKey     = "secret-access-key"
-	testSchemeKey           = "scheme"
-	testRegionKey           = "region"
-	testBucketNameKey       = "bucket"
-	testCustomBucketNameKey = "BUCKET_NAME"
-	testBucketName          = "my-bucket"
-	testSecretValue         = "secret123"
-	testOperatorImage       = "registry.example.com/garage:v2.0.0"
-	testPortNameRPC         = "rpc"
-	teamLabelKey            = "team"
+	testClusterDomain           = "cluster.local"
+	testClusterName             = "test-cluster"
+	testNonExistentCluster      = "non-existent-cluster"
+	testNonExistent             = "non-existent"
+	testExternalRPCSecret       = "external-rpc-secret"
+	testStorageClass            = "fast-ssd"
+	testIPv4Addr                = "10.0.0.1"
+	testIPv4RPCAddr             = "10.0.0.1:3901"
+	testEndpointKey             = "endpoint"
+	testHostKey                 = "host"
+	testAccessKeyID             = "AKIAIOSFODNN7EXAMPLE"
+	testCustomKey               = "custom-key"
+	testImageFull               = "custom/garage:v1.0.0"
+	testImageRepo               = "my-mirror/garage"
+	testImageFull2              = "custom/garage:v3.0.0"
+	testNodeImageRepo           = "node-mirror/garage"
+	testAccessKeyIDKey          = "access-key-id"
+	testSecretAccessKey         = "secret-access-key"
+	testSchemeKey               = "scheme"
+	testRegionKey               = "region"
+	testBucketNameKey           = "bucket"
+	testCustomBucketNameKey     = "BUCKET_NAME"
+	testBucketName              = "my-bucket"
+	testSecretValue             = "secret123"
+	testOperatorImage           = "registry.example.com/garage:v2.0.0"
+	testPortNameRPC             = "rpc"
+	teamLabelKey                = "team"
+	testGarageValue             = "garage"
+	testBlockResyncWorkerName   = "Block resync worker #1"
+	testClusterUID              = "cluster-uid"
+	testGarageNodeUID           = "garage-node-uid"
+	testDaemonSetUID            = "daemonset-uid"
+	testGatewayNodeID           = "gateway-a"
+	testGarageNodeID            = "garage-a"
+	testForeignValue            = "foreign"
+	testEdgeValue               = "edge"
+	testGarageNodeConfig        = "# test GarageNode config\n"
+	testArchiveMetadataHostPath = "/var/lib/garage/archive-meta"
+	testArchiveDataHostPath     = "/var/lib/garage/archive-data"
+	testOwnedClusterTag         = "cluster:gc/garage"
+	testOwnedClusterUIDTag      = "cluster-uid:local-uid"
+	testOrphanGatewayID         = "gw-orphan"
+	testStorageNodeName         = "storage-a"
+	testRemovedNodeID           = "removed-a"
+	testTerminalNodeID          = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testSecondStorageNodeID     = "storage-b"
+	testNodeUID                 = "node-uid"
+	testSourcePodUID            = "source-pod-uid"
+	testStatefulSetUID          = "statefulset-uid"
+	testStorageMetadataPVC      = "metadata-storage-a-0"
+	testSiteA                   = "site-a"
+	testLocalDeadNodeID         = "local-dead"
+	testOttawaName              = "ottawa"
+	testNodeAddressTemplate     = "{nodeName}.example.net:3901"
+	testSMBNodeName             = "smb-a"
+	testKubernetesNodeA         = "node-a"
+	testKubernetesNodeB         = "node-b"
+	testPoolA                   = "pool-a"
+	testNewValue                = "new"
+	testOldPodUID               = "old-pod"
+	testNewSpecHash             = "new-spec"
+	testSMBMetadataPVC          = "metadata-smb-a-0"
+	testPVCUID                  = "pvc-uid"
+	testNewConfigHash           = "new-config"
+	testRackATag                = "rack:a"
+	testOwnedNodeID             = "owned"
+	testKubernetesWorkerA       = "worker-a"
+	testReplacementPodUID       = "replacement-pod-uid"
+	testLoopbackPodIP           = "127.0.0.1"
+	testManualGarageNodeName    = "manual-node"
+	testStoragePodIP            = "10.0.0.11"
+	testSharedRPCPublicAddr     = "shared.example.net:3901"
+	testHTTPErrorKey            = "error"
+	testHTTPSuccessKey          = "success"
+	testSiteName                = "site"
+	testStorageOwnerLabelKey    = "storage.example/owner"
+	testSecondDiskHostPath      = "/var/lib/garage/shared/disk-2"
+	testGetNodeInfoPath         = "/v2/GetNodeInfo"
+	testNodeIDJSONKey           = "nodeId"
+	testPoolB                   = "pool-b"
 )
 
 func TestResolveSecretConfig(t *testing.T) {
@@ -69,16 +286,18 @@ func TestResolveSecretConfig(t *testing.T) {
 				Spec: garagev1beta1.GarageKeySpec{},
 			},
 			expected: secretConfig{
-				accessKeyIDKey:     testAccessKeyIDKey,
-				secretAccessKeyKey: testSecretAccessKey,
-				endpointKey:        testEndpointKey,
-				hostKey:            testHostKey,
-				schemeKey:          testSchemeKey,
-				regionKey:          testRegionKey,
-				bucketNameKey:      testBucketNameKey,
-				includeEndpoint:    true,
-				includeRegion:      true,
-				secretType:         corev1.SecretTypeOpaque,
+				accessKeyIDKey:         testAccessKeyIDKey,
+				secretAccessKeyKey:     testSecretAccessKey,
+				endpointKey:            testEndpointKey,
+				hostKey:                testHostKey,
+				schemeKey:              testSchemeKey,
+				regionKey:              testRegionKey,
+				bucketNameKey:          testBucketNameKey,
+				credentialsFileKey:     defaultCredentialsFileKey,
+				credentialsFileProfile: defaultCredentialsProfile,
+				includeEndpoint:        true,
+				includeRegion:          true,
+				secretType:             corev1.SecretTypeOpaque,
 			},
 		},
 		{
@@ -86,26 +305,57 @@ func TestResolveSecretConfig(t *testing.T) {
 			key: &garagev1beta1.GarageKey{
 				Spec: garagev1beta1.GarageKeySpec{
 					SecretTemplate: &garagev1beta1.SecretTemplate{
-						AccessKeyIDKey:     "AWS_ACCESS_KEY_ID",
-						SecretAccessKeyKey: "AWS_SECRET_ACCESS_KEY",
-						EndpointKey:        "AWS_ENDPOINT",
-						HostKey:            "AWS_HOST",
-						SchemeKey:          "AWS_SCHEME",
-						RegionKey:          "AWS_REGION",
+						AccessKeyIDKey:         "AWS_ACCESS_KEY_ID",
+						SecretAccessKeyKey:     "AWS_SECRET_ACCESS_KEY",
+						EndpointKey:            "AWS_ENDPOINT",
+						HostKey:                "AWS_HOST",
+						SchemeKey:              "AWS_SCHEME",
+						RegionKey:              "AWS_REGION",
+						CredentialsFileKey:     "aws-credentials",
+						CredentialsFileProfile: "backup.prod",
+						IncludeCredentialsFile: boolPtr(true),
 					},
 				},
 			},
 			expected: secretConfig{
-				accessKeyIDKey:     "AWS_ACCESS_KEY_ID",
-				secretAccessKeyKey: "AWS_SECRET_ACCESS_KEY",
-				endpointKey:        "AWS_ENDPOINT",
-				hostKey:            "AWS_HOST",
-				schemeKey:          "AWS_SCHEME",
-				regionKey:          "AWS_REGION",
-				bucketNameKey:      testBucketNameKey,
-				includeEndpoint:    true,
-				includeRegion:      true,
-				secretType:         corev1.SecretTypeOpaque,
+				accessKeyIDKey:         "AWS_ACCESS_KEY_ID",
+				secretAccessKeyKey:     "AWS_SECRET_ACCESS_KEY",
+				endpointKey:            "AWS_ENDPOINT",
+				hostKey:                "AWS_HOST",
+				schemeKey:              "AWS_SCHEME",
+				regionKey:              "AWS_REGION",
+				bucketNameKey:          testBucketNameKey,
+				credentialsFileKey:     "aws-credentials",
+				credentialsFileProfile: "backup.prod",
+				includeEndpoint:        true,
+				includeRegion:          true,
+				includeCredentialsFile: true,
+				secretType:             corev1.SecretTypeOpaque,
+			},
+		},
+		{
+			name: "include credentials file with default key",
+			key: &garagev1beta1.GarageKey{
+				Spec: garagev1beta1.GarageKeySpec{
+					SecretTemplate: &garagev1beta1.SecretTemplate{
+						IncludeCredentialsFile: boolPtr(true),
+					},
+				},
+			},
+			expected: secretConfig{
+				accessKeyIDKey:         testAccessKeyIDKey,
+				secretAccessKeyKey:     testSecretAccessKey,
+				endpointKey:            testEndpointKey,
+				hostKey:                testHostKey,
+				schemeKey:              testSchemeKey,
+				regionKey:              testRegionKey,
+				bucketNameKey:          testBucketNameKey,
+				credentialsFileKey:     defaultCredentialsFileKey,
+				credentialsFileProfile: defaultCredentialsProfile,
+				includeEndpoint:        true,
+				includeRegion:          true,
+				includeCredentialsFile: true,
+				secretType:             corev1.SecretTypeOpaque,
 			},
 		},
 		{
@@ -119,16 +369,18 @@ func TestResolveSecretConfig(t *testing.T) {
 				},
 			},
 			expected: secretConfig{
-				accessKeyIDKey:     testAccessKeyIDKey,
-				secretAccessKeyKey: testSecretAccessKey,
-				endpointKey:        testEndpointKey,
-				hostKey:            testHostKey,
-				schemeKey:          testSchemeKey,
-				regionKey:          testRegionKey,
-				bucketNameKey:      testBucketNameKey,
-				includeEndpoint:    false,
-				includeRegion:      false,
-				secretType:         corev1.SecretTypeOpaque,
+				accessKeyIDKey:         testAccessKeyIDKey,
+				secretAccessKeyKey:     testSecretAccessKey,
+				endpointKey:            testEndpointKey,
+				hostKey:                testHostKey,
+				schemeKey:              testSchemeKey,
+				regionKey:              testRegionKey,
+				bucketNameKey:          testBucketNameKey,
+				credentialsFileKey:     defaultCredentialsFileKey,
+				credentialsFileProfile: defaultCredentialsProfile,
+				includeEndpoint:        false,
+				includeRegion:          false,
+				secretType:             corev1.SecretTypeOpaque,
 			},
 		},
 		{
@@ -142,17 +394,19 @@ func TestResolveSecretConfig(t *testing.T) {
 				},
 			},
 			expected: secretConfig{
-				accessKeyIDKey:     testAccessKeyIDKey,
-				secretAccessKeyKey: testSecretAccessKey,
-				endpointKey:        testEndpointKey,
-				hostKey:            testHostKey,
-				schemeKey:          testSchemeKey,
-				regionKey:          testRegionKey,
-				bucketNameKey:      testCustomBucketNameKey,
-				includeEndpoint:    true,
-				includeRegion:      true,
-				includeBucketName:  true,
-				secretType:         corev1.SecretTypeOpaque,
+				accessKeyIDKey:         testAccessKeyIDKey,
+				secretAccessKeyKey:     testSecretAccessKey,
+				endpointKey:            testEndpointKey,
+				hostKey:                testHostKey,
+				schemeKey:              testSchemeKey,
+				regionKey:              testRegionKey,
+				bucketNameKey:          testCustomBucketNameKey,
+				credentialsFileKey:     defaultCredentialsFileKey,
+				credentialsFileProfile: defaultCredentialsProfile,
+				includeEndpoint:        true,
+				includeRegion:          true,
+				includeBucketName:      true,
+				secretType:             corev1.SecretTypeOpaque,
 			},
 		},
 		{
@@ -165,16 +419,18 @@ func TestResolveSecretConfig(t *testing.T) {
 				},
 			},
 			expected: secretConfig{
-				accessKeyIDKey:     testAccessKeyIDKey,
-				secretAccessKeyKey: testSecretAccessKey,
-				endpointKey:        testEndpointKey,
-				hostKey:            testHostKey,
-				schemeKey:          testSchemeKey,
-				regionKey:          testRegionKey,
-				bucketNameKey:      testBucketNameKey,
-				includeEndpoint:    true,
-				includeRegion:      true,
-				secretType:         corev1.SecretTypeDockerConfigJson,
+				accessKeyIDKey:         testAccessKeyIDKey,
+				secretAccessKeyKey:     testSecretAccessKey,
+				endpointKey:            testEndpointKey,
+				hostKey:                testHostKey,
+				schemeKey:              testSchemeKey,
+				regionKey:              testRegionKey,
+				bucketNameKey:          testBucketNameKey,
+				credentialsFileKey:     defaultCredentialsFileKey,
+				credentialsFileProfile: defaultCredentialsProfile,
+				includeEndpoint:        true,
+				includeRegion:          true,
+				secretType:             corev1.SecretTypeDockerConfigJson,
 			},
 		},
 	}
@@ -213,10 +469,42 @@ func TestResolveSecretConfig(t *testing.T) {
 			if result.includeBucketName != tt.expected.includeBucketName {
 				t.Errorf("includeBucketName = %v, want %v", result.includeBucketName, tt.expected.includeBucketName)
 			}
+			if result.credentialsFileKey != tt.expected.credentialsFileKey {
+				t.Errorf("credentialsFileKey = %q, want %q", result.credentialsFileKey, tt.expected.credentialsFileKey)
+			}
+			if result.credentialsFileProfile != tt.expected.credentialsFileProfile {
+				t.Errorf("credentialsFileProfile = %q, want %q", result.credentialsFileProfile, tt.expected.credentialsFileProfile)
+			}
+			if result.includeCredentialsFile != tt.expected.includeCredentialsFile {
+				t.Errorf("includeCredentialsFile = %v, want %v", result.includeCredentialsFile, tt.expected.includeCredentialsFile)
+			}
 			if result.secretType != tt.expected.secretType {
 				t.Errorf("secretType = %v, want %v", result.secretType, tt.expected.secretType)
 			}
 		})
+	}
+}
+
+func TestResolveSecretConfigWebsiteURL(t *testing.T) {
+	defaultConfig := resolveSecretConfig(&garagev1beta1.GarageKey{})
+	if defaultConfig.websiteURLKey != defaultWebsiteURLKey {
+		t.Fatalf("default websiteURLKey = %q, want %q", defaultConfig.websiteURLKey, defaultWebsiteURLKey)
+	}
+	if defaultConfig.includeWebsiteURL {
+		t.Fatal("includeWebsiteURL defaults to true")
+	}
+
+	custom := resolveSecretConfig(&garagev1beta1.GarageKey{Spec: garagev1beta1.GarageKeySpec{
+		SecretTemplate: &garagev1beta1.SecretTemplate{
+			WebsiteURLKey:     "PUBLIC_WEBSITE_URL",
+			IncludeWebsiteURL: boolPtr(true),
+		},
+	}})
+	if custom.websiteURLKey != "PUBLIC_WEBSITE_URL" {
+		t.Fatalf("custom websiteURLKey = %q, want PUBLIC_WEBSITE_URL", custom.websiteURLKey)
+	}
+	if !custom.includeWebsiteURL {
+		t.Fatal("includeWebsiteURL = false, want true")
 	}
 }
 
@@ -262,6 +550,56 @@ func TestBuildSecretData(t *testing.T) {
 				testSecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
 				testRegionKey:       "us-west-2",
 				testSchemeKey:       "http",
+			},
+			dontWantKeys: []string{defaultCredentialsFileKey},
+		},
+		{
+			name: "AWS shared credentials file with default key",
+			cfg: secretConfig{
+				accessKeyIDKey:         testAccessKeyIDKey,
+				secretAccessKeyKey:     testSecretAccessKey,
+				credentialsFileKey:     defaultCredentialsFileKey,
+				credentialsFileProfile: defaultCredentialsProfile,
+				includeCredentialsFile: true,
+			},
+			key:             &garagev1beta1.GarageKey{Status: garagev1beta1.GarageKeyStatus{AccessKeyID: testAccessKeyID}},
+			cluster:         &garagev1beta2.GarageCluster{},
+			secretAccessKey: testSecretValue,
+			wantValues: map[string]string{
+				defaultCredentialsFileKey: "[default]\naws_access_key_id=" + testAccessKeyID + "\naws_secret_access_key=" + testSecretValue + "\n",
+			},
+		},
+		{
+			name: "AWS shared credentials file with custom key",
+			cfg: secretConfig{
+				accessKeyIDKey:         testAccessKeyIDKey,
+				secretAccessKeyKey:     testSecretAccessKey,
+				credentialsFileKey:     "velero-credentials",
+				credentialsFileProfile: defaultCredentialsProfile,
+				includeCredentialsFile: true,
+			},
+			key:             &garagev1beta1.GarageKey{Status: garagev1beta1.GarageKeyStatus{AccessKeyID: testAccessKeyID}},
+			cluster:         &garagev1beta2.GarageCluster{},
+			secretAccessKey: testSecretValue,
+			wantValues: map[string]string{
+				"velero-credentials": "[default]\naws_access_key_id=" + testAccessKeyID + "\naws_secret_access_key=" + testSecretValue + "\n",
+			},
+			dontWantKeys: []string{defaultCredentialsFileKey},
+		},
+		{
+			name: "AWS shared credentials file with custom profile",
+			cfg: secretConfig{
+				accessKeyIDKey:         testAccessKeyIDKey,
+				secretAccessKeyKey:     testSecretAccessKey,
+				credentialsFileKey:     defaultCredentialsFileKey,
+				credentialsFileProfile: "backup.prod",
+				includeCredentialsFile: true,
+			},
+			key:             &garagev1beta1.GarageKey{Status: garagev1beta1.GarageKeyStatus{AccessKeyID: testAccessKeyID}},
+			cluster:         &garagev1beta2.GarageCluster{},
+			secretAccessKey: testSecretValue,
+			wantValues: map[string]string{
+				defaultCredentialsFileKey: "[backup.prod]\naws_access_key_id=" + testAccessKeyID + "\naws_secret_access_key=" + testSecretValue + "\n",
 			},
 		},
 		{
@@ -487,7 +825,19 @@ func TestBuildSecretData(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := buildSecretData(tt.cfg, tt.key, tt.cluster, tt.secretAccessKey, "cluster.local")
+			s := runtime.NewScheme()
+			_ = corev1.AddToScheme(s)
+			_ = garagev1beta1.AddToScheme(s)
+			_ = garagev1beta2.AddToScheme(s)
+			fc := fake.NewClientBuilder().WithScheme(s).Build()
+
+			r := &GarageKeyReconciler{Client: fc, Scheme: s, ClusterDomain: testClusterDomain}
+
+			s3, err := ResolveS3Endpoint(tt.cluster, r.ClusterDomain)
+			if err != nil {
+				t.Fatalf("ResolveS3Endpoint: %v", err)
+			}
+			result := r.buildSecretData(context.Background(), tt.cfg, tt.key, tt.cluster, tt.secretAccessKey, s3)
 
 			for _, key := range tt.wantKeys {
 				if _, ok := result[key]; !ok {
@@ -507,6 +857,116 @@ func TestBuildSecretData(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestBuildSecretDataIncludesWebsiteURL(t *testing.T) {
+	s := runtime.NewScheme()
+	if err := corev1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := garagev1beta1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := garagev1beta2.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+
+	bucket := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: testBucketName, Namespace: testNamespace},
+		Status: garagev1beta1.GarageBucketStatus{
+			WebsiteURL: "https://media.example.test",
+		},
+	}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(bucket).Build()
+	r := &GarageKeyReconciler{Client: fc, Scheme: s}
+	key := &garagev1beta1.GarageKey{
+		ObjectMeta: metav1.ObjectMeta{Name: "media-key", Namespace: testNamespace},
+		Spec: garagev1beta1.GarageKeySpec{
+			SecretTemplate: &garagev1beta1.SecretTemplate{
+				IncludeEndpoint:   boolPtr(false),
+				IncludeRegion:     boolPtr(false),
+				IncludeWebsiteURL: boolPtr(true),
+				WebsiteURLKey:     "PUBLIC_WEBSITE_URL",
+			},
+			BucketPermissions: []garagev1beta1.BucketPermission{{
+				BucketRef: &garagev1beta1.BucketRef{Name: testBucketName},
+				Read:      true,
+			}},
+		},
+		Status: garagev1beta1.GarageKeyStatus{AccessKeyID: testAccessKeyID},
+	}
+
+	cfg := resolveSecretConfig(key)
+	data := r.buildSecretData(context.Background(), cfg, key, &garagev1beta2.GarageCluster{}, testSecretValue, nil)
+	if got := string(data["PUBLIC_WEBSITE_URL"]); got != "https://media.example.test" {
+		t.Fatalf("website URL = %q, want https://media.example.test", got)
+	}
+}
+
+func TestKeysForBucketEnqueuesWebsiteURLConsumers(t *testing.T) {
+	s := runtime.NewScheme()
+	if err := garagev1beta1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	bucket := &garagev1beta1.GarageBucket{ObjectMeta: metav1.ObjectMeta{
+		Name: "media", Namespace: testNamespace,
+	}}
+	include := boolPtr(true)
+	exclude := boolPtr(false)
+	matching := &garagev1beta1.GarageKey{
+		ObjectMeta: metav1.ObjectMeta{Name: "matching", Namespace: testNamespace},
+		Spec: garagev1beta1.GarageKeySpec{
+			SecretTemplate: &garagev1beta1.SecretTemplate{IncludeWebsiteURL: include},
+			BucketPermissions: []garagev1beta1.BucketPermission{{
+				BucketRef: &garagev1beta1.BucketRef{Name: bucket.Name},
+			}},
+		},
+	}
+	crossNamespace := &garagev1beta1.GarageKey{
+		ObjectMeta: metav1.ObjectMeta{Name: "cross-namespace", Namespace: "consumer"},
+		Spec: garagev1beta1.GarageKeySpec{
+			SecretTemplate: &garagev1beta1.SecretTemplate{IncludeWebsiteURL: include},
+			BucketPermissions: []garagev1beta1.BucketPermission{{
+				BucketRef: &garagev1beta1.BucketRef{Name: bucket.Name, Namespace: bucket.Namespace},
+			}},
+		},
+	}
+	objects := []client.Object{
+		bucket,
+		matching,
+		crossNamespace,
+		&garagev1beta1.GarageKey{
+			ObjectMeta: metav1.ObjectMeta{Name: "disabled", Namespace: testNamespace},
+			Spec: garagev1beta1.GarageKeySpec{
+				SecretTemplate: &garagev1beta1.SecretTemplate{IncludeWebsiteURL: exclude},
+				BucketPermissions: []garagev1beta1.BucketPermission{{
+					BucketRef: &garagev1beta1.BucketRef{Name: bucket.Name},
+				}},
+			},
+		},
+		&garagev1beta1.GarageKey{
+			ObjectMeta: metav1.ObjectMeta{Name: "other-bucket", Namespace: testNamespace},
+			Spec: garagev1beta1.GarageKeySpec{
+				SecretTemplate: &garagev1beta1.SecretTemplate{IncludeWebsiteURL: include},
+				BucketPermissions: []garagev1beta1.BucketPermission{{
+					BucketRef: &garagev1beta1.BucketRef{Name: "other"},
+				}},
+			},
+		},
+	}
+	fc := fake.NewClientBuilder().WithScheme(s).WithObjects(objects...).Build()
+	r := &GarageKeyReconciler{Client: fc, Scheme: s}
+	requests := r.keysForBucket(context.Background(), bucket)
+	got := make([]string, 0, len(requests))
+	for _, request := range requests {
+		got = append(got, request.Namespace+"/"+request.Name)
+	}
+	sort.Strings(got)
+	want := []string{testNamespace + "/matching", "consumer/cross-namespace"}
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("website URL consumer requests = %v, want %v", got, want)
 	}
 }
 
@@ -825,6 +1285,46 @@ func TestFindSelfNode(t *testing.T) {
 	}
 }
 
+func TestWaitingForClusterMessage(t *testing.T) {
+	if got := waitingForClusterMessage(nil); got != msgWaitingForCluster {
+		t.Errorf("waitingForClusterMessage(nil) = %q, want %q", got, msgWaitingForCluster)
+	}
+
+	cause := fmt.Errorf("dial tcp: lookup garage.garage.svc.cluster.local: no such host")
+	got := waitingForClusterMessage(cause)
+	if !strings.Contains(got, msgWaitingForCluster) {
+		t.Errorf("waitingForClusterMessage(%v) = %q, missing base message %q", cause, got, msgWaitingForCluster)
+	}
+	if !strings.Contains(got, "no such host") {
+		t.Errorf("waitingForClusterMessage(%v) = %q, missing cause detail", cause, got)
+	}
+}
+
+func TestIsTransientConnectivityError(t *testing.T) {
+	if len(transientConnectivityErrSubstrings) == 0 {
+		t.Fatal("transientConnectivityErrSubstrings is empty")
+	}
+	for _, substr := range transientConnectivityErrSubstrings {
+		t.Run(substr, func(t *testing.T) {
+			err := fmt.Errorf("dial tcp 10.0.0.1:3903: %s", substr)
+			if !isTransientConnectivityError(err) {
+				t.Errorf("isTransientConnectivityError(%v) = false, want true", err)
+			}
+		})
+	}
+	t.Run("nil", func(t *testing.T) {
+		if isTransientConnectivityError(nil) {
+			t.Error("isTransientConnectivityError(nil) = true, want false")
+		}
+	})
+	t.Run("unrelated error", func(t *testing.T) {
+		err := fmt.Errorf("bucket %q is not empty", "app-data")
+		if isTransientConnectivityError(err) {
+			t.Errorf("isTransientConnectivityError(%v) = true, want false", err)
+		}
+	})
+}
+
 func TestAdminEndpoint(t *testing.T) {
 	tests := []struct {
 		name string
@@ -958,6 +1458,7 @@ func TestEffectiveWebAPI(t *testing.T) {
 		cluster            *garagev1beta2.GarageCluster
 		expectNonNil       bool
 		expectedRootDomain string
+		expectedScheme     string
 		wantURL            string
 	}{
 		{
@@ -970,6 +1471,7 @@ func TestEffectiveWebAPI(t *testing.T) {
 			},
 			expectNonNil:       true,
 			expectedRootDomain: ".test.svc",
+			expectedScheme:     "http",
 			wantURL:            "http://mybucket.test.svc",
 		},
 		{
@@ -992,7 +1494,21 @@ func TestEffectiveWebAPI(t *testing.T) {
 			},
 			expectNonNil:       true,
 			expectedRootDomain: ".web.example.com",
+			expectedScheme:     "http",
 			wantURL:            "http://mybucket.web.example.com",
+		},
+		{
+			name: "uses https for externally terminated web API",
+			cluster: &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: defaultS3Region, Namespace: testNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					WebAPI: &garagev1beta2.WebAPIConfig{Scheme: "https", RootDomain: ".web.example.com"},
+				},
+			},
+			expectNonNil:       true,
+			expectedRootDomain: ".web.example.com",
+			expectedScheme:     "https",
+			wantURL:            "https://mybucket.web.example.com",
 		},
 		{
 			name: "explicit Disabled: false with custom domain",
@@ -1006,6 +1522,7 @@ func TestEffectiveWebAPI(t *testing.T) {
 			},
 			expectNonNil:       true,
 			expectedRootDomain: ".custom.local",
+			expectedScheme:     "http",
 			wantURL:            "http://mybucket.custom.local",
 		},
 	}
@@ -1022,8 +1539,11 @@ func TestEffectiveWebAPI(t *testing.T) {
 				if result.RootDomain != tt.expectedRootDomain {
 					t.Errorf("RootDomain = %q, want %q", result.RootDomain, tt.expectedRootDomain)
 				}
+				if result.Scheme != tt.expectedScheme {
+					t.Errorf("Scheme = %q, want %q", result.Scheme, tt.expectedScheme)
+				}
 				if tt.wantURL != "" {
-					gotURL := "http://mybucket" + result.RootDomain
+					gotURL := bucketWebsiteURL(tt.cluster, "mybucket")
 					if gotURL != tt.wantURL {
 						t.Errorf("composed URL = %q, want %q", gotURL, tt.wantURL)
 					}
@@ -1136,6 +1656,28 @@ func TestBuildNodeTags_TierTag(t *testing.T) {
 				t.Errorf("missing ownership tag %q in %v", ownership, tags)
 			}
 		})
+	}
+}
+
+func TestBuildNodeTags_DropsForgedReservedDefaults(t *testing.T) {
+	defaults := []string{
+		"cluster:other/namespace",
+		"cluster-uid:other-site",
+		testTierGatewayTag,
+		"rpc-address:other.example:3901",
+		"node-local-pool:other",
+		"kubernetes-node:other-worker",
+		testRackATag,
+	}
+	want := []string{
+		"cluster:my-cluster/my-ns",
+		"cluster-uid:real-site",
+		"tier:storage",
+		testRackATag,
+		"my-cluster-0",
+	}
+	if got := buildNodeTags("my-cluster", "my-ns", tierStorage, defaults, "my-cluster-0", "real-site"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildNodeTags() = %#v, want %#v", got, want)
 	}
 }
 
@@ -1267,7 +1809,8 @@ func TestBuildGaragePodSpec_UserEnv(t *testing.T) {
 		{Name: envGarageNodeHost, Value: "overridden.example"},
 	}
 	userEnvFrom := []corev1.EnvFromSource{
-		{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "my-secret"}}},
+		{Prefix: "CUSTOM_", SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "my-secret"}}},
+		{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "unsafe-unprefixed"}}},
 	}
 
 	spec := buildGaragePodSpec(PodSpecConfig{
@@ -1280,9 +1823,10 @@ func TestBuildGaragePodSpec_UserEnv(t *testing.T) {
 	}
 	c := spec.Containers[0]
 
-	// EnvFrom passes through verbatim.
-	if len(c.EnvFrom) != 1 || c.EnvFrom[0].SecretRef == nil || c.EnvFrom[0].SecretRef.Name != "my-secret" {
-		t.Errorf("envFrom not propagated: %+v", c.EnvFrom)
+	// A safely prefixed source passes through; an admission-bypassed source that
+	// could inject Garage's literal secret variables is filtered fail closed.
+	if len(c.EnvFrom) != 1 || c.EnvFrom[0].Prefix != "CUSTOM_" || c.EnvFrom[0].SecretRef == nil || c.EnvFrom[0].SecretRef.Name != "my-secret" {
+		t.Errorf("safe envFrom not propagated or unsafe source not filtered: %+v", c.EnvFrom)
 	}
 
 	// Custom env var must be present.
@@ -1290,7 +1834,7 @@ func TestBuildGaragePodSpec_UserEnv(t *testing.T) {
 	for _, e := range c.Env {
 		got[e.Name] = append(got[e.Name], e.Value)
 	}
-	if vs, ok := got["GARAGE_ALLOW_WORLD_READABLE_SECRETS"]; !ok || vs[0] != "true" {
+	if vs, ok := got["GARAGE_ALLOW_WORLD_READABLE_SECRETS"]; !ok || vs[0] != annotationTrue {
 		t.Errorf("expected GARAGE_ALLOW_WORLD_READABLE_SECRETS=true, got %v", vs)
 	}
 	if vs, ok := got["MY_EXTRA"]; !ok || vs[0] != "user-supplied-value" {
@@ -1352,5 +1896,328 @@ func TestBuildGaragePodSpec_GatewayReadinessProbe(t *testing.T) {
 	st := buildGaragePodSpec(PodSpecConfig{Image: defaultGarageImage, IsGateway: false}, nil, nil, nil)
 	if st.Containers[0].ReadinessProbe != nil {
 		t.Errorf("storage pod should have no readiness probe, got %+v", st.Containers[0].ReadinessProbe)
+	}
+}
+
+func TestGatewayUsesLegacyCompatibleProjectedDataMarkerWithoutInitImage(t *testing.T) {
+	cluster := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: testClusterName, Namespace: testNamespace},
+		Spec:       garagev1beta2.GarageClusterSpec{Gateway: &garagev1beta2.GatewaySpec{Replicas: 1}},
+	}
+	volumes, mounts := buildGatewayVolumesAndMounts(cluster)
+	podSpec := buildGaragePodSpec(
+		PodSpecConfig{Image: defaultGarageImage, IsGateway: true},
+		volumes,
+		mounts,
+		nil,
+	)
+	if len(podSpec.InitContainers) != 0 {
+		t.Fatalf("gateway must not require a third-party marker init image: %+v", podSpec.InitContainers)
+	}
+	var markerVolume *corev1.Volume
+	for i := range podSpec.Volumes {
+		if podSpec.Volumes[i].Name == gatewayDataMarkerVolumeName {
+			markerVolume = &podSpec.Volumes[i]
+			break
+		}
+	}
+	if markerVolume == nil || markerVolume.DownwardAPI == nil || len(markerVolume.DownwardAPI.Items) != 1 {
+		t.Fatalf("gateway marker DownwardAPI projection missing: %+v", markerVolume)
+	}
+	item := markerVolume.DownwardAPI.Items[0]
+	if item.Path != gatewayDataMarkerFile || item.FieldRef == nil || item.FieldRef.FieldPath != gatewayDataMarkerFieldPath {
+		t.Fatalf("gateway marker projection does not read the operator-owned compatibility annotation: %+v", item)
+	}
+	if gatewayDataMarkerLegacyContent != "" {
+		t.Fatalf("gateway marker content %q is incompatible with the empty marker written by released workloads", gatewayDataMarkerLegacyContent)
+	}
+	var markerMount *corev1.VolumeMount
+	for i := range podSpec.Containers[0].VolumeMounts {
+		if podSpec.Containers[0].VolumeMounts[i].Name == gatewayDataMarkerVolumeName {
+			markerMount = &podSpec.Containers[0].VolumeMounts[i]
+			break
+		}
+	}
+	if markerMount == nil || !markerMount.ReadOnly || markerMount.SubPath != gatewayDataMarkerFile ||
+		markerMount.MountPath != dataPath+"/"+gatewayDataMarkerFile {
+		t.Fatalf("gateway marker is not mounted as the exact read-only data marker: %+v", markerMount)
+	}
+
+	node := &garagev1beta1.GarageNode{Spec: garagev1beta1.GarageNodeSpec{
+		Gateway: true,
+		Storage: &garagev1beta1.NodeStorageConfig{},
+	}}
+	nodeVolumes, nodeMounts := (&GarageNodeReconciler{}).buildNodeVolumesAndMounts(node, cluster)
+	foundVolume := false
+	foundMount := false
+	for i := range nodeVolumes {
+		foundVolume = foundVolume || nodeVolumes[i].Name == gatewayDataMarkerVolumeName
+	}
+	for i := range nodeMounts {
+		foundMount = foundMount || nodeMounts[i].Name == gatewayDataMarkerVolumeName
+	}
+	if !foundVolume || !foundMount {
+		t.Fatalf("unified gateway GarageNode lacks projected marker: volume=%v mount=%v", foundVolume, foundMount)
+	}
+}
+
+func TestEdgeGatewayEmptyDirMetadataRendersVolumeWithoutClaim(t *testing.T) {
+	size := resource.MustParse("64Mi")
+	cluster := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: testClusterName, Namespace: testNamespace},
+		Spec: garagev1beta2.GarageClusterSpec{Gateway: &garagev1beta2.GatewaySpec{
+			Replicas: 1,
+			Metadata: &garagev1beta2.VolumeConfig{
+				Type: garagev1beta2.VolumeTypeEmptyDir,
+				Size: &size,
+			},
+		}},
+	}
+
+	volumes, mounts := buildGatewayVolumesAndMounts(cluster)
+	var metadataVolume *corev1.Volume
+	for i := range volumes {
+		if volumes[i].Name == metadataVolName {
+			metadataVolume = &volumes[i]
+			break
+		}
+	}
+	if metadataVolume == nil || metadataVolume.EmptyDir == nil {
+		t.Fatalf("edge gateway metadata EmptyDir volume missing: %+v", volumes)
+	}
+	if metadataVolume.EmptyDir.SizeLimit == nil || metadataVolume.EmptyDir.SizeLimit.Cmp(size) != 0 {
+		t.Fatalf("edge gateway metadata sizeLimit = %v, want %s", metadataVolume.EmptyDir.SizeLimit, size.String())
+	}
+	foundMount := false
+	for i := range mounts {
+		if mounts[i].Name == metadataVolName && mounts[i].MountPath == metadataPath {
+			foundMount = true
+		}
+	}
+	if !foundMount {
+		t.Fatalf("edge gateway metadata mount missing: %+v", mounts)
+	}
+	if claims := buildGatewayVolumeClaimTemplates(cluster); len(claims) != 0 {
+		t.Fatalf("edge gateway EmptyDir metadata must not render a PVC template: %+v", claims)
+	}
+}
+
+func TestEdgeGatewayPersistentMetadataRendersClaimWithoutExplicitVolume(t *testing.T) {
+	cluster := &garagev1beta2.GarageCluster{
+		Spec: garagev1beta2.GarageClusterSpec{Gateway: &garagev1beta2.GatewaySpec{Replicas: 1}},
+	}
+	volumes, _ := buildGatewayVolumesAndMounts(cluster)
+	for i := range volumes {
+		if volumes[i].Name == metadataVolName {
+			t.Fatalf("persistent edge gateway metadata must come only from the claim template: %+v", volumes[i])
+		}
+	}
+	claims := buildGatewayVolumeClaimTemplates(cluster)
+	if len(claims) != 1 || claims[0].Name != metadataVolName {
+		t.Fatalf("persistent edge gateway metadata claim missing: %+v", claims)
+	}
+}
+
+func TestBuildGatewayVolumeClaimTemplatesCopiesMetadataDataSourceRef(t *testing.T) {
+	group := "kopiur.example.io"
+	size := resource.MustParse("1Gi")
+	cluster := &garagev1beta2.GarageCluster{Spec: garagev1beta2.GarageClusterSpec{
+		Gateway: &garagev1beta2.GatewaySpec{
+			Replicas: 1,
+			Metadata: &garagev1beta2.VolumeConfig{
+				Size:          &size,
+				DataSourceRef: &corev1.TypedObjectReference{APIGroup: &group, Kind: "Restore", Name: "gateway-restore"},
+			},
+		},
+	}}
+	claims := buildGatewayVolumeClaimTemplates(cluster)
+	if len(claims) != 1 {
+		t.Fatalf("expected one metadata claim, got %+v", claims)
+	}
+	if claims[0].Spec.DataSourceRef == nil || claims[0].Spec.DataSourceRef.Name != "gateway-restore" {
+		t.Fatalf("gateway metadata data source missing: %+v", claims[0].Spec.DataSourceRef)
+	}
+}
+
+func TestGatewayVolumeClaimTemplatesChangedCoversSupportedImmutableShape(t *testing.T) {
+	baseCluster := &garagev1beta2.GarageCluster{Spec: garagev1beta2.GarageClusterSpec{
+		Gateway: &garagev1beta2.GatewaySpec{Replicas: 0},
+	}}
+	base := buildGatewayVolumeClaimTemplates(baseCluster)
+	if gatewayVolumeClaimTemplatesChanged(base, base) {
+		t.Fatal("identical gateway claim templates reported drift")
+	}
+	if !gatewayVolumeClaimTemplatesChanged(base, nil) {
+		t.Fatal("PVC to EmptyDir template removal was not detected")
+	}
+
+	cases := map[string]func(*garagev1beta2.VolumeConfig){
+		"size": func(metadata *garagev1beta2.VolumeConfig) {
+			value := resource.MustParse("2Gi")
+			metadata.Size = &value
+		},
+		"accessModes": func(metadata *garagev1beta2.VolumeConfig) {
+			metadata.AccessModes = []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+		},
+		"selector": func(metadata *garagev1beta2.VolumeConfig) {
+			metadata.Selector = &metav1.LabelSelector{MatchLabels: map[string]string{"disk": tierGateway}}
+		},
+		"labels": func(metadata *garagev1beta2.VolumeConfig) {
+			metadata.Labels = map[string]string{"example.com/claim": tierGateway}
+		},
+		"annotations": func(metadata *garagev1beta2.VolumeConfig) {
+			metadata.Annotations = map[string]string{"example.com/claim": tierGateway}
+		},
+		"dataSourceRef": func(metadata *garagev1beta2.VolumeConfig) {
+			group := "kopiur.example.io"
+			metadata.DataSourceRef = &corev1.TypedObjectReference{APIGroup: &group, Kind: "Restore", Name: "gateway-restore"}
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			cluster := baseCluster.DeepCopy()
+			cluster.Spec.Gateway.Metadata = &garagev1beta2.VolumeConfig{}
+			mutate(cluster.Spec.Gateway.Metadata)
+			desired := buildGatewayVolumeClaimTemplates(cluster)
+			if !gatewayVolumeClaimTemplatesChanged(base, desired) {
+				t.Fatalf("%s claim-template drift was not detected", name)
+			}
+		})
+	}
+}
+
+func TestUpdateStatusWithRetryPreservesDesiredStatusWithoutCallback(t *testing.T) {
+	ctx := context.Background()
+	scheme := runtime.NewScheme()
+	if err := garagev1beta1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	stored := &garagev1beta1.GarageBucket{
+		ObjectMeta: metav1.ObjectMeta{Name: "status-retry", Namespace: testNamespace, UID: "uid-1"},
+		Status:     garagev1beta1.GarageBucketStatus{Phase: PhasePending},
+	}
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(stored).
+		WithStatusSubresource(&garagev1beta1.GarageBucket{}).Build()
+	updates := 0
+	wrapped := interceptor.NewClient(base, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			updates++
+			if subResourceName == "status" && updates == 1 {
+				return apierrors.NewConflict(schema.GroupResource{
+					Group: garagev1beta1.GroupVersion.Group, Resource: "garagebuckets",
+				}, obj.GetName(), fmt.Errorf("injected conflict"))
+			}
+			return c.Status().Update(ctx, obj, opts...)
+		},
+	})
+
+	desired := &garagev1beta1.GarageBucket{}
+	if err := wrapped.Get(ctx, client.ObjectKeyFromObject(stored), desired); err != nil {
+		t.Fatal(err)
+	}
+	desired.Status.Phase = PhaseRunning
+	desired.Status.BucketID = "desired-status-survived"
+	if err := UpdateStatusWithRetry(ctx, wrapped, desired); err != nil {
+		t.Fatal(err)
+	}
+
+	got := &garagev1beta1.GarageBucket{}
+	if err := wrapped.Get(ctx, client.ObjectKeyFromObject(stored), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != PhaseRunning || got.Status.BucketID != "desired-status-survived" {
+		t.Fatalf("status after conflict = %#v, want desired status", got.Status)
+	}
+	if updates != 2 {
+		t.Fatalf("status updates = %d, want 2", updates)
+	}
+}
+
+func TestApplyOwnedMetadataMigratesLegacyUpdateOwnershipAndPrunes(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	legacy := metav1.ManagedFieldsEntry{
+		Manager:    "manager",
+		Operation:  metav1.ManagedFieldsOperationUpdate,
+		APIVersion: "v1",
+		FieldsType: "FieldsV1",
+		FieldsV1:   metav1.NewFieldsV1(`{"f:metadata":{"f:labels":{".":{},"f:stale":{}},"f:annotations":{".":{},"f:old":{}}}}`),
+	}
+	foreign := metav1.ManagedFieldsEntry{
+		Manager:    "foreign-controller",
+		Operation:  metav1.ManagedFieldsOperationApply,
+		APIVersion: "v1",
+		FieldsType: "FieldsV1",
+		FieldsV1:   metav1.NewFieldsV1(`{"f:metadata":{"f:labels":{".":{},"f:foreign":{}},"f:annotations":{".":{},"f:foreign.example":{}}}}`),
+	}
+	existing := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: "ssa-metadata", Namespace: testNamespace,
+		Labels: map[string]string{
+			"foreign": "keep",
+			"stale":   "remove",
+		},
+		Annotations: map[string]string{
+			"foreign.example": "keep",
+			"old":             "remove",
+		},
+		ManagedFields: []metav1.ManagedFieldsEntry{legacy, foreign},
+	}}
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).WithReturnManagedFields().Build()
+	live := &corev1.Secret{}
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(existing), live); err != nil {
+		t.Fatal(err)
+	}
+
+	desired := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: "ssa-metadata", Namespace: testNamespace,
+		Labels:      map[string]string{"managed": "fresh"},
+		Annotations: map[string]string{"managed": "yes"},
+	}}
+	if err := applyOwnedMetadata(context.Background(), base, live, desired); err != nil {
+		t.Fatal(err)
+	}
+
+	got := &corev1.Secret{}
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(existing), got); err != nil {
+		t.Fatal(err)
+	}
+	if !maps.Equal(got.Labels, map[string]string{"foreign": "keep", "managed": "fresh"}) {
+		t.Fatalf("labels after legacy migration = %v", got.Labels)
+	}
+	if !maps.Equal(got.Annotations, map[string]string{"foreign.example": "keep", "managed": "yes"}) {
+		t.Fatalf("annotations after legacy migration = %v", got.Annotations)
+	}
+	ownedLabels, ownedAnnotations := appliedOwnedMetadata(got)
+	if !maps.Equal(ownedLabels, map[string]string{"managed": "fresh"}) ||
+		!maps.Equal(ownedAnnotations, map[string]string{"managed": "yes"}) {
+		t.Fatalf("SSA-owned metadata after migration = labels %v annotations %v", ownedLabels, ownedAnnotations)
+	}
+	resourceVersion := got.ResourceVersion
+	if err := applyOwnedMetadata(context.Background(), base, got, desired); err != nil {
+		t.Fatal(err)
+	}
+	if got.ResourceVersion != resourceVersion {
+		t.Fatalf("converged metadata apply changed resourceVersion from %q to %q", resourceVersion, got.ResourceVersion)
+	}
+
+	// A later apply omits the old managed keys. SSA must release them without
+	// touching the foreign keys that were never owned by this manager.
+	desired = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: "ssa-metadata", Namespace: testNamespace,
+		Labels: map[string]string{"next": "value"},
+	}}
+	if err := applyOwnedMetadata(context.Background(), base, got, desired); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(existing), got); err != nil {
+		t.Fatal(err)
+	}
+	if !maps.Equal(got.Labels, map[string]string{"foreign": "keep", "next": "value"}) {
+		t.Fatalf("labels after subsequent prune = %v", got.Labels)
+	}
+	if !maps.Equal(got.Annotations, map[string]string{"foreign.example": "keep"}) {
+		t.Fatalf("annotations after subsequent prune = %v", got.Annotations)
 	}
 }

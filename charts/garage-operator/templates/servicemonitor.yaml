@@ -1,3 +1,4 @@
+{{- include "garage-operator.monitoringValidation" . -}}
 {{- if and .Values.metrics.enabled .Values.serviceMonitor.enabled -}}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
@@ -10,6 +11,13 @@ metadata:
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
+  {{- with .Values.serviceMonitor.jobLabel }}
+  jobLabel: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.serviceMonitor.targetLabels }}
+  targetLabels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   endpoints:
   - path: /metrics
     port: https
@@ -25,11 +33,32 @@ spec:
     tlsConfig:
       {{- toYaml . | nindent 6 }}
     {{- end }}
+    {{- if .Values.serviceMonitor.honorLabels }}
+    honorLabels: true
+    {{- end }}
+    {{- with .Values.serviceMonitor.relabelings }}
+    relabelings:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.serviceMonitor.metricRelabelings }}
+    metricRelabelings:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
   namespaceSelector:
+    {{- if .Values.serviceMonitor.namespaceSelector.matchNames }}
+    matchNames:
+      {{- toYaml .Values.serviceMonitor.namespaceSelector.matchNames | nindent 6 }}
+    {{- else }}
     matchNames:
     - {{ .Release.Namespace }}
+    {{- end }}
   selector:
+    {{- if .Values.serviceMonitor.selector.matchLabels }}
+    matchLabels:
+      {{- toYaml .Values.serviceMonitor.selector.matchLabels | nindent 6 }}
+    {{- else }}
     matchLabels:
       {{- include "garage-operator.selectorLabels" . | nindent 6 }}
       app.kubernetes.io/component: metrics
+    {{- end }}
 {{- end }}

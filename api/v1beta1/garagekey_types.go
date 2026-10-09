@@ -96,8 +96,8 @@ type GarageKeySpec struct {
 // Specify credentials one of two ways (not both):
 //
 //	# Inline (store in CR — only appropriate for non-sensitive testing)
-//	accessKeyId: GKabcdef...
-//	secretAccessKey: abc123...
+//	accessKeyId: GK0123456789abcdef01234567
+//	secretAccessKey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 //
 //	# From an existing secret (recommended for production)
 //	secretRef:
@@ -105,19 +105,34 @@ type GarageKeySpec struct {
 //	# optionally override key names if they differ from the defaults:
 //	accessKeyIdKey: "MY_ACCESS_KEY"
 //	secretAccessKeyKey: "MY_SECRET_KEY"
+//
+// Admission checks inline credentials against the Garage v2.3 and newer key
+// grammar. Garage v2.0 to v2.2 accept only the shape Garage generates; against
+// those versions Garage answers 400 and the GarageKey Ready condition reports
+// it with reason ImportKeyRejected. Credentials read from secretRef are checked
+// only by Garage.
 type ImportKeyConfig struct {
-	// AccessKeyID is the existing Garage access key ID (must start with "GK").
+	// AccessKeyID is the existing Garage access key ID. Garage v2.3 and newer
+	// accept at least 8 characters from ASCII letters, digits, '-', '_' and '.'
+	// (so keys from other S3 providers can be migrated). Garage v2.0 to v2.2
+	// accept only "GK" followed by 24 hex characters and reject anything else
+	// with a 400 that is reported in the Ready condition.
 	// Use secretRef instead to avoid storing credentials in the CR.
 	// +optional
 	AccessKeyID string `json:"accessKeyId,omitempty"`
 
-	// SecretAccessKey is the existing secret access key.
+	// SecretAccessKey is the existing secret access key. Garage v2.3 and newer
+	// accept at least 16 graphic ASCII characters (U+0021 to U+007E: no spaces,
+	// control characters or non-ASCII text). Garage v2.0 to v2.2 accept only 64
+	// hex characters and reject anything else with a 400 that is reported in the
+	// Ready condition.
 	// Use secretRef instead to avoid storing credentials in the CR.
 	// +optional
 	SecretAccessKey string `json:"secretAccessKey,omitempty"`
 
 	// SecretRef references a Kubernetes secret containing the credentials.
 	// Mutually exclusive with inline accessKeyId/secretAccessKey.
+	// The namespace must be empty or match the GarageKey namespace.
 	// +optional
 	SecretRef *corev1.SecretReference `json:"secretRef,omitempty"`
 
@@ -188,6 +203,29 @@ type SecretTemplate struct {
 	// +optional
 	BucketNameKey string `json:"bucketNameKey,omitempty"`
 
+	// WebsiteURLKey is the data key under which the bucket website URL is written
+	// in the Secret. Defaults to "website-url". Only used when IncludeWebsiteURL
+	// is true.
+	// +kubebuilder:default="website-url"
+	// +optional
+	WebsiteURLKey string `json:"websiteUrlKey,omitempty"`
+
+	// CredentialsFileKey is the data key under which an AWS shared credentials
+	// file is written. Defaults to "credentials". Only used when
+	// IncludeCredentialsFile is true.
+	// +kubebuilder:default="credentials"
+	// +optional
+	CredentialsFileKey string `json:"credentialsFileKey,omitempty"`
+
+	// CredentialsFileProfile is the profile name used in the AWS shared
+	// credentials file. Defaults to "default". Only used when
+	// IncludeCredentialsFile is true.
+	// +kubebuilder:default="default"
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9][A-Za-z0-9_.-]*$`
+	// +kubebuilder:validation:MaxLength=128
+	// +optional
+	CredentialsFileProfile string `json:"credentialsFileProfile,omitempty"`
+
 	// IncludeEndpoint includes the S3 endpoint in the secret
 	// Defaults to true if not specified
 	// +optional
@@ -203,6 +241,19 @@ type SecretTemplate struct {
 	// references exactly one bucket (via bucketRef or globalAlias); omitted otherwise.
 	// +optional
 	IncludeBucketName *bool `json:"includeBucketName,omitempty"`
+
+	// IncludeWebsiteURL controls whether the referenced bucket's observed website
+	// URL is written to the Secret. Defaults to false. The value is populated only
+	// when the key references exactly one GarageBucket via bucketRef and that
+	// bucket has a non-empty status.websiteUrl.
+	// +optional
+	IncludeWebsiteURL *bool `json:"includeWebsiteUrl,omitempty"`
+
+	// IncludeCredentialsFile controls whether an AWS shared credentials file is
+	// written to the Secret. Defaults to false. The file contains only the access
+	// key ID and secret access key under CredentialsFileProfile.
+	// +optional
+	IncludeCredentialsFile *bool `json:"includeCredentialsFile,omitempty"`
 
 	// AdditionalData includes additional key-value pairs in the secret
 	// +optional
@@ -320,7 +371,9 @@ type GarageKeyStatus struct {
 	// +optional
 	ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
 
-	// ClusterWide indicates this key has cluster-wide bucket access via allBuckets
+	// ClusterWide records reserved or active operator ownership of permissions
+	// managed through spec.allBuckets. It is set before the first remote allow
+	// and remains set until every resulting permission has been removed.
 	// +optional
 	ClusterWide bool `json:"clusterWide"`
 
@@ -336,7 +389,16 @@ type GarageKeyStatus struct {
 	// +optional
 	Buckets []KeyBucketAccess `json:"buckets,omitempty"`
 
-	// EffectivePermissions shows merged permissions from both bucket and key definitions
+	// ManagedBucketGrants lists Garage bucket IDs with reserved or active
+	// operator ownership from this key's spec.bucketPermissions. IDs are recorded
+	// before the first remote mutation and removed only after exact convergence,
+	// allowing crash-safe removal or downgrade without touching manual grants.
+	// Cluster-wide spec.allBuckets ownership is represented by ClusterWide.
+	// +optional
+	ManagedBucketGrants []string `json:"managedBucketGrants,omitempty"`
+
+	// EffectivePermissions is retained for API compatibility but is not currently
+	// populated. Status.Buckets reports Garage's authoritative effective bucket access.
 	// +optional
 	EffectivePermissions []EffectivePermission `json:"effectivePermissions,omitempty"`
 

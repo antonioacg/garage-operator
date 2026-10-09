@@ -19,24 +19,503 @@ package utils
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
 )
 
 const (
-	certmanagerVersion = "v1.19.1"
-	certmanagerURLTmpl = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
+	certmanagerVersion     = "v1.19.1"
+	certmanagerManifestSHA = "876a41a57e36b85619f4124b24b3deb80912b5ffed515f90e2f160b6e6338e81"
+	certmanagerURLTmpl     = "https://github.com/cert-manager/cert-manager/releases/download/%s/cert-manager.yaml"
+	certmanagerMaxBytes    = 20 << 20
 
 	defaultKindBinary  = "kind"
 	defaultKindCluster = "kind"
 )
 
+func bindKubectlContext(cmd *exec.Cmd) error {
+	if cmd == nil || len(cmd.Args) == 0 || filepath.Base(cmd.Args[0]) != kubectlBinary {
+		return nil
+	}
+	cluster := strings.TrimSpace(os.Getenv("KIND_CLUSTER"))
+	if cluster == "" {
+		return nil
+	}
+	expected := "kind-" + cluster
+	for i, arg := range cmd.Args[1:] {
+		if arg == "--" {
+			break
+		}
+		if strings.HasPrefix(arg, kubectlContextFlag+"=") {
+			if contextName := strings.TrimPrefix(arg, kubectlContextFlag+"="); contextName != expected {
+				return fmt.Errorf("refusing kubectl context %q during Kind E2E; expected %q", contextName, expected)
+			}
+			return nil
+		}
+		if arg == kubectlContextFlag {
+			index := i + 2
+			if index >= len(cmd.Args) || cmd.Args[index] != expected {
+				actual := ""
+				if index < len(cmd.Args) {
+					actual = cmd.Args[index]
+				}
+				return fmt.Errorf("refusing kubectl context %q during Kind E2E; expected %q", actual, expected)
+			}
+			return nil
+		}
+	}
+	args := make([]string, 0, len(cmd.Args)+1)
+	args = append(args, cmd.Args[0], "--context="+expected)
+	cmd.Args = append(args, cmd.Args[1:]...)
+	return nil
+}
+
+var certmanagerImagePins = map[string]string{
+	"quay.io/jetstack/cert-manager-controller:v1.19.1": "quay.io/jetstack/cert-manager-controller:v1.19.1@sha256:cd49e769e18ada1fd7b9a9bacc87c90db24c65cbfd4bf71694dda7ed40e91187",
+	"quay.io/jetstack/cert-manager-cainjector:v1.19.1": "quay.io/jetstack/cert-manager-cainjector:v1.19.1@sha256:c7898aece8fb08102fca0b37683e37cb94e0a77c0d15b8e3c9128f6c04c868e0",
+	"quay.io/jetstack/cert-manager-webhook:v1.19.1":    "quay.io/jetstack/cert-manager-webhook:v1.19.1@sha256:f5bfe77541e38978aec53cc6eb924d190e1fe923c98b2582e6ccf5edf6c02cce",
+	"quay.io/jetstack/cert-manager-acmesolver:v1.19.1": "quay.io/jetstack/cert-manager-acmesolver:v1.19.1@sha256:35ed1103cb49a3e1fc2438de84f304e3fbdeb53e0366f6b1bc2ec9b2e57462db",
+}
+
 func warnError(err error) {
 	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)
+}
+
+var certmanagerManifestCache struct {
+	once    sync.Once
+	payload []byte
+	err     error
+}
+
+// certManagerManifest returns the exact cert-manager release manifest expected
+// by the E2E suite. It is downloaded and verified at most once so apply and
+// teardown consume identical bytes without teardown depending on the network.
+// The immutable in-memory cache is safe for concurrent callers and is reclaimed
+// automatically when the test process exits.
+func certManagerManifest() ([]byte, error) {
+	certmanagerManifestCache.once.Do(func() {
+		certmanagerManifestCache.payload, certmanagerManifestCache.err = downloadCertManagerManifest()
+	})
+	return certmanagerManifestCache.payload, certmanagerManifestCache.err
+}
+
+func downloadCertManagerManifest() ([]byte, error) {
+	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create cert-manager manifest request: %w", err)
+	}
+	client := &http.Client{Timeout: 2 * time.Minute}
+	response, err := client.Do(request) // #nosec G107 -- fixed HTTPS release URL
+	if err != nil {
+		return nil, fmt.Errorf("download cert-manager manifest: %w", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download cert-manager manifest: HTTP %s", response.Status)
+	}
+
+	payload, err := io.ReadAll(io.LimitReader(response.Body, certmanagerMaxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read cert-manager manifest: %w", err)
+	}
+	if len(payload) > certmanagerMaxBytes {
+		return nil, fmt.Errorf("cert-manager manifest exceeds %d bytes", certmanagerMaxBytes)
+	}
+	if digest := fmt.Sprintf("%x", sha256.Sum256(payload)); digest != certmanagerManifestSHA {
+		return nil, fmt.Errorf("cert-manager manifest checksum %s, want %s", digest, certmanagerManifestSHA)
+	}
+	return pinCertManagerImages(payload)
+}
+
+func pinCertManagerImages(payload []byte) ([]byte, error) {
+	pinned := bytes.Clone(payload)
+	for source, target := range certmanagerImagePins {
+		if bytes.Count(pinned, []byte(source)) != 1 {
+			return nil, fmt.Errorf("cert-manager manifest must contain image %q exactly once", source)
+		}
+		pinned = bytes.ReplaceAll(pinned, []byte(source), []byte(target))
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(pinned))
+	scanner.Buffer(make([]byte, 64*1024), certmanagerMaxBytes)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		image := ""
+		if strings.HasPrefix(line, "image:") {
+			image = strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "image:")), `"'`)
+		} else {
+			argument := strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, "- ")), `"'`)
+			if equals := strings.IndexByte(argument, '='); equals > 2 &&
+				strings.HasPrefix(argument, "--") && strings.HasSuffix(argument[:equals], "-image") {
+				image = strings.Trim(argument[equals+1:], `"'`)
+			}
+		}
+		if image != "" && !isSHA256DigestPinned(image) {
+			return nil, fmt.Errorf("cert-manager manifest contains image without digest: %s", image)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan cert-manager manifest images: %w", err)
+	}
+	return pinned, nil
+}
+
+func isSHA256DigestPinned(image string) bool {
+	const separator = "@sha256:"
+	index := strings.LastIndex(image, separator)
+	if index < 1 || len(image[index+len(separator):]) != 64 {
+		return false
+	}
+	for _, character := range image[index+len(separator):] {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+const (
+	// defaultKubectlDeleteTimeout bounds any `kubectl delete` the suite issues
+	// without saying how long it is willing to wait.
+	//
+	// Garage finalizers are fail-closed: a GarageCluster whose Admin API it cannot
+	// reach, or whose layout it cannot prove safe to release, blocks deletion
+	// indefinitely. An unbounded delete in a teardown hook inherits that block, and
+	// because teardown runs inside the same `go test` process it consumes the rest of
+	// the shard's budget. The result reports as "panic: test timed out after 40m"
+	// attributed to whichever cleanup line happened to be executing, hiding both the
+	// stuck finalizer and every spec that never got to run — twice observed on this
+	// suite, in two different shards.
+	//
+	// The delete is still issued and processed asynchronously; the suite just
+	// stops blocking on an unbounded finalizer or API request. Callers that need
+	// to assert a delete completed keep doing so with their own Eventually.
+	defaultKubectlDeleteTimeout  = "3m"
+	defaultKubectlRequestTimeout = "15s"
+
+	// CLI clients can hang below their own API deadlines while waiting on a
+	// daemon, a child process, or an inherited output pipe. Keep those clients
+	// bounded at a layer outside the client as well. The values are deliberately
+	// longer than the operation-specific flags used by the suite.
+	defaultKubectlExecutionTimeout = 6 * time.Minute
+	defaultDockerExecTimeout       = 2 * time.Minute
+	defaultDockerBuildTimeout      = 15 * time.Minute
+	defaultKindQueryTimeout        = 30 * time.Second
+	defaultKindOperationTimeout    = 10 * time.Minute
+	defaultHelmInstallTimeout      = 6 * time.Minute
+	defaultHelmUninstallTimeout    = 4 * time.Minute
+	defaultMakeTimeout             = 10 * time.Minute
+	defaultMakeBuildTimeout        = 15 * time.Minute
+
+	kubectlBinary             = "kubectl"
+	kubectlContextFlag        = "--context"
+	kubectlDeleteVerb         = "delete"
+	kubectlExecVerb           = "exec"
+	kubectlGetVerb            = "get"
+	kubectlLogsVerb           = "logs"
+	kubectlPortForwardVerb    = "port-forward"
+	kubectlRequestTimeoutFlag = "--request-timeout"
+	kubectlWaitFalseFlag      = "--wait=false"
+	kubectlRunVerb            = "run"
+	dockerBinary              = "docker"
+	podmanBinary              = "podman"
+	helmBinary                = "helm"
+	makeBinary                = "make"
+)
+
+// kubectlVerb returns kubectl's subcommand while accounting for global flags
+// that take a separate value. Command-specific flags appear after the verb in
+// every command used by the E2E helpers and therefore do not affect this scan.
+func kubectlVerb(args []string) string {
+	if len(args) < 2 || filepath.Base(args[0]) != kubectlBinary {
+		return ""
+	}
+
+	skipNext := false
+	for _, arg := range args[1:] {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		switch arg {
+		case kubectlContextFlag, "--kubeconfig", "--namespace", "-n", "--server", "--as", "--as-group", "--as-user", "--as-uid", "--cluster", "--user", "--token", "--certificate-authority", "--client-certificate", "--client-key", "--cache-dir", kubectlRequestTimeoutFlag, "-f":
+			skipNext = true
+			continue
+		case "--":
+			return ""
+		}
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		return arg
+	}
+	return ""
+}
+
+func hasKubectlRequestTimeout(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if arg == kubectlRequestTimeoutFlag || strings.HasPrefix(arg, kubectlRequestTimeoutFlag+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+// boundKubectlDelete bounds both sides of a kubectl delete. A regular delete
+// gets a deadline for waiting on object disappearance and an API request
+// deadline; a --wait=false delete gets only the request deadline because it
+// intentionally does not wait for object disappearance.
+func boundKubectlDelete(cmd *exec.Cmd) {
+	if cmd == nil || len(cmd.Args) < 2 || filepath.Base(cmd.Args[0]) != kubectlBinary {
+		return
+	}
+	if kubectlVerb(cmd.Args) != kubectlDeleteVerb {
+		return
+	}
+	waitFalse := false
+	requestTimeout := false
+	deleteTimeout := false
+	for _, arg := range cmd.Args {
+		if arg == "--" {
+			break
+		}
+		if arg == "--timeout" || strings.HasPrefix(arg, "--timeout=") {
+			deleteTimeout = true
+		}
+		if arg == kubectlRequestTimeoutFlag || strings.HasPrefix(arg, kubectlRequestTimeoutFlag+"=") {
+			requestTimeout = true
+		}
+		if arg == kubectlWaitFalseFlag {
+			waitFalse = true
+		}
+	}
+	if waitFalse {
+		if !requestTimeout {
+			cmd.Args = append(cmd.Args, kubectlRequestTimeoutFlag+"="+defaultKubectlRequestTimeout)
+		}
+		return
+	}
+	if !deleteTimeout {
+		cmd.Args = append(cmd.Args, "--timeout="+defaultKubectlDeleteTimeout)
+	}
+	if !requestTimeout {
+		cmd.Args = append(cmd.Args, kubectlRequestTimeoutFlag+"="+defaultKubectlRequestTimeout)
+	}
+}
+
+// boundKubectlRequest adds a finite API request deadline to one-shot kubectl
+// operations. Long-lived watch/stream commands deliberately remain untouched:
+// `kubectl wait`, following logs, `exec`, `rollout status`, and `port-forward` have
+// operation-specific lifetimes and a request timeout would terminate their
+// streams before those lifetimes expire. Non-following logs are finite and get
+// both a bounded startup wait and API request deadline; callers that use `-f`
+// retain only the startup wait. `kubectl exec` and `kubectl run` get the flag
+// before their `--` child-command separator so it cannot leak into the child
+// command.
+func boundKubectlRequest(cmd *exec.Cmd) {
+	if cmd == nil || len(cmd.Args) < 2 || filepath.Base(cmd.Args[0]) != kubectlBinary {
+		return
+	}
+
+	verb := kubectlVerb(cmd.Args)
+	if verb == kubectlLogsVerb {
+		if !hasKubectlFlag(cmd.Args, "--pod-running-timeout") {
+			cmd.Args = append(cmd.Args, "--pod-running-timeout=15s")
+		}
+		if !hasKubectlFollow(cmd.Args) && !hasKubectlRequestTimeout(cmd.Args) {
+			cmd.Args = append(cmd.Args, kubectlRequestTimeoutFlag+"="+defaultKubectlRequestTimeout)
+		}
+		return
+	}
+	if hasKubectlRequestTimeout(cmd.Args) {
+		return
+	}
+	switch verb {
+	case kubectlGetVerb, "apply", "create", "patch", "label", "annotate", kubectlDeleteVerb, "scale", "api-resources", "describe", "cluster-info", "kustomize":
+		cmd.Args = append(cmd.Args, kubectlRequestTimeoutFlag+"="+defaultKubectlRequestTimeout)
+	case kubectlExecVerb, kubectlRunVerb:
+		separator := len(cmd.Args)
+		for index, arg := range cmd.Args {
+			if arg == "--" {
+				separator = index
+				break
+			}
+		}
+		requestTimeout := kubectlRequestTimeoutFlag + "=" + defaultKubectlRequestTimeout
+		if separator == len(cmd.Args) {
+			cmd.Args = append(cmd.Args, requestTimeout)
+			return
+		}
+		cmd.Args = append(cmd.Args, "")
+		copy(cmd.Args[separator+1:], cmd.Args[separator:])
+		cmd.Args[separator] = requestTimeout
+	}
+}
+
+func hasKubectlFlag(args []string, flag string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if arg == flag || strings.HasPrefix(arg, flag+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasKubectlFollow(args []string) bool {
+	for _, arg := range args {
+		if arg == "--" {
+			return false
+		}
+		if arg == "-f" || arg == "--follow" || arg == "--follow=true" {
+			return true
+		}
+	}
+	return false
+}
+
+// e2eCommandTimeout returns the outer deadline for commands that talk to
+// Docker/Kind/Helm or launch a shell through make. Kubectl's own request and
+// operation flags remain the source of truth for their normal behavior; this
+// outer deadline only protects against a wedged client or daemon. Streaming
+// commands are left to their caller because they have no meaningful finite
+// completion time.
+func e2eCommandTimeout(cmd *exec.Cmd) time.Duration {
+	if cmd == nil || len(cmd.Args) == 0 {
+		return 0
+	}
+
+	switch filepath.Base(cmd.Args[0]) {
+	case kubectlBinary:
+		verb := kubectlVerb(cmd.Args)
+		if verb == kubectlPortForwardVerb || (verb == kubectlLogsVerb && hasKubectlFollow(cmd.Args)) {
+			return 0
+		}
+		return defaultKubectlExecutionTimeout
+	case dockerBinary, podmanBinary:
+		if len(cmd.Args) < 2 {
+			return defaultDockerExecTimeout
+		}
+		switch cmd.Args[1] {
+		case "build", "save", "load":
+			return defaultDockerBuildTimeout
+		case kubectlExecVerb:
+			return defaultDockerExecTimeout
+		default:
+			return defaultDockerExecTimeout
+		}
+	case defaultKindBinary:
+		if len(cmd.Args) >= 2 && cmd.Args[1] == kubectlGetVerb {
+			return defaultKindQueryTimeout
+		}
+		return defaultKindOperationTimeout
+	case helmBinary:
+		if len(cmd.Args) >= 2 {
+			switch cmd.Args[1] {
+			case "install", "upgrade":
+				return defaultHelmInstallTimeout
+			case "uninstall":
+				return defaultHelmUninstallTimeout
+			}
+		}
+		return defaultDockerExecTimeout
+	case makeBinary:
+		for _, arg := range cmd.Args[1:] {
+			if arg == "docker-build" || strings.HasPrefix(arg, "docker-build=") {
+				return defaultMakeBuildTimeout
+			}
+		}
+		return defaultMakeTimeout
+	case "wait-for-operator-webhook.sh":
+		if len(cmd.Args) >= 5 {
+			seconds, err := strconv.Atoi(cmd.Args[4])
+			if err == nil && seconds > 0 {
+				return time.Duration(seconds) * time.Second
+			}
+		}
+		return 2 * time.Minute
+	default:
+		return 0
+	}
+}
+
+type synchronizedOutputBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *synchronizedOutputBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *synchronizedOutputBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
+// runE2ECommandWithTimeout runs a command through a context while preserving
+// the command properties that E2E callers set (working directory, environment,
+// stdin, output writers, and extra files). A process group is configured by
+// configureE2EProcess so a timed-out make/docker client cannot leave a child
+// holding the test process's pipes open.
+func runE2ECommandWithTimeout(cmd *exec.Cmd, timeout time.Duration) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	path := cmd.Path
+	if path == "" {
+		path = cmd.Args[0]
+	}
+	bounded := exec.CommandContext(ctx, path, cmd.Args[1:]...)
+	bounded.Dir = cmd.Dir
+	bounded.Env = cmd.Env
+	bounded.Stdin = cmd.Stdin
+	var captured synchronizedOutputBuffer
+	bounded.Stdout = &captured
+	if cmd.Stdout != nil {
+		bounded.Stdout = io.MultiWriter(&captured, cmd.Stdout)
+	}
+	bounded.Stderr = &captured
+	if cmd.Stderr != nil {
+		bounded.Stderr = io.MultiWriter(&captured, cmd.Stderr)
+	}
+	bounded.ExtraFiles = cmd.ExtraFiles
+	configureE2EProcess(bounded)
+	// Even a process that ignores SIGKILL can leave an inherited pipe open.
+	// WaitDelay ensures CombinedOutput returns instead of waiting forever for
+	// such a descriptor.
+	bounded.WaitDelay = 5 * time.Second
+
+	err := bounded.Run()
+	output := captured.Bytes()
+	if err != nil && ctx.Err() == context.DeadlineExceeded {
+		return output, fmt.Errorf("command timed out after %s: %w", timeout, context.DeadlineExceeded)
+	}
+	return output, err
 }
 
 // Run executes the provided command within this context
@@ -49,9 +528,20 @@ func Run(cmd *exec.Cmd) (string, error) {
 	}
 
 	cmd.Env = append(os.Environ(), "GO111MODULE=on")
+	if err := bindKubectlContext(cmd); err != nil {
+		return "", err
+	}
+	boundKubectlDelete(cmd)
+	boundKubectlRequest(cmd)
 	command := strings.Join(cmd.Args, " ")
 	_, _ = fmt.Fprintf(GinkgoWriter, "running: %q\n", command)
-	output, err := cmd.CombinedOutput()
+	var output []byte
+	var err error
+	if timeout := e2eCommandTimeout(cmd); timeout > 0 {
+		output, err = runE2ECommandWithTimeout(cmd, timeout)
+	} else {
+		output, err = cmd.CombinedOutput()
+	}
 	if err != nil {
 		return string(output), fmt.Errorf("%q failed with error %q: %w", command, string(output), err)
 	}
@@ -61,8 +551,14 @@ func Run(cmd *exec.Cmd) (string, error) {
 
 // UninstallCertManager uninstalls the cert manager
 func UninstallCertManager() {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "delete", "-f", url, "--timeout=2m", "--wait=false")
+	manifest, err := certManagerManifest()
+	if err != nil {
+		warnError(err)
+		return
+	}
+
+	cmd := exec.Command("kubectl", "delete", "-f", "-", "--timeout=2m", "--wait=false")
+	cmd.Stdin = bytes.NewReader(manifest)
 	if _, err := Run(cmd); err != nil {
 		warnError(err)
 	}
@@ -83,8 +579,13 @@ func UninstallCertManager() {
 
 // InstallCertManager installs the cert manager bundle.
 func InstallCertManager() error {
-	url := fmt.Sprintf(certmanagerURLTmpl, certmanagerVersion)
-	cmd := exec.Command("kubectl", "apply", "-f", url)
+	manifest, err := certManagerManifest()
+	if err != nil {
+		return err
+	}
+
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = bytes.NewReader(manifest)
 	if _, err := Run(cmd); err != nil {
 		return err
 	}
@@ -96,7 +597,7 @@ func InstallCertManager() error {
 		"--timeout", "5m",
 	)
 
-	_, err := Run(cmd)
+	_, err = Run(cmd)
 	return err
 }
 
@@ -264,18 +765,96 @@ var GarageCRDs = []string{
 	"garagereferencegrants.garage.rajsingh.info",
 }
 
+type garageCRDList struct {
+	Items []struct {
+		Metadata struct {
+			Name string `json:"name"`
+		} `json:"metadata"`
+		Status struct {
+			Conditions []struct {
+				Type   string `json:"type"`
+				Status string `json:"status"`
+			} `json:"conditions"`
+		} `json:"status"`
+	} `json:"items"`
+}
+
+// missingEstablishedGarageCRDs returns the Garage CRDs that are either absent
+// from the list or do not yet have Established=True. Reading the condition
+// array ourselves is intentional: kubectl wait's condition accessor can fail
+// with "expected []interface{}" while a newly-created CRD still has a nil
+// status.conditions field, aborting the whole multi-resource wait instead of
+// retrying that CRD.
+func missingEstablishedGarageCRDs(output string) ([]string, error) {
+	var crds garageCRDList
+	if err := json.Unmarshal([]byte(stripKubectlWarnings(output)), &crds); err != nil {
+		return nil, fmt.Errorf("decode CRD list: %w", err)
+	}
+
+	established := make(map[string]bool, len(crds.Items))
+	for _, crd := range crds.Items {
+		for _, condition := range crd.Status.Conditions {
+			if condition.Type == "Established" && condition.Status == "True" {
+				established[crd.Metadata.Name] = true
+				break
+			}
+		}
+	}
+
+	missing := make([]string, 0)
+	for _, name := range GarageCRDs {
+		if !established[name] {
+			missing = append(missing, name)
+		}
+	}
+	return missing, nil
+}
+
+// stripKubectlWarnings removes warning lines that kubectl may write to the
+// same combined output stream as JSON. It deliberately leaves all other lines
+// untouched so malformed API output still fails closed in the JSON decoder.
+func stripKubectlWarnings(output string) string {
+	lines := make([]string, 0)
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "Warning:") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
 // WaitCRDsEstablished blocks until every Garage CRD reports
 // `Established=True`, then forces a kubectl discovery-cache refresh so the
-// next apply does not race against a stale REST mapper. Returns the kubectl
-// error if any individual wait fails.
+// next apply does not race against a stale REST mapper. The bounded JSON poll
+// tolerates a CRD existing briefly without a status.conditions array.
 func WaitCRDsEstablished() error {
-	args := make([]string, 0, 3+len(GarageCRDs))
-	args = append(args, "wait", "--for=condition=Established", "--timeout=60s")
-	for _, crd := range GarageCRDs {
-		args = append(args, "crd/"+crd)
-	}
-	if _, err := Run(exec.Command("kubectl", args...)); err != nil {
-		return fmt.Errorf("waiting for CRDs to be Established: %w", err)
+	deadline := time.Now().Add(60 * time.Second)
+	var lastErr error
+	for {
+		output, err := Run(exec.Command("kubectl", "get", "crd", "-o", "json", "--request-timeout=10s"))
+		if err != nil {
+			lastErr = fmt.Errorf("listing CRDs: %w", err)
+		} else {
+			missing, parseErr := missingEstablishedGarageCRDs(output)
+			if parseErr != nil {
+				lastErr = parseErr
+			} else if len(missing) == 0 {
+				break
+			} else {
+				lastErr = fmt.Errorf("CRDs not yet Established: %s", strings.Join(missing, ", "))
+			}
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("waiting for Garage CRDs to be Established: %w", lastErr)
+		}
+		interval := 500 * time.Millisecond
+		if interval > remaining {
+			interval = remaining
+		}
+		time.Sleep(interval)
 	}
 	// Refresh kubectl's discovery cache. Without this, the very first apply
 	// after `make install` can fail with "no matches for kind" because the

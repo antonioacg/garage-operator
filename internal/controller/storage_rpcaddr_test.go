@@ -17,7 +17,10 @@ limitations under the License.
 package controller
 
 import (
+	"errors"
 	"fmt"
+	"reflect"
+	"slices"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -27,6 +30,7 @@ import (
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
+	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
 
 var _ = Describe("buildAutoModeStorageNode rpc_public_addr per-ordinal (#cross-region storage reachability)", func() {
@@ -35,7 +39,7 @@ var _ = Describe("buildAutoModeStorageNode rpc_public_addr per-ordinal (#cross-r
 	}
 	makeCluster := func(name, rpcAddr string, ep *garagev1beta2.PublicEndpointConfig) *garagev1beta2.GarageCluster {
 		return &garagev1beta2.GarageCluster{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, UID: "test-uid"},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace, UID: testCRUID},
 			Spec: garagev1beta2.GarageClusterSpec{
 				LayoutPolicy: LayoutPolicyAuto,
 				Storage: &garagev1beta2.StorageSpec{
@@ -96,6 +100,129 @@ var _ = Describe("buildAutoModeStorageNode rpc_public_addr per-ordinal (#cross-r
 
 // TestParseRemotePodOrdinal verifies ordinal extraction for both tiers from
 // layout tags, including the gateway delegation wrapper.
+func TestNodeIDFromDiscovery(t *testing.T) {
+	discoveryErr := errors.New("pod unavailable")
+
+	if got, fallback, err := nodeIDFromDiscovery("live-id", nil, "stale-id"); got != "live-id" || fallback || err != nil {
+		t.Fatalf("live discovery = (%q,%v,%v), want live-id without fallback", got, fallback, err)
+	}
+	if got, fallback, err := nodeIDFromDiscovery("", discoveryErr, "observed-id"); got != "observed-id" || !fallback || err != nil {
+		t.Fatalf("offline fallback = (%q,%v,%v), want observed-id fallback", got, fallback, err)
+	}
+	if _, _, err := nodeIDFromDiscovery("", discoveryErr, ""); !errors.Is(err, discoveryErr) {
+		t.Fatalf("missing fallback error = %v, want discovery error", err)
+	}
+}
+
+func TestNodeSpecificRPCAddressTags(t *testing.T) {
+	original := []string{
+		"cluster:forged/namespace",
+		"cluster-uid:forged",
+		testTierGatewayTag,
+		nodeRPCAddressTagPrefix + "old.example:3901",
+		"node-local-pool:forged",
+		"kubernetes-node:forged",
+		testRackATag,
+	}
+	tags := desiredNodeRoleTags(
+		original,
+		"new.example:3901",
+		testGatewayOwnershipTag,
+		"cluster-uid:real-site",
+		testTierStorageTag,
+		"node-local-pool:local",
+		"kubernetes-node:worker-1",
+	)
+	want := []string{
+		testGatewayOwnershipTag,
+		"cluster-uid:real-site",
+		testTierStorageTag,
+		"node-local-pool:local",
+		"kubernetes-node:worker-1",
+		testRackATag,
+		nodeRPCAddressTagPrefix + "new.example:3901",
+	}
+	if !reflect.DeepEqual(tags, want) {
+		t.Fatalf("desired tags = %#v, want canonical reserved tags %#v", tags, want)
+	}
+	if original[3] != nodeRPCAddressTagPrefix+"old.example:3901" {
+		t.Fatalf("desiredNodeRoleTags mutated its input: %#v", original)
+	}
+
+	capacity := uint64(1024)
+	remote := garagev1beta2.RemoteClusterConfig{Name: testRemoteRoleTag, Zone: "remote-zone"}
+	imported := remoteImportTags(remote, testGarageValue, &capacity, tags)
+	wantRPC := nodeRPCAddressTagPrefix + "new.example:3901"
+	foundRPC := false
+	for _, tag := range imported {
+		if tag == wantRPC {
+			foundRPC = true
+		}
+	}
+	if !foundRPC {
+		t.Fatalf("imported tags lost node RPC address: %#v", imported)
+	}
+	if !slices.Contains(imported, testGatewayOwnershipTag) || !slices.Contains(imported, "cluster-uid:real-site") {
+		t.Fatalf("federated import rewrote immutable source ownership tags: %#v", imported)
+	}
+
+	node := garage.NodeInfo{Role: &garage.NodeAssignedRole{Tags: imported}}
+	addr, source := remoteNodeRPCAddress(node, "shared.example", 3901)
+	if addr != "new.example:3901" || source != nodeRPCAddressSourceLayoutTag {
+		t.Fatalf("address = (%q,%q), want node-specific layout address", addr, source)
+	}
+}
+
+func TestRemoteNodeRPCAddressFallbacks(t *testing.T) {
+	observed := "10.0.0.2:3901"
+	node := garage.NodeInfo{Address: &observed}
+	// A known peer address wins over the shared (local-DNS-resolved) host:
+	// the shared host may resolve to another cluster and gets gossiped.
+	if addr, source := remoteNodeRPCAddress(node, "shared.example", 3901); addr != observed || source != "observed-peer" {
+		t.Fatalf("known address with shared host = (%q,%q), want the observed peer address", addr, source)
+	}
+	if addr, source := remoteNodeRPCAddress(node, "", 3901); addr != observed || source != "observed-peer" {
+		t.Fatalf("observed fallback = (%q,%q)", addr, source)
+	}
+	// With no known address the shared host remains the bootstrap fallback.
+	unknown := garage.NodeInfo{}
+	if addr, source := remoteNodeRPCAddress(unknown, "shared.example", 3901); addr != "shared.example:3901" || source != "shared-bootstrap" {
+		t.Fatalf("shared bootstrap fallback = (%q,%q)", addr, source)
+	}
+	if addr, source := remoteNodeRPCAddress(unknown, "", 3901); addr != "" || source != "" {
+		t.Fatalf("no address = (%q,%q), want none", addr, source)
+	}
+}
+
+func TestMergeRemoteLayoutRolesRefreshesDaemonSetRPCAddress(t *testing.T) {
+	const nodeID = "1111111111111111111111111111111111111111111111111111111111111111"
+	nodes := []garage.NodeInfo{{
+		ID:   nodeID,
+		IsUp: false,
+		Role: &garage.NodeAssignedRole{
+			Zone: "remote",
+			Tags: []string{nodeRPCAddressTagPrefix + "10.0.0.10:3901"},
+		},
+	}}
+	layout := &garage.ClusterLayout{Roles: []garage.LayoutNodeRole{{
+		ID:   nodeID,
+		Zone: "remote",
+		Tags: []string{nodeRPCAddressTagPrefix + "10.0.0.11:3901"},
+	}}}
+
+	merged := mergeRemoteLayoutRoles(nodes, layout)
+	addr, source := remoteNodeRPCAddress(merged[0], "", 3901)
+	if addr != "10.0.0.11:3901" || source != nodeRPCAddressSourceLayoutTag {
+		t.Fatalf("refreshed address = (%q,%q), want new remote layout tag", addr, source)
+	}
+	if nodes[0].Role.Tags[0] != nodeRPCAddressTagPrefix+"10.0.0.10:3901" {
+		t.Fatalf("mergeRemoteLayoutRoles mutated local status input: %#v", nodes)
+	}
+	if merged[0].IsUp {
+		t.Fatal("role refresh must not overwrite local liveness observation")
+	}
+}
+
 func TestParseRemotePodOrdinal(t *testing.T) {
 	storageTags := []string{testGatewayOwnershipTag, testTierStorageTag, "garage-storage-2-0"}
 	if got, ok := parseRemotePodOrdinal(storageTags, tierStorage); !ok || got != "2" {

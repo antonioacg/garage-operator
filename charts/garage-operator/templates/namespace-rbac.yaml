@@ -3,6 +3,8 @@
 {{- $labels := include "garage-operator.labels" . -}}
 {{- $saName := include "garage-operator.serviceAccountName" . -}}
 {{- $releaseNamespace := .Release.Namespace -}}
+{{- $gatewayAPIEnabled := .Values.gatewayAPI.enabled -}}
+{{- $ingressEnabled := include "garage-operator.ingressEnabled" . -}}
 {{- $watchedNamespaces := splitList "," (include "garage-operator.watchedNamespaces" .) -}}
 {{- range $ns := $watchedNamespaces }}
 ---
@@ -35,9 +37,11 @@ rules:
   resources:
   - pods
   verbs:
+  - create
   - delete
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - ""
@@ -50,6 +54,7 @@ rules:
 - apiGroups:
   - apps
   resources:
+  - daemonsets
   - deployments
   - statefulsets
   verbs:
@@ -59,6 +64,16 @@ rules:
   - list
   - patch
   - update
+  - watch
+# Read-only: the released-environment migration walks Deployment -> ReplicaSet
+# -> Pod to prove which live Garage processes share an RPC identity.
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
+  verbs:
+  - get
+  - list
   - watch
 # Policy resources for PodDisruptionBudget
 - apiGroups:
@@ -129,6 +144,36 @@ rules:
   - patch
   - update
   - watch
+{{- if $gatewayAPIEnabled }}
+# Gateway API HTTPRoutes for website-enabled buckets (spec.websiteExposure)
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - httproutes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+{{- end }}
+{{- if $ingressEnabled }}
+# Ingress resources for website-enabled buckets (spec.websiteExposure)
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - ingresses
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

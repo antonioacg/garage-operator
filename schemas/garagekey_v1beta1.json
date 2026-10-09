@@ -100,7 +100,7 @@
           "description": "ClusterRef references the GarageCluster this key belongs to",
           "properties": {
             "kubeConfigSecretRef": {
-              "description": "KubeConfigSecretRef references a secret containing a kubeconfig for a remote Kubernetes cluster.\nOnly needed for multi-cluster federation where the GarageCluster lives in a different\nKubernetes cluster entirely (not just a different namespace).",
+              "description": "KubeConfigSecretRef is reserved for a future remote Kubernetes client integration.\nIt is currently rejected by admission because the operator does not use it.",
               "properties": {
                 "key": {
                   "description": "The key of the secret to select from.  Must be a valid secret key.",
@@ -128,7 +128,7 @@
               "type": "string"
             },
             "namespace": {
-              "description": "Namespace of the GarageCluster. Defaults to the referencing resource's namespace.\nCross-namespace references require a GarageReferenceGrant in the target namespace.\nNot supported on GarageNode.",
+              "description": "Namespace of the GarageCluster. Defaults to the referencing resource's namespace.\nCross-namespace references require a GarageReferenceGrant where supported by\nthe owning resource. GarageNode and GarageAdminToken reject them.",
               "type": "string"
             }
           },
@@ -147,7 +147,7 @@
           "description": "ImportKey imports an existing key instead of generating new credentials",
           "properties": {
             "accessKeyId": {
-              "description": "AccessKeyID is the existing Garage access key ID (must start with \"GK\").\nUse secretRef instead to avoid storing credentials in the CR.",
+              "description": "AccessKeyID is the existing Garage access key ID. Garage v2.3 and newer\naccept at least 8 characters from ASCII letters, digits, '-', '_' and '.'\n(so keys from other S3 providers can be migrated). Garage v2.0 to v2.2\naccept only \"GK\" followed by 24 hex characters and reject anything else\nwith a 400 that is reported in the Ready condition.\nUse secretRef instead to avoid storing credentials in the CR.",
               "type": "string"
             },
             "accessKeyIdKey": {
@@ -155,7 +155,7 @@
               "type": "string"
             },
             "secretAccessKey": {
-              "description": "SecretAccessKey is the existing secret access key.\nUse secretRef instead to avoid storing credentials in the CR.",
+              "description": "SecretAccessKey is the existing secret access key. Garage v2.3 and newer\naccept at least 16 graphic ASCII characters (U+0021 to U+007E: no spaces,\ncontrol characters or non-ASCII text). Garage v2.0 to v2.2 accept only 64\nhex characters and reject anything else with a 400 that is reported in the\nReady condition.\nUse secretRef instead to avoid storing credentials in the CR.",
               "type": "string"
             },
             "secretAccessKeyKey": {
@@ -163,7 +163,7 @@
               "type": "string"
             },
             "secretRef": {
-              "description": "SecretRef references a Kubernetes secret containing the credentials.\nMutually exclusive with inline accessKeyId/secretAccessKey.",
+              "description": "SecretRef references a Kubernetes secret containing the credentials.\nMutually exclusive with inline accessKeyId/secretAccessKey.\nThe namespace must be empty or match the GarageKey namespace.",
               "properties": {
                 "name": {
                   "description": "name is unique within a namespace to reference a secret resource.",
@@ -229,6 +229,18 @@
               "description": "BucketNameKey is the data key under which the bucket name is written\nin the Secret. Defaults to \"bucket\". Only used when IncludeBucketName is true.",
               "type": "string"
             },
+            "credentialsFileKey": {
+              "default": "credentials",
+              "description": "CredentialsFileKey is the data key under which an AWS shared credentials\nfile is written. Defaults to \"credentials\". Only used when\nIncludeCredentialsFile is true.",
+              "type": "string"
+            },
+            "credentialsFileProfile": {
+              "default": "default",
+              "description": "CredentialsFileProfile is the profile name used in the AWS shared\ncredentials file. Defaults to \"default\". Only used when\nIncludeCredentialsFile is true.",
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+              "type": "string"
+            },
             "endpointKey": {
               "default": "endpoint",
               "description": "EndpointKey is the key name for the S3 endpoint (includes http:// scheme)",
@@ -243,12 +255,20 @@
               "description": "IncludeBucketName controls whether the bucket name is written to the Secret.\nDefaults to false. When true, the bucket name is populated only if the key\nreferences exactly one bucket (via bucketRef or globalAlias); omitted otherwise.",
               "type": "boolean"
             },
+            "includeCredentialsFile": {
+              "description": "IncludeCredentialsFile controls whether an AWS shared credentials file is\nwritten to the Secret. Defaults to false. The file contains only the access\nkey ID and secret access key under CredentialsFileProfile.",
+              "type": "boolean"
+            },
             "includeEndpoint": {
               "description": "IncludeEndpoint includes the S3 endpoint in the secret\nDefaults to true if not specified",
               "type": "boolean"
             },
             "includeRegion": {
               "description": "IncludeRegion includes the S3 region in the secret\nDefaults to true if not specified",
+              "type": "boolean"
+            },
+            "includeWebsiteUrl": {
+              "description": "IncludeWebsiteURL controls whether the referenced bucket's observed website\nURL is written to the Secret. Defaults to false. The value is populated only\nwhen the key references exactly one GarageBucket via bucketRef and that\nbucket has a non-empty status.websiteUrl.",
               "type": "boolean"
             },
             "labels": {
@@ -280,6 +300,11 @@
             "type": {
               "default": "Opaque",
               "description": "Type is the secret type",
+              "type": "string"
+            },
+            "websiteUrlKey": {
+              "default": "website-url",
+              "description": "WebsiteURLKey is the data key under which the bucket website URL is written\nin the Secret. Defaults to \"website-url\". Only used when IncludeWebsiteURL\nis true.",
               "type": "string"
             }
           },
@@ -339,7 +364,7 @@
           "type": "array"
         },
         "clusterWide": {
-          "description": "ClusterWide indicates this key has cluster-wide bucket access via allBuckets",
+          "description": "ClusterWide records reserved or active operator ownership of permissions\nmanaged through spec.allBuckets. It is set before the first remote allow\nand remains set until every resulting permission has been removed.",
           "type": "boolean"
         },
         "conditions": {
@@ -408,7 +433,7 @@
           "type": "string"
         },
         "effectivePermissions": {
-          "description": "EffectivePermissions shows merged permissions from both bucket and key definitions",
+          "description": "EffectivePermissions is retained for API compatibility but is not currently\npopulated. Status.Buckets reports Garage's authoritative effective bucket access.",
           "items": {
             "description": "EffectivePermission shows the resolved permission for a bucket",
             "properties": {
@@ -453,6 +478,13 @@
         "keyId": {
           "description": "KeyID is the Garage-assigned key ID",
           "type": "string"
+        },
+        "managedBucketGrants": {
+          "description": "ManagedBucketGrants lists Garage bucket IDs with reserved or active\noperator ownership from this key's spec.bucketPermissions. IDs are recorded\nbefore the first remote mutation and removed only after exact convergence,\nallowing crash-safe removal or downgrade without touching manual grants.\nCluster-wide spec.allBuckets ownership is represented by ClusterWide.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "observedGeneration": {
           "description": "ObservedGeneration is the last observed generation",

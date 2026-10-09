@@ -25,23 +25,23 @@ import (
 // ClusterReference identifies a GarageCluster resource.
 // Used by GarageBucket, GarageKey, GarageNode, and GarageAdminToken.
 //
-// Cross-namespace references require a GarageReferenceGrant in the target namespace
-// (the namespace where the GarageCluster lives). Without it, the webhook will reject
-// the resource. GarageNode does not support cross-namespace references at all.
+// GarageBucket and GarageKey support cross-namespace references when a
+// GarageReferenceGrant in the target namespace (where the GarageCluster lives)
+// authorizes them. GarageNode and GarageAdminToken are namespace-local and reject
+// cross-namespace references.
 type ClusterReference struct {
 	// Name of the GarageCluster resource.
 	// +required
 	Name string `json:"name"`
 
 	// Namespace of the GarageCluster. Defaults to the referencing resource's namespace.
-	// Cross-namespace references require a GarageReferenceGrant in the target namespace.
-	// Not supported on GarageNode.
+	// Cross-namespace references require a GarageReferenceGrant where supported by
+	// the owning resource. GarageNode and GarageAdminToken reject them.
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
 
-	// KubeConfigSecretRef references a secret containing a kubeconfig for a remote Kubernetes cluster.
-	// Only needed for multi-cluster federation where the GarageCluster lives in a different
-	// Kubernetes cluster entirely (not just a different namespace).
+	// KubeConfigSecretRef is reserved for a future remote Kubernetes client integration.
+	// It is currently rejected by admission because the operator does not use it.
 	// +optional
 	KubeConfigSecretRef *corev1.SecretKeySelector `json:"kubeConfigSecretRef,omitempty"`
 }
@@ -51,4 +51,15 @@ type SecretReference struct {
 	// Name of the secret
 	// +required
 	Name string `json:"name"`
+}
+
+// ZoneSource derives a Garage layout zone from Kubernetes topology instead of a
+// static string. See the v1beta2 GarageCluster docs for the full semantics.
+type ZoneSource struct {
+	// NodeLabel is the label key on the Kubernetes Node whose value becomes the
+	// Garage layout zone.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=316
+	// +required
+	NodeLabel string `json:"nodeLabel"`
 }

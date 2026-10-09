@@ -29,12 +29,16 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
+	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
 
@@ -547,7 +551,7 @@ var _ = Describe("GarageKey Controller", func() {
 			defer srv.Close()
 
 			r := &GarageKeyReconciler{}
-			err := r.finalize(context.Background(), buildKey(), garage.NewClient(srv.URL, "tok"))
+			err := r.finalize(context.Background(), buildKey(), nil, garage.NewClient(srv.URL, "tok"))
 
 			Expect(err).NotTo(HaveOccurred())
 			Expect(denyCalls).To(ConsistOf(bucketIDGood1, bucketIDStuck, bucketIDGood2))
@@ -561,10 +565,26 @@ var _ = Describe("GarageKey Controller", func() {
 			defer srv.Close()
 
 			r := &GarageKeyReconciler{}
-			err := r.finalize(context.Background(), buildKey(), garage.NewClient(srv.URL, "tok"))
+			err := r.finalize(context.Background(), buildKey(), nil, garage.NewClient(srv.URL, "tok"))
 
 			Expect(err).NotTo(HaveOccurred())
 			Expect(denyCalls).To(HaveLen(3))
+			Expect(atomic.LoadInt32(&deleteCalls)).To(Equal(int32(1)))
+		})
+
+		It("pre-revokes grants preserved only in managedBucketGrants", func() {
+			var denyCalls []string
+			var deleteCalls int32
+			srv := newServer(nil, http.StatusOK, &denyCalls, &deleteCalls)
+			defer srv.Close()
+
+			key := buildKey()
+			key.Status.Buckets = nil
+			key.Status.ManagedBucketGrants = []string{bucketIDGood2}
+			err := (&GarageKeyReconciler{}).finalize(context.Background(), key, nil, garage.NewClient(srv.URL, "tok"))
+
+			Expect(err).NotTo(HaveOccurred())
+			Expect(denyCalls).To(Equal([]string{bucketIDGood2}))
 			Expect(atomic.LoadInt32(&deleteCalls)).To(Equal(int32(1)))
 		})
 
@@ -584,7 +604,7 @@ var _ = Describe("GarageKey Controller", func() {
 			done := make(chan error, 1)
 			start := time.Now()
 			go func() {
-				done <- r.finalize(context.Background(), buildKey(), garage.NewClient(srv.URL, "tok"))
+				done <- r.finalize(context.Background(), buildKey(), nil, garage.NewClient(srv.URL, "tok"))
 			}()
 
 			select {
@@ -601,5 +621,119 @@ var _ = Describe("GarageKey Controller", func() {
 				Fail("finalize blocked past the per-call timeout budget")
 			}
 		})
+	})
+})
+
+var _ = Describe("GarageKey server-side apply migration", func() {
+	It("accepts an allBuckets grant reapplied as scoped permissions", func() {
+		const (
+			name       = "all-buckets-migration"
+			fieldOwner = "garagekey-migration-test"
+		)
+		object := &garagev1beta1.GarageKey{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: testNamespace,
+		}}
+		initial := []byte(`{
+			"apiVersion":"garage.rajsingh.info/v1beta1",
+			"kind":"GarageKey",
+			"metadata":{"name":"all-buckets-migration","namespace":"default"},
+			"spec":{"clusterRef":{"name":"test-cluster"},"allBuckets":{"read":true}}
+		}`)
+		// Apply the original cluster-wide declaration with the same field owner
+		// used for the migration. This makes the second apply model the real
+		// omission of allBuckets from a previously managed configuration.
+		Expect(k8sClient.Patch(ctx, object, client.RawPatch(types.ApplyPatchType, initial),
+			client.FieldOwner(fieldOwner), client.ForceOwnership)).To(Succeed())
+		DeferCleanup(func() {
+			stored := &garagev1beta1.GarageKey{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, stored); err == nil {
+				stored.Finalizers = nil
+				_ = k8sClient.Update(ctx, stored)
+				_ = k8sClient.Delete(ctx, stored)
+			}
+		})
+
+		stored := &garagev1beta1.GarageKey{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, stored)).To(Succeed())
+		Expect(stored.Spec.AllBuckets).NotTo(BeNil())
+		Expect(stored.Spec.AllBuckets.Read).To(BeTrue())
+
+		migration := []byte(`{
+			"apiVersion":"garage.rajsingh.info/v1beta1",
+			"kind":"GarageKey",
+			"metadata":{"name":"all-buckets-migration","namespace":"default"},
+			"spec":{"clusterRef":{"name":"test-cluster"},"bucketPermissions":[{"bucketId":"scoped-bucket","read":true}]}
+		}`)
+		Expect(k8sClient.Patch(ctx, object, client.RawPatch(types.ApplyPatchType, migration),
+			client.FieldOwner(fieldOwner), client.ForceOwnership)).To(Succeed())
+
+		migrated := &garagev1beta1.GarageKey{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: testNamespace}, migrated)).To(Succeed())
+		Expect(migrated.Spec.BucketPermissions).To(HaveLen(1))
+		// Depending on field ownership, the apiserver may remove the optional
+		// parent or retain it as an all-false object after the omission. Both
+		// representations mean that no cluster-wide permissions are desired.
+		effective := migrated.DeepCopy()
+		if effective.Spec.AllBuckets == nil {
+			// The envtest apiserver removes the parent for this field-owner
+			// sequence. Exercise the retained/defaulted representation too; that
+			// is the shape produced by the production migration.
+			effective.Spec.AllBuckets = &garagev1beta1.AllBucketsPermission{}
+		}
+		Expect(*effective.Spec.AllBuckets).To(Equal(garagev1beta1.AllBucketsPermission{}))
+		Expect(garagev1beta1.ValidateGarageKeySpec(effective)).To(Succeed())
+	})
+})
+
+var _ = Describe("GarageKey generated Secret metadata", func() {
+	It("preserves labels and annotations set by other controllers and skips no-op writes", func() {
+		key := &garagev1beta1.GarageKey{
+			ObjectMeta: metav1.ObjectMeta{Name: "metadata-merge-key", Namespace: testNamespace},
+			Spec: garagev1beta1.GarageKeySpec{
+				ClusterRef: garagev1beta1.ClusterReference{Name: testClusterName},
+				SecretTemplate: &garagev1beta1.SecretTemplate{
+					IncludeEndpoint: boolPtr(false),
+					Labels:          map[string]string{"app": "merge-test"},
+					Annotations:     map[string]string{"example.com/from-template": "yes"},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, key)).To(Succeed())
+
+		By("Pre-creating the owned Secret with metadata written by another controller")
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        key.Name,
+				Namespace:   testNamespace,
+				Labels:      map[string]string{"example.com/foreign": "keep"},
+				Annotations: map[string]string{"generate.kyverno.io/clone-source": ""},
+			},
+		}
+		Expect(controllerutil.SetControllerReference(key, secret, k8sClient.Scheme())).To(Succeed())
+		Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		DeferCleanup(func() {
+			_ = k8sClient.Delete(ctx, secret)
+			_ = k8sClient.Delete(ctx, key)
+		})
+
+		reconciler := &GarageKeyReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		reconcileAndGet := func() *corev1.Secret {
+			Expect(reconciler.reconcileSecret(ctx, key, &garagev1beta2.GarageCluster{}, "secret")).To(Succeed())
+			got := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(secret), got)).To(Succeed())
+			return got
+		}
+
+		By("Reconciling and checking foreign metadata survives alongside the operator's keys")
+		got := reconcileAndGet()
+		Expect(got.Labels).To(HaveKeyWithValue("example.com/foreign", "keep"))
+		Expect(got.Annotations).To(HaveKeyWithValue("generate.kyverno.io/clone-source", ""))
+		Expect(got.Labels).To(HaveKeyWithValue(labelAppManagedBy, "garage-operator"))
+		Expect(got.Labels).To(HaveKeyWithValue(keyGeneratedSecretOwnerLabel, string(key.UID)))
+		Expect(got.Labels).To(HaveKeyWithValue("app", "merge-test"))
+		Expect(got.Annotations).To(HaveKeyWithValue("example.com/from-template", "yes"))
+
+		By("Reconciling again against the unchanged Secret and checking it is not rewritten")
+		Expect(reconcileAndGet().ResourceVersion).To(Equal(got.ResourceVersion))
 	})
 })

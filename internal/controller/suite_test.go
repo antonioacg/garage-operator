@@ -34,6 +34,8 @@ import (
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
+	"github.com/rajsinghtech/garage-operator/internal/testutil"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -63,6 +65,12 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	err = garagev1beta2.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
+	// Gateway API types are registered for the fake-client HTTPRoute tests.
+	// The envtest apiserver itself does NOT get the Gateway API CRDs, so the
+	// REST-mapper probe in the bucket controller correctly reports the CRDs
+	// as unavailable there.
+	err = gatewayv1.Install(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
 
 	// +kubebuilder:scaffold:scheme
 
@@ -72,9 +80,9 @@ var _ = BeforeSuite(func() {
 		ErrorIfCRDPathMissing: true,
 	}
 
-	// Retrieve the first found binary directory to allow running tests from IDEs
-	if getFirstFoundEnvTestBinaryDir() != "" {
-		testEnv.BinaryAssetsDirectory = getFirstFoundEnvTestBinaryDir()
+	// Retrieve a complete binary directory to allow running tests from IDEs.
+	if binaryDir := getEnvTestBinaryDir(); binaryDir != "" {
+		testEnv.BinaryAssetsDirectory = binaryDir
 	}
 
 	// cfg is defined in this file globally.
@@ -94,7 +102,7 @@ var _ = AfterSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 })
 
-// getFirstFoundEnvTestBinaryDir locates the first binary in the specified path.
+// getEnvTestBinaryDir locates a complete envtest binary set.
 // ENVTEST-based tests depend on specific binaries, usually located in paths set by
 // controller-runtime. When running tests directly (e.g., via an IDE) without using
 // Makefile targets, the 'BinaryAssetsDirectory' must be explicitly configured.
@@ -102,17 +110,9 @@ var _ = AfterSuite(func() {
 // This function streamlines the process by finding the required binaries, similar to
 // setting the 'KUBEBUILDER_ASSETS' environment variable. To ensure the binaries are
 // properly set up, run 'make setup-envtest' beforehand.
-func getFirstFoundEnvTestBinaryDir() string {
-	basePath := filepath.Join("..", "..", "bin", "k8s")
-	entries, err := os.ReadDir(basePath)
-	if err != nil {
-		logf.Log.Error(err, "Failed to read directory", "path", basePath)
-		return ""
-	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			return filepath.Join(basePath, entry.Name())
-		}
-	}
-	return ""
+func getEnvTestBinaryDir() string {
+	return testutil.FindEnvTestBinaryDir(
+		os.Getenv("KUBEBUILDER_ASSETS"),
+		filepath.Join("..", "..", "bin", "k8s"),
+	)
 }

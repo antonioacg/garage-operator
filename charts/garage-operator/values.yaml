@@ -10,12 +10,14 @@ image:
   # -- Image pull policy
   pullPolicy: IfNotPresent
   # -- Overrides the image tag (default is the chart appVersion)
-  tag: "v0.6.21"
+  tag: "v0.8.2"
+  # -- Immutable image digest. When set, takes precedence over tag and renders repository@digest.
+  digest: ""
 
 # -- Default Garage container image for clusters that don't specify one.
 # When set, all GarageCluster/GarageNode CRs that omit spec.image will use this image.
 # Useful for environments that can only pull from a specific registry.
-# Example: "registry.example.com/garage:v2.3.0"
+# Example: "registry.example.com/garage:v2.4.0"
 defaultGarageImage: ""
 
 # -- Image pull secrets for private registries
@@ -71,8 +73,10 @@ resources:
 
 # Leader election configuration
 leaderElection:
-  # -- Enable leader election for HA deployments
+  # -- Enable the single-active-manager safety boundary. Required for supported installations.
   enabled: true
+  # -- Explicitly acknowledge unsupported single-replica operation without leader election.
+  unsafeAllowDisabled: false
 
 # Health probes configuration
 livenessProbe:
@@ -120,6 +124,61 @@ serviceMonitor:
     insecureSkipVerify: true
   # -- Namespace for ServiceMonitor (defaults to release namespace)
   namespace: ""
+  # -- Override the namespaces from which Prometheus discovers the metrics Service.
+  # An empty matchNames list preserves the release namespace default.
+  namespaceSelector:
+    matchNames: []
+  # -- Override the labels used to select the metrics Service.
+  # An empty matchLabels map preserves the chart-generated selector default.
+  selector:
+    matchLabels: {}
+  # -- Service label whose value becomes the Prometheus job label
+  jobLabel: ""
+  # -- Service labels copied to the Prometheus target
+  targetLabels: []
+  # -- Preserve labels from scraped metrics instead of overwriting conflicts
+  honorLabels: false
+  # -- Prometheus target relabelings
+  relabelings: []
+  # -- Prometheus metric relabelings applied before ingestion
+  metricRelabelings: []
+
+# PodMonitor for Prometheus Operator. ServiceMonitor and PodMonitor are mutually
+# exclusive because enabling both would scrape every operator replica twice.
+podMonitor:
+  # -- Create PodMonitor resource
+  enabled: false
+  # -- Additional labels for PodMonitor
+  labels: {}
+  # -- Metrics scrape interval
+  interval: 30s
+  # -- Metrics scrape timeout
+  scrapeTimeout: 10s
+  # -- Use HTTPS for scraping
+  scheme: https
+  # -- TLS configuration for metrics endpoint
+  tlsConfig:
+    insecureSkipVerify: true
+  # -- Namespace for PodMonitor (defaults to release namespace)
+  namespace: ""
+  # -- Override the namespaces from which Prometheus discovers operator Pods.
+  # An empty matchNames list preserves the release namespace default.
+  namespaceSelector:
+    matchNames: []
+  # -- Override the labels used to select operator Pods.
+  # An empty matchLabels map preserves the chart-generated selector default.
+  selector:
+    matchLabels: {}
+  # -- Pod label whose value becomes the Prometheus job label
+  jobLabel: ""
+  # -- Pod labels copied to the Prometheus target
+  targetLabels: []
+  # -- Preserve labels from scraped metrics instead of overwriting conflicts
+  honorLabels: false
+  # -- Prometheus target relabelings
+  relabelings: []
+  # -- Prometheus metric relabelings applied before ingestion
+  metricRelabelings: []
 
 # Grafana dashboard ConfigMap for the official Garage Prometheus dashboard.
 # Uses the Grafana sidecar pattern — label the ConfigMap so Grafana auto-discovers it.
@@ -149,17 +208,19 @@ prometheusRules:
   additionalRuleLabels: {}
   # -- Additional annotations for all alerting rules
   additionalRuleAnnotations: {}
-  # -- Additional labels per rule group (keys: availability, storage, cluster)
+  # -- Additional labels per rule group (keys: availability, storage, quota, cluster)
   additionalRuleGroupLabels:
     availability: {}
     storage: {}
+    quota: {}
     cluster: {}
-  # -- Additional annotations per rule group (keys: availability, storage, cluster)
+  # -- Additional annotations per rule group (keys: availability, storage, quota, cluster)
   additionalRuleGroupAnnotations:
     availability: {}
     storage: {}
+    quota: {}
     cluster: {}
-  # -- Disable specific alerts by name (e.g. GarageNodeDown: true)
+  # -- Disable specific alerts by name (e.g. GarageNodeDown: true or GarageBucketSizeQuotaNearLimit: true)
   disabled: {}
   # -- Override severity or for duration per rule
   # Example:
@@ -184,9 +245,13 @@ networkPolicy:
 # Kubernetes' storedVersions invariant is preserved.
 webhooks:
   # -- Enable admission and conversion webhooks. Required when multiple API versions
-  # are in use. cert-manager must be installed.
+  # are in use, for nodeLocalPools, and for admission-protected storage deletion.
+  # Disabling this is supported only for local development or simple v1beta2-only
+  # installs that do not rely on those safety boundaries, controller-managed
+  # persistent claims, or PVC-backed rollout/recovery. cert-manager must be installed.
   enabled: true
-  # -- Failure policy for webhooks (Fail or Ignore)
+  # -- Failure policy for ordinary webhooks (Fail or Ignore). The managed-PVC
+  # identity-protection webhook is always Fail.
   failurePolicy: Fail
   # Certificate configuration for webhooks
   certManager:
@@ -247,12 +312,35 @@ clusterDomain: cluster.local
 # Namespace scoping
 # -- List of namespaces to watch (empty means all namespaces, cluster-scoped).
 # When set, the operator only watches the listed namespaces (plus the release namespace)
-# and uses namespace-scoped Roles instead of ClusterRoles.
+# and uses namespace-scoped Roles for managed resources. A separate read-only
+# ClusterRole is rendered for Namespace labels so GarageReferenceGrant
+# namespaceSelector entries can be evaluated.
 # CRDs must still be installed by a cluster admin.
 watchNamespaces: []
 # -- Force cluster-wide watching even when watchNamespaces is set.
 # Only meaningful when watchNamespaces is non-empty; otherwise has no effect.
 watchAnyNamespace: false
+
+# Gateway API support for bucket website exposure (spec.websiteExposure.gateway).
+# When enabled, the operator renders --enable-gateway-api and its RBAC rules
+# for gateway.networking.k8s.io/httproutes. The Gateway API CRDs must be
+# installed separately (the operator never creates them); without them the
+# operator reports a GatewayAPIUnavailable condition and does not create
+# HTTPRoutes.
+gatewayAPI:
+  # -- Enable Gateway API support (HTTPRoute website exposure)
+  enabled: false
+
+# Ingress support for bucket website exposure (spec.websiteExposure.ingress).
+# When enabled, the operator renders --enable-ingress and its RBAC rules for
+# networking.k8s.io/ingresses, and watches the Ingresses it creates. It is off
+# by default (like gatewayAPI.enabled) so the operator holds no Ingress write
+# access, and starts no Ingress informer, unless Ingress exposure is in use.
+# With it disabled, a bucket that sets spec.websiteExposure.ingress reports
+# WebsiteExposed=False with reason IngressDisabled and no Ingress is created.
+ingress:
+  # -- Enable Ingress support (Ingress website exposure)
+  enabled: false
 
 # COSI (Container Object Storage Interface) driver configuration
 cosi:
@@ -260,7 +348,10 @@ cosi:
   enabled: false
   # -- COSI driver name (must match BucketClass/BucketAccessClass driverName)
   driverName: garage.rajsingh.info
-  # -- Namespace for shadow resources (defaults to release namespace)
+  # -- Namespace for shadow resources (defaults to release namespace).
+  # If this differs from a target GarageCluster namespace, create a
+  # GarageReferenceGrant in that target namespace allowing GarageBucket and
+  # GarageKey references from this namespace.
   namespace: ""
 
 # -- Extra Kubernetes objects to deploy with the chart (supports templating)

@@ -19,12 +19,12 @@ package controller
 import (
 	"context"
 	"fmt"
-	"strconv"
-	"strings"
+	"sort"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -35,6 +35,7 @@ import (
 
 	garagev1beta1 "github.com/rajsinghtech/garage-operator/api/v1beta1"
 	garagev1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
+	"github.com/rajsinghtech/garage-operator/internal/factormigration"
 	"github.com/rajsinghtech/garage-operator/internal/garage"
 )
 
@@ -139,7 +140,7 @@ func (r *GarageClusterReconciler) reconcileFactorMigration(ctx context.Context, 
 		r.setFactorMigration(ctx, cluster, func(m *garagev1beta2.FactorMigrationStatus) {
 			*m = garagev1beta2.FactorMigrationStatus{Phase: fmPhaseValidating, ToFactor: toFactor, Force: force, StartedAt: &now}
 		})
-		return ctrl.Result{Requeue: true}, r.removeAnnotations(ctx, cluster, garagev1beta1.AnnotationPurgeClusterLayout)
+		return ctrl.Result{RequeueAfter: time.Nanosecond}, r.removeAnnotations(ctx, cluster, garagev1beta1.AnnotationPurgeClusterLayout)
 	}
 
 	// In-flight: the annotation should already be consumed; remove it defensively
@@ -176,10 +177,9 @@ func (r *GarageClusterReconciler) fmValidate(ctx context.Context, cluster *garag
 	force := fm.Force
 
 	if cluster.Spec.Replication == nil || cluster.Spec.Replication.Factor != toFactor {
-		// The annotation and the spec.replication.factor edit are usually two
-		// separate API operations; the operator may briefly observe the request
-		// before the factor change propagates. Tolerate that race by requeueing
-		// within a short grace window before failing.
+		// Admission requires factor edits to carry the matching annotation in one
+		// update. Retain this grace period for an annotation-first request admitted
+		// by an older webhook during a rolling operator upgrade.
 		if fm != nil && fm.StartedAt != nil && time.Since(fm.StartedAt.Time) < fmValidateGrace {
 			r.setFactorMigration(ctx, cluster, func(m *garagev1beta2.FactorMigrationStatus) {
 				m.Message = fmt.Sprintf("waiting for spec.replication.factor to match annotation factor=%d (currently %d)",
@@ -200,7 +200,13 @@ func (r *GarageClusterReconciler) fmValidate(ctx context.Context, cluster *garag
 	if !cluster.HasStorageTier() {
 		return r.failFactorMigration(ctx, cluster, "factor migration requires a storage tier")
 	}
-	if !force && cluster.Spec.Replication.ConsistencyMode == "dangerous" {
+	if hasNodeLocalPools(cluster) {
+		return r.failFactorMigration(ctx, cluster,
+			"factor migration is not supported while spec.storage.nodeLocalPools are present — "+
+				"the coordinated purge relies on scaling per-ordinal StatefulSets to 0 and back, "+
+				"which has no pool-quiescing equivalent yet; migrate the factor manually")
+	}
+	if !force && cluster.Spec.Replication.ConsistencyMode == consistencyModeDangerous {
 		return r.failFactorMigration(ctx, cluster, "consistencyMode 'dangerous' requires ,force on the purge annotation")
 	}
 	if !force && len(cluster.Status.PendingGatewayTombstones) > 0 {
@@ -225,7 +231,8 @@ func (r *GarageClusterReconciler) fmValidate(ctx context.Context, cluster *garag
 	// at the OLD factor and wedge the cluster in a mixed-factor state (a
 	// lower-factor node std::process::exit(1)s, or the layout is discarded —
 	// src/rpc/system.rs, src/rpc/layout/manager.rs). Refuse rather than corrupt.
-	for name, n := range nodes {
+	for _, name := range sortedFactorMigrationNodeNames(nodes) {
+		n := nodes[name]
 		if nodeHasConfigOverrides(n) {
 			return r.failFactorMigration(ctx, cluster, fmt.Sprintf(
 				"storage node %q has per-node config overrides (e.g. multi-HDD dataPaths, fsync, network, publicEndpoint, or logging); "+
@@ -239,7 +246,7 @@ func (r *GarageClusterReconciler) fmValidate(ctx context.Context, cluster *garag
 		m.PurgeID = purgeIDFromStart(m)
 		m.Message = fmt.Sprintf("validated; reducing/setting replication factor to %d across %d storage nodes", toFactor, len(nodes))
 	})
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: time.Nanosecond}, nil
 }
 
 // fmScaleDown suspends the per-node controllers and scales every storage
@@ -269,7 +276,7 @@ func (r *GarageClusterReconciler) fmScaleDown(ctx context.Context, cluster *gara
 				return ctrl.Result{}, fmt.Errorf("suspending GarageNode %s: %w", name, err)
 			}
 		}
-		if err := r.scaleStorageSTS(ctx, cluster, name, 0); err != nil {
+		if err := r.scaleStorageSTSForNode(ctx, cluster, n, 0); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -287,12 +294,15 @@ func (r *GarageClusterReconciler) fmScaleDown(ctx context.Context, cluster *gara
 		m.Phase = fmPhasePurging
 		m.Message = "all storage pods terminated; deleting on-disk cluster_layout"
 	})
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: time.Nanosecond}, nil
 }
 
-// fmPurge patches each storage StatefulSet with the marker-guarded busybox init
-// container that deletes cluster_layout, then scales it back to 1. The new pod
-// boots with the new factor (from the refreshed ConfigMap) and an empty layout.
+// fmPurge prepares every storage StatefulSet while the entire tier remains at
+// zero replicas, proves every template is complete, and only then begins the
+// scale-up pass. This ordering is deliberately retry-safe: after a crash during
+// preparation all members are still quiesced; after a crash during scale-up a
+// retry verifies the already-prepared templates and resumes the idempotent
+// scale pass without trying to patch a running member.
 func (r *GarageClusterReconciler) fmPurge(ctx context.Context, cluster *garagev1beta2.GarageCluster) (ctrl.Result, error) {
 	if stuck, res, err := r.fmCheckStuck(ctx, cluster); stuck {
 		return res, err
@@ -302,11 +312,36 @@ func (r *GarageClusterReconciler) fmPurge(ctx context.Context, cluster *garagev1
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	for name := range nodes {
-		if err := r.patchSTSPurgeInitContainer(ctx, cluster, name, fm.PurgeID, true); err != nil {
+	names := sortedFactorMigrationNodeNames(nodes)
+	anyRunning := false
+	for _, name := range names {
+		running, err := r.factorMigrationStatefulSetRunning(ctx, cluster, nodes[name])
+		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.scaleStorageSTS(ctx, cluster, name, 1); err != nil {
+		anyRunning = anyRunning || running
+	}
+	if !anyRunning {
+		// Keep these as distinct all-member passes. A process death after any API
+		// write leaves every StatefulSet at zero and can safely repeat either pass.
+		for _, name := range names {
+			if err := r.patchSTSConfigRevisionForFactorMigration(ctx, cluster, nodes[name]); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+		for _, name := range names {
+			if err := r.patchSTSPurgeInitContainerForNode(ctx, cluster, nodes[name], fm.PurgeID, true); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+	for _, name := range names {
+		if err := r.verifyFactorMigrationPurgePreparation(ctx, cluster, nodes[name], fm.PurgeID, !anyRunning); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	for _, name := range names {
+		if err := r.scaleStorageSTSForNode(ctx, cluster, nodes[name], 1); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -314,7 +349,200 @@ func (r *GarageClusterReconciler) fmPurge(ctx context.Context, cluster *garagev1
 		m.Phase = fmPhaseVerifying
 		m.Message = "storage pods restarting with purged layout at the new factor"
 	})
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: time.Nanosecond}, nil
+}
+
+// patchSTSConfigRevisionForFactorMigration moves a quiesced, suspended
+// GarageNode StatefulSet to the exact immutable shared garage.toml revision
+// before the destructive purge restart. Fixed-name ConfigMaps used to change
+// beneath the template; content-addressed publication deliberately cannot.
+func (r *GarageClusterReconciler) patchSTSConfigRevisionForFactorMigration(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+	node *garagev1beta1.GarageNode,
+) error {
+	if node == nil {
+		return fmt.Errorf("factor-migration GarageNode is nil")
+	}
+	name := node.Name
+	cfgCtx, err := buildConfigContext(ctx, r.Client, cluster)
+	if err != nil {
+		return fmt.Errorf("building factor-migration Garage config: %w", err)
+	}
+	body := generateGarageConfig(cluster, cfgCtx)
+	baseName := cluster.Name + "-config"
+	configRevision, err := garageConfigRevision(ctx, r.safetyReader(), cluster, body)
+	if err != nil {
+		return fmt.Errorf("deriving factor-migration config revision: %w", err)
+	}
+	configName := garageConfigRevisionName(baseName, configRevision)
+	published, object, err := readGarageConfigResource(
+		ctx, r.safetyReader(), cluster.Namespace, configName, garageConfigUsesSecret(cluster),
+	)
+	if err != nil {
+		return fmt.Errorf("reading factor-migration config revision %s: %w", configName, err)
+	}
+	if published != body || !metav1.IsControlledBy(object, cluster) {
+		return fmt.Errorf("factor-migration config revision %s is not the exact GarageCluster-owned rendered input", configName)
+	}
+	sts := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Name: name, Namespace: cluster.Namespace}
+	if err := r.safetyReader().Get(ctx, key, sts); err != nil {
+		return fmt.Errorf("reading factor-migration StatefulSet %s: %w", name, err)
+	}
+	if sts.Spec.Replicas == nil || *sts.Spec.Replicas != 0 {
+		return fmt.Errorf("refusing to patch factor-migration StatefulSet %s config before it is quiesced at zero replicas", name)
+	}
+	if !metav1.IsControlledBy(sts, node) {
+		return fmt.Errorf("factor-migration StatefulSet %s is not controlled by exact GarageNode UID %s", name, node.UID)
+	}
+	configAnnotationRevision, err := garageConfigAnnotationRevision(ctx, r.safetyReader(), cluster, body)
+	if err != nil {
+		return fmt.Errorf("deriving factor-migration config annotation revision: %w", err)
+	}
+	desiredVolumeSource := garageConfigVolumeSource(cluster, configName)
+	configAlreadyCurrent := sts.Spec.Template.Annotations[annotationConfigHash] == configAnnotationRevision
+	updated := false
+	for i := range sts.Spec.Template.Spec.Volumes {
+		volume := &sts.Spec.Template.Spec.Volumes[i]
+		if volume.Name != configVolumeName {
+			continue
+		}
+		configAlreadyCurrent = configAlreadyCurrent && equality.Semantic.DeepEqual(volume.VolumeSource, desiredVolumeSource)
+		volume.VolumeSource = desiredVolumeSource
+		updated = true
+		break
+	}
+	if !updated {
+		return fmt.Errorf("factor-migration StatefulSet %s has no %q config volume", name, configVolumeName)
+	}
+	if sts.Spec.Template.Annotations == nil {
+		sts.Spec.Template.Annotations = make(map[string]string)
+	}
+	sts.Spec.Template.Annotations[annotationConfigHash] = configAnnotationRevision
+	// Leave annotationStorageRolloutInput untouched. Once the migration releases
+	// the GarageNode controller, its ordinary renderer recomputes the complete
+	// pod-spec hash and generation-bound acknowledgment before normal rollout can
+	// report convergence.
+	if configAlreadyCurrent {
+		return nil
+	}
+	if err := r.Update(ctx, sts); err != nil {
+		return fmt.Errorf("patching factor-migration StatefulSet %s to config revision %s: %w", name, configName, err)
+	}
+	return nil
+}
+
+func sortedFactorMigrationNodeNames(nodes map[string]*garagev1beta1.GarageNode) []string {
+	names := make([]string, 0, len(nodes))
+	for name := range nodes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (r *GarageClusterReconciler) factorMigrationStatefulSetRunning(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+	node *garagev1beta1.GarageNode,
+) (bool, error) {
+	if node == nil {
+		return false, fmt.Errorf("factor-migration GarageNode is nil")
+	}
+	sts := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Name: node.Name, Namespace: cluster.Namespace}
+	if err := r.safetyReader().Get(ctx, key, sts); err != nil {
+		return false, fmt.Errorf("reading factor-migration StatefulSet %s: %w", key, err)
+	}
+	if !metav1.IsControlledBy(sts, node) {
+		return false, fmt.Errorf("factor-migration StatefulSet %s is not controlled by exact GarageNode UID %s", key, node.UID)
+	}
+	if sts.Spec.Replicas == nil {
+		return false, fmt.Errorf("factor-migration StatefulSet %s has no explicit replica count", key)
+	}
+	switch *sts.Spec.Replicas {
+	case 0:
+		return false, nil
+	case 1:
+		return true, nil
+	default:
+		return false, fmt.Errorf("factor-migration StatefulSet %s has unsafe replica count %d; expected zero or one", key, *sts.Spec.Replicas)
+	}
+}
+
+func (r *GarageClusterReconciler) verifyFactorMigrationPurgePreparation(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+	node *garagev1beta1.GarageNode,
+	purgeID string,
+	requireQuiesced bool,
+) error {
+	if node == nil {
+		return fmt.Errorf("factor-migration GarageNode is nil")
+	}
+	cfgCtx, err := buildConfigContext(ctx, r.Client, cluster)
+	if err != nil {
+		return fmt.Errorf("building factor-migration Garage config proof: %w", err)
+	}
+	body := generateGarageConfig(cluster, cfgCtx)
+	revision, err := garageConfigRevision(ctx, r.safetyReader(), cluster, body)
+	if err != nil {
+		return fmt.Errorf("deriving factor-migration Garage config proof: %w", err)
+	}
+	configName := garageConfigRevisionName(cluster.Name+"-config", revision)
+	secretBacked := garageConfigUsesSecret(cluster)
+	published, object, err := readGarageConfigResource(
+		ctx, r.safetyReader(), cluster.Namespace, configName, secretBacked,
+	)
+	if err != nil {
+		return fmt.Errorf("reading factor-migration config proof %s: %w", configName, err)
+	}
+	if published != body || !metav1.IsControlledBy(object, cluster) || !garageConfigResourceIsImmutable(object) {
+		return fmt.Errorf("factor-migration config revision %s is not the exact immutable GarageCluster-owned rendered input", configName)
+	}
+
+	sts := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Name: node.Name, Namespace: cluster.Namespace}
+	if err := r.safetyReader().Get(ctx, key, sts); err != nil {
+		return fmt.Errorf("reading prepared factor-migration StatefulSet %s: %w", key, err)
+	}
+	if !metav1.IsControlledBy(sts, node) {
+		return fmt.Errorf("prepared factor-migration StatefulSet %s is not controlled by exact GarageNode UID %s", key, node.UID)
+	}
+	if sts.Spec.Replicas == nil || *sts.Spec.Replicas < 0 || *sts.Spec.Replicas > 1 ||
+		(requireQuiesced && *sts.Spec.Replicas != 0) {
+		return fmt.Errorf("prepared factor-migration StatefulSet %s has unsafe replica count", key)
+	}
+	mountedName, mountedSecret, err := mountedGarageConfigResource(sts.Spec.Template.Spec)
+	if err != nil {
+		return fmt.Errorf("checking prepared factor-migration StatefulSet %s config mount: %w", key, err)
+	}
+	if mountedName != configName || mountedSecret != secretBacked {
+		return fmt.Errorf("prepared factor-migration StatefulSet %s does not mount exact config revision %s", key, configName)
+	}
+	annotationRevision, err := garageConfigAnnotationRevision(ctx, r.safetyReader(), cluster, body)
+	if err != nil {
+		return fmt.Errorf("deriving factor-migration config annotation proof: %w", err)
+	}
+	if sts.Spec.Template.Annotations[annotationConfigHash] != annotationRevision {
+		return fmt.Errorf("prepared factor-migration StatefulSet %s does not carry exact config annotation revision", key)
+	}
+	expectedInit := factorMigrationPurgeInitContainer(sts, purgeID)
+	found := 0
+	for i := range sts.Spec.Template.Spec.InitContainers {
+		if sts.Spec.Template.Spec.InitContainers[i].Name != fmPurgeInitContainerName {
+			continue
+		}
+		found++
+		if !equality.Semantic.DeepEqual(sts.Spec.Template.Spec.InitContainers[i], expectedInit) {
+			return fmt.Errorf("prepared factor-migration StatefulSet %s has a stale or altered purge init container", key)
+		}
+	}
+	if found != 1 {
+		return fmt.Errorf("prepared factor-migration StatefulSet %s has %d purge init containers; expected exactly one", key, found)
+	}
+	return nil
 }
 
 // fmVerify waits for every storage pod to become Ready at the new factor. A pod
@@ -343,7 +571,7 @@ func (r *GarageClusterReconciler) fmVerify(ctx context.Context, cluster *garagev
 		m.Phase = fmPhaseRebuildingLayout
 		m.Message = "all storage pods Ready; rebuilding the layout from scratch"
 	})
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: time.Nanosecond}, nil
 }
 
 // fmRebuildLayout re-stages EVERY node role (purging cluster_layout wiped them
@@ -361,9 +589,61 @@ func (r *GarageClusterReconciler) fmRebuildLayout(ctx context.Context, cluster *
 		return res, err
 	}
 
-	gc, err := GetGarageClient(ctx, r.Client, cluster, r.ClusterDomain)
+	// Every retry below is silent at default verbosity, so a phase that cannot
+	// make progress looks identical to one that is merely slow — from the
+	// outside, and from status. Record which precondition is still unmet so an
+	// operator watching a destructive migration (and a CI failure dump) can see
+	// what it is waiting on without a debug-level rebuild.
+	waiting := func(reason string, args ...any) ctrl.Result {
+		detail := "rebuilding the layout from scratch; waiting: " + fmt.Sprintf(reason, args...)
+		log.V(1).Info("Factor migration: rebuild waiting", "reason", detail)
+		// Only write when the reason actually changes: this path retries every 5s,
+		// and setFactorMigration persists unconditionally.
+		if cluster.Status.FactorMigration == nil || cluster.Status.FactorMigration.Message != detail {
+			r.setFactorMigration(ctx, cluster, func(m *garagev1beta2.FactorMigrationStatus) {
+				m.Message = detail
+			})
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}
+	}
+
+	// Pin to one storage Pod rather than dialing the cluster Service.
+	//
+	// The purge deleted cluster_layout everywhere, so there is no committed layout
+	// yet — which is exactly the state the shared client cannot serve. Its dynamic
+	// token cannot be re-proved (that needs the admin-token table, which needs a
+	// layout, which needs this client), and the load-balanced Service must never
+	// carry a substituted credential: a Pod that predates the last static rotation
+	// rejects it with a 403, intermittently, depending on which Pod is picked.
+	//
+	// staticGarageClientForPod reads the bearer out of the target Pod's own spec,
+	// so it is by construction the credential that process accepted at startup.
+	// This is the same bootstrap client reconcileOperatorAdminToken uses before a
+	// dynamic token exists, which is the situation a purge recreates.
+	podSet, err := getOperatorAdminPodSet(ctx, r.safetyReader(), cluster)
 	if err != nil {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil //nolint:nilerr // admin not up yet; retry
+		return waiting("managed storage Pod set is not provable yet: %v", err), nil
+	}
+	gc, err := r.staticGarageClientForPod(ctx, &podSet.Pods[0], getAdminPort(cluster))
+	if err != nil {
+		return waiting("exact-Pod bootstrap Admin client unavailable: %v", err), nil
+	}
+	// The node-local-pool rollout exclusion cannot legitimately apply here, and
+	// waiting on it deadlocks. It is asserted whenever StorageRolloutReady's
+	// observedGeneration trails spec — which a factor migration guarantees, because
+	// the factor edit bumps the generation and Reconcile dispatches to this state
+	// machine BEFORE the rollout reconciliation that would catch the condition up.
+	// Nothing it protects against can be in flight: fmValidate refuses a migration
+	// outright when spec.storage.nodeLocalPools is set, and fmScaleDown suspends
+	// the per-node controllers, so the migration is the only layout writer left.
+	// The storage-drain exclusion still applies — that one can be real.
+	release, err := acquireLayoutMutationIgnoringNodeLocalPoolRollout(r.layoutMutationCoordinator(), cluster)
+	if err != nil {
+		return waiting("layout mutation coordinator busy: %v", err), nil
+	}
+	defer release()
+	if err := requireSettledLayoutHistory(ctx, gc); err != nil {
+		return waiting("layout history not settled: %v", err), nil
 	}
 
 	changes, err := r.buildRebuildRoleChanges(ctx, cluster)
@@ -371,16 +651,19 @@ func (r *GarageClusterReconciler) fmRebuildLayout(ctx context.Context, cluster *
 		return ctrl.Result{}, err
 	}
 	if len(changes) == 0 {
-		// Node IDs not yet discoverable (pods still settling); retry.
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		return waiting("no storage node identity is observable yet; pods may still be settling"), nil
 	}
-	if err := gc.UpdateClusterLayout(ctx, changes); err != nil {
-		log.V(1).Info("Factor migration: staging rebuilt roles failed, will retry", "error", err)
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil //nolint:nilerr
+	layout, err := gc.GetClusterLayout(ctx)
+	if err != nil {
+		return waiting("reading the rebuilt layout failed: %v", err), nil
 	}
-	if err := gc.ApplyStagedLayoutChanges(ctx); err != nil {
-		log.V(1).Info("Factor migration: applying rebuilt layout failed, will retry", "error", err)
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil //nolint:nilerr
+	if _, err := stageAndApplyExclusiveLayout(ctx, gc, layout, changes, nil, func() error {
+		if err := gc.UpdateClusterLayout(ctx, changes); err != nil {
+			return fmt.Errorf("staging rebuilt roles: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return waiting("applying the rebuilt layout failed: %v", err), nil
 	}
 
 	// Strip the purge init containers so future restarts are clean (the marker
@@ -389,8 +672,8 @@ func (r *GarageClusterReconciler) fmRebuildLayout(ctx context.Context, cluster *
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	for name := range nodes {
-		if err := r.patchSTSPurgeInitContainer(ctx, cluster, name, "", false); err != nil {
+	for _, name := range sortedFactorMigrationNodeNames(nodes) {
+		if err := r.patchSTSPurgeInitContainerForNode(ctx, cluster, nodes[name], "", false); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -399,7 +682,7 @@ func (r *GarageClusterReconciler) fmRebuildLayout(ctx context.Context, cluster *
 		m.Phase = fmPhaseConverging
 		m.Message = fmt.Sprintf("layout rebuilt at factor %d with %d storage roles", m.ToFactor, len(changes))
 	})
-	return ctrl.Result{Requeue: true}, nil
+	return ctrl.Result{RequeueAfter: time.Nanosecond}, nil
 }
 
 // fmConverge resumes the per-node controllers and finalizes. A Tables repair is
@@ -424,33 +707,21 @@ func (r *GarageClusterReconciler) fmConverge(ctx context.Context, cluster *garag
 	})
 	log.Info("Factor migration completed", "factor", cluster.Status.FactorMigration.ToFactor)
 	// The trigger annotation was consumed at start, so there's nothing to remove
-	// here — the terminal Completed phase prevents any re-trigger.
-	return ctrl.Result{}, nil
+	// here — the terminal Completed phase prevents any re-trigger. Re-enter at
+	// once so the ordinary workload/layout path resumes: the status write above
+	// no longer wakes the controller (garageClusterPrimaryPredicate).
+	return ctrl.Result{RequeueAfter: time.Nanosecond}, nil
 }
 
 // --- helpers ---------------------------------------------------------------
 
 // parsePurgeAnnotation parses "factor=N" or "factor=N,force".
 func parsePurgeAnnotation(val string) (factor int, force bool, err error) {
-	for _, part := range strings.Split(val, ",") {
-		part = strings.TrimSpace(part)
-		switch {
-		case part == "force":
-			force = true
-		case strings.HasPrefix(part, "factor="):
-			f, perr := strconv.Atoi(strings.TrimPrefix(part, "factor="))
-			if perr != nil || f < 1 {
-				return 0, false, fmt.Errorf("invalid purge annotation %q: factor must be a positive integer", val)
-			}
-			factor = f
-		default:
-			return 0, false, fmt.Errorf("invalid purge annotation %q (expected \"factor=N[,force]\")", val)
-		}
+	request, err := factormigration.Parse(val)
+	if err != nil {
+		return 0, false, err
 	}
-	if factor == 0 {
-		return 0, false, fmt.Errorf("invalid purge annotation %q: missing factor=N", val)
-	}
-	return factor, force, nil
+	return request.Factor, request.Force, nil
 }
 
 func replicationFactorOf(cluster *garagev1beta2.GarageCluster) int {
@@ -533,20 +804,34 @@ func (r *GarageClusterReconciler) buildRebuildRoleChanges(ctx context.Context, c
 	return changes, nil
 }
 
-// scaleStorageSTS sets the replica count on a per-node storage StatefulSet.
-func (r *GarageClusterReconciler) scaleStorageSTS(ctx context.Context, cluster *garagev1beta2.GarageCluster, name string, replicas int32) error {
+func (r *GarageClusterReconciler) scaleStorageSTSForNode(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+	node *garagev1beta1.GarageNode,
+	replicas int32,
+) error {
+	if node == nil {
+		return fmt.Errorf("factor-migration GarageNode is nil")
+	}
 	sts := &appsv1.StatefulSet{}
-	if err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: cluster.Namespace}, sts); err != nil {
+	key := types.NamespacedName{Name: node.Name, Namespace: cluster.Namespace}
+	if err := r.safetyReader().Get(ctx, key, sts); err != nil {
 		if errors.IsNotFound(err) {
 			return nil
 		}
-		return err
+		return fmt.Errorf("reading factor-migration StatefulSet %s: %w", key, err)
+	}
+	if !metav1.IsControlledBy(sts, node) {
+		return fmt.Errorf("factor-migration StatefulSet %s is not controlled by exact GarageNode UID %s", key, node.UID)
 	}
 	if sts.Spec.Replicas != nil && *sts.Spec.Replicas == replicas {
 		return nil
 	}
 	sts.Spec.Replicas = ptr.To(replicas)
-	return r.Update(ctx, sts)
+	if err := r.Update(ctx, sts); err != nil {
+		return fmt.Errorf("scaling factor-migration StatefulSet %s to %d: %w", key, replicas, err)
+	}
+	return nil
 }
 
 // patchSTSPurgeInitContainer adds (add=true) or removes (add=false) the
@@ -584,12 +869,63 @@ func (r *GarageClusterReconciler) patchSTSPurgeInitContainer(ctx context.Context
 	}
 
 	sts.Spec.Template.Spec.InitContainers = filtered
+	init := factorMigrationPurgeInitContainer(sts, purgeID)
+	sts.Spec.Template.Spec.InitContainers = append([]corev1.Container{init}, sts.Spec.Template.Spec.InitContainers...)
+	return r.Update(ctx, sts)
+}
+
+func (r *GarageClusterReconciler) patchSTSPurgeInitContainerForNode(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+	node *garagev1beta1.GarageNode,
+	purgeID string,
+	add bool,
+) error {
+	if node == nil {
+		return fmt.Errorf("factor-migration GarageNode is nil")
+	}
+	sts := &appsv1.StatefulSet{}
+	key := types.NamespacedName{Name: node.Name, Namespace: cluster.Namespace}
+	if err := r.safetyReader().Get(ctx, key, sts); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("reading factor-migration StatefulSet %s: %w", key, err)
+	}
+	if !metav1.IsControlledBy(sts, node) {
+		return fmt.Errorf("factor-migration StatefulSet %s is not controlled by exact GarageNode UID %s", key, node.UID)
+	}
+	if add && (sts.Spec.Replicas == nil || *sts.Spec.Replicas != 0) {
+		return fmt.Errorf("refusing to patch factor-migration StatefulSet %s purge init before it is quiesced at zero replicas", key)
+	}
+
+	filtered := make([]corev1.Container, 0, len(sts.Spec.Template.Spec.InitContainers))
+	for i := range sts.Spec.Template.Spec.InitContainers {
+		if sts.Spec.Template.Spec.InitContainers[i].Name != fmPurgeInitContainerName {
+			filtered = append(filtered, sts.Spec.Template.Spec.InitContainers[i])
+		}
+	}
+	desired := filtered
+	if add {
+		desired = append([]corev1.Container{factorMigrationPurgeInitContainer(sts, purgeID)}, filtered...)
+	}
+	if equality.Semantic.DeepEqual(sts.Spec.Template.Spec.InitContainers, desired) {
+		return nil
+	}
+	sts.Spec.Template.Spec.InitContainers = desired
+	if err := r.Update(ctx, sts); err != nil {
+		return fmt.Errorf("patching factor-migration StatefulSet %s purge init: %w", key, err)
+	}
+	return nil
+}
+
+func factorMigrationPurgeInitContainer(sts *appsv1.StatefulSet, purgeID string) corev1.Container {
 	marker := fmt.Sprintf("%s/.purged-%s", metadataPath, purgeID)
 	// set -e so a failed rm (e.g. EACCES) surfaces as a non-zero init exit
 	// instead of being masked — the pod then visibly stalls in Init with the
 	// error rather than the migration silently never purging.
 	script := fmt.Sprintf("set -e\nif [ ! -f %q ]; then\n  rm -f %s/cluster_layout\n  touch %q\nfi", marker, metadataPath, marker)
-	init := corev1.Container{
+	return corev1.Container{
 		Name:    fmPurgeInitContainerName,
 		Image:   "busybox:1.37",
 		Command: []string{"/bin/sh", "-c", script},
@@ -597,9 +933,16 @@ func (r *GarageClusterReconciler) patchSTSPurgeInitContainer(ctx context.Context
 			{Name: metadataVolName, MountPath: metadataPath},
 		},
 		SecurityContext: purgeInitSecurityContext(sts),
+		// fmValidatePreparedSTS re-reads the StatefulSet and requires the stored
+		// init container to DeepEqual this value, so anything the API server
+		// defaults on write must be spelled out here. Otherwise the readback
+		// always differs from the freshly built expectation, every purge is
+		// rejected as "stale or altered", and the migration is stranded in
+		// Purging with the storage tier scaled to zero.
+		ImagePullPolicy:          corev1.PullIfNotPresent,
+		TerminationMessagePath:   corev1.TerminationMessagePathDefault,
+		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
 	}
-	sts.Spec.Template.Spec.InitContainers = append([]corev1.Container{init}, sts.Spec.Template.Spec.InitContainers...)
-	return r.Update(ctx, sts)
 }
 
 // purgeInitSecurityContext builds the SecurityContext for the purge init
@@ -623,7 +966,7 @@ func purgeInitSecurityContext(sts *appsv1.StatefulSet) *corev1.SecurityContext {
 }
 
 // purgeInitRunAsUser returns the UID the storage pod runs as: the pod-level
-// RunAsUser if set, else the first container's RunAsUser, else nil (image
+// RunAsUser if set, else the garage container's RunAsUser, else nil (image
 // default — root for the FROM-scratch Garage image).
 func purgeInitRunAsUser(sts *appsv1.StatefulSet) *int64 {
 	ps := sts.Spec.Template.Spec
@@ -631,6 +974,11 @@ func purgeInitRunAsUser(sts *appsv1.StatefulSet) *int64 {
 		return ps.SecurityContext.RunAsUser
 	}
 	for i := range ps.Containers {
+		// Only the Garage container decides: user extraContainers follow it and
+		// may run as any user.
+		if ps.Containers[i].Name != defaultAppName {
+			continue
+		}
 		if c := ps.Containers[i].SecurityContext; c != nil && c.RunAsUser != nil {
 			return c.RunAsUser
 		}
@@ -687,11 +1035,11 @@ func (r *GarageClusterReconciler) teardownFactorMigration(ctx context.Context, c
 	if err != nil {
 		return err
 	}
-	for name := range nodes {
-		if err := r.patchSTSPurgeInitContainer(ctx, cluster, name, "", false); err != nil {
+	for _, name := range sortedFactorMigrationNodeNames(nodes) {
+		if err := r.patchSTSPurgeInitContainerForNode(ctx, cluster, nodes[name], "", false); err != nil {
 			return err
 		}
-		if err := r.scaleStorageSTS(ctx, cluster, name, 1); err != nil {
+		if err := r.scaleStorageSTSForNode(ctx, cluster, nodes[name], 1); err != nil {
 			return err
 		}
 	}
@@ -763,7 +1111,10 @@ func (r *GarageClusterReconciler) failFactorMigration(ctx context.Context, clust
 		fm.Message = message
 		fm.CompletedAt = &now
 	})
-	return ctrl.Result{}, nil
+	// Re-enter at once so the ordinary workload/layout path takes over the
+	// restored tier: the status write above no longer wakes the controller
+	// (garageClusterPrimaryPredicate), same as fmConverge's Completed write.
+	return ctrl.Result{RequeueAfter: time.Nanosecond}, nil
 }
 
 // removeAnnotations deletes the given annotations from the cluster with conflict retry.

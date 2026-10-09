@@ -18,10 +18,13 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -30,6 +33,7 @@ import (
 
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -46,6 +50,7 @@ import (
 	"github.com/rajsinghtech/garage-operator/internal/controller"
 	"github.com/rajsinghtech/garage-operator/internal/cosi"
 	cosiv1alpha2 "sigs.k8s.io/container-object-storage-interface/client/apis/objectstorage/v1alpha2"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -59,9 +64,30 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
+// defaultClusterDomain is used when neither --cluster-domain nor
+// CLUSTER_DOMAIN is set.
+const defaultClusterDomain = "cluster.local"
+
+// clusterDomainDefault resolves the --cluster-domain flag's default: the
+// CLUSTER_DOMAIN env var if set, otherwise defaultClusterDomain. This lets a
+// plain kubectl apply -f install.yaml deployment configure the cluster domain
+// via the container's env instead of needing a templating layer (Helm) to add
+// the --cluster-domain arg. An explicit --cluster-domain flag still wins over
+// the env var.
+func clusterDomainDefault() string {
+	if v := os.Getenv("CLUSTER_DOMAIN"); v != "" {
+		return v
+	}
+	return defaultClusterDomain
+}
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(monitoringv1.AddToScheme(scheme))
+	// Gateway API is registered unconditionally: the bucket controller only
+	// creates HTTPRoutes when the CRDs are actually installed (REST-mapper
+	// probe), so the scheme entry is inert otherwise.
+	utilruntime.Must(gatewayv1.Install(scheme))
 	// v1alpha1 is a Spoke placeholder (no real objects exist) so the conversion
 	// webhook can dispatch without erroring on storedVersions migration sweeps.
 	// See api/v1alpha1/groupversion_info.go and issue #181.
@@ -78,6 +104,7 @@ func main() {
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
 	var enableLeaderElection bool
+	var unsafeAllowNoLeaderElection bool
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
@@ -85,9 +112,7 @@ func main() {
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
+	bindLeaderElectionFlags(flag.CommandLine, &enableLeaderElection, &unsafeAllowNoLeaderElection)
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
@@ -105,17 +130,22 @@ func main() {
 	flag.StringVar(&watchNamespaces, "watch-namespaces", "",
 		"Comma-separated list of namespaces to watch. If empty, watches all namespaces. "+
 			"Can also be set via WATCH_NAMESPACE env var.")
+	var controllerServiceAccountName string
+	flag.StringVar(&controllerServiceAccountName, "controller-service-account-name", os.Getenv("POD_SERVICE_ACCOUNT"),
+		"Service account name used by this controller; required to protect managed PVC finalizer removal when webhooks are enabled.")
 
 	// Default Garage image
 	var defaultGarageImage string
 	flag.StringVar(&defaultGarageImage, "default-garage-image", "",
 		"Default Garage container image for clusters that don't specify one. "+
-			"If empty, uses the built-in default (dxflrs/garage:v2.3.0).")
+			"If empty, uses the built-in digest-pinned Garage v2.4.0 image.")
 
-	// Cluster domain
+	// Cluster domain. See clusterDomainDefault for the CLUSTER_DOMAIN env var
+	// fallback.
 	var clusterDomain string
-	flag.StringVar(&clusterDomain, "cluster-domain", "cluster.local",
-		"Kubernetes cluster domain used for service FQDNs (e.g. cluster.local, eu-cluster.local)")
+	flag.StringVar(&clusterDomain, "cluster-domain", clusterDomainDefault(),
+		"Kubernetes cluster domain used for service FQDNs (e.g. cluster.local, eu-cluster.local). "+
+			"Can also be set via CLUSTER_DOMAIN env var.")
 
 	// operator-namespace is kept for backward compatibility but is no longer used.
 	// Internal key Secrets are now stored in the GarageCluster's own namespace.
@@ -130,6 +160,34 @@ func main() {
 	flag.BoolVar(&enableCOSI, "enable-cosi", false, "Enable COSI driver for Kubernetes-native object storage provisioning")
 	flag.StringVar(&cosiDriverName, "cosi-driver-name", "garage.rajsingh.info", "COSI driver name")
 	flag.StringVar(&cosiNamespace, "cosi-namespace", "garage-operator-system", "Namespace for COSI shadow resources")
+
+	// Gateway API flag (like cert-manager's --enable-gateway-api): gates the
+	// Gateway API half of GarageBucket spec.websiteExposure. HTTPRoutes are
+	// only created and watched when this flag is set AND the Gateway API
+	// CRDs are installed.
+	var enableGatewayAPI bool
+	flag.BoolVar(&enableGatewayAPI, "enable-gateway-api", false,
+		"Enable Gateway API support for bucket website exposure (spec.websiteExposure.gateway). "+
+			"Requires the gateway.networking.k8s.io HTTPRoute CRDs to be installed.")
+	if v := os.Getenv("ENABLE_GATEWAY_API"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			enableGatewayAPI = parsed
+		}
+	}
+
+	// Ingress flag (mirrors --enable-gateway-api): gates the Ingress half of
+	// GarageBucket spec.websiteExposure. Ingresses are only created and
+	// watched when this flag is set, so the operator needs no Ingress RBAC
+	// (and starts no Ingress informer) unless Ingress exposure is in use.
+	var enableIngress bool
+	flag.BoolVar(&enableIngress, "enable-ingress", false,
+		"Enable Ingress support for bucket website exposure (spec.websiteExposure.ingress). "+
+			"Requires RBAC on networking.k8s.io/ingresses (chart value ingress.enabled).")
+	if v := os.Getenv("ENABLE_INGRESS"); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			enableIngress = parsed
+		}
+	}
 
 	opts := zap.Options{
 		Development: false,
@@ -153,6 +211,13 @@ func main() {
 		"GOMAXPROCS", runtime.GOMAXPROCS(0),
 		"GOMEMLIMIT", os.Getenv("GOMEMLIMIT"),
 	)
+	if err := validateLeaderElectionSafety(enableLeaderElection, unsafeAllowNoLeaderElection); err != nil {
+		setupLog.Error(err, "refusing unsafe controller-manager startup")
+		os.Exit(1)
+	}
+	if !enableLeaderElection {
+		setupLog.Info("UNSAFE CONFIGURATION: leader election is disabled; only one controller-manager process may run, and layout mutation is not serialized across processes or Kubernetes clusters")
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -225,6 +290,8 @@ func main() {
 	if watchNamespaces == "" {
 		watchNamespaces = os.Getenv("WATCH_NAMESPACE")
 	}
+	clusterScoped := true
+	var resolvedWatchNamespaces []string
 
 	managerOptions := ctrl.Options{
 		Scheme:                 scheme,
@@ -240,11 +307,16 @@ func main() {
 		for _, ns := range strings.Split(watchNamespaces, ",") {
 			ns = strings.TrimSpace(ns)
 			if ns != "" {
+				if _, exists := nsMap[ns]; exists {
+					continue
+				}
 				nsMap[ns] = cache.Config{}
+				resolvedWatchNamespaces = append(resolvedWatchNamespaces, ns)
 			}
 		}
 		if len(nsMap) > 0 {
 			managerOptions.Cache.DefaultNamespaces = nsMap
+			clusterScoped = false
 			setupLog.Info("watching namespaces", "namespaces", watchNamespaces)
 		} else {
 			setupLog.Info("watching all namespaces (WATCH_NAMESPACE set but resolved to empty)")
@@ -253,44 +325,72 @@ func main() {
 		setupLog.Info("watching all namespaces")
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), managerOptions)
+	restConfig := ctrl.GetConfigOrDie()
+	mgr, err := ctrl.NewManager(restConfig, managerOptions)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(restConfig)
+	if err != nil {
+		setupLog.Error(err, "unable to create Kubernetes discovery client")
+		os.Exit(1)
+	}
+	layoutMutations := controller.NewLayoutMutationCoordinator()
+	garageBucketCOSIDriverName := ""
+	if enableCOSI {
+		garageBucketCOSIDriverName = cosiDriverName
+	}
 
 	_ = operatorNamespace // deprecated, kept for backward-compat flag parsing only
 	if err := (&controller.GarageClusterReconciler{
-		Client:        mgr.GetClient(),
-		APIReader:     mgr.GetAPIReader(),
-		Scheme:        mgr.GetScheme(),
-		ClusterDomain: clusterDomain,
-		DefaultImage:  defaultGarageImage,
+		Client:                      mgr.GetClient(),
+		APIReader:                   mgr.GetAPIReader(),
+		Scheme:                      mgr.GetScheme(),
+		EventRecorder:               mgr.GetEventRecorderFor("garagecluster-controller"), //nolint:staticcheck // core/v1 Events match the chart's existing RBAC
+		ClusterDomain:               clusterDomain,
+		DefaultImage:                defaultGarageImage,
+		ManagedPVCAdmissionDisabled: len(webhookCertPath) == 0,
+		ClusterScoped:               clusterScoped,
+		WatchNamespaces:             resolvedWatchNamespaces,
+		LayoutMutations:             layoutMutations,
+		NodeLocalPoolPrerequisites: controller.NewNodeLocalPoolPrerequisiteChecker(
+			mgr.GetClient(), mgr.GetAPIReader(), discoveryClient,
+		),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GarageCluster")
 		os.Exit(1)
 	}
 	if err := (&controller.GarageBucketReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		ClusterDomain: clusterDomain,
+		Client:              mgr.GetClient(),
+		AuthorizationReader: mgr.GetAPIReader(),
+		Scheme:              mgr.GetScheme(),
+		ClusterDomain:       clusterDomain,
+		COSIDriverName:      garageBucketCOSIDriverName,
+		EnableGatewayAPI:    enableGatewayAPI,
+		EnableIngress:       enableIngress,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GarageBucket")
 		os.Exit(1)
 	}
 	if err := (&controller.GarageKeyReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		ClusterDomain: clusterDomain,
+		Client:              mgr.GetClient(),
+		AuthorizationReader: mgr.GetAPIReader(),
+		Scheme:              mgr.GetScheme(),
+		ClusterDomain:       clusterDomain,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GarageKey")
 		os.Exit(1)
 	}
 	if err := (&controller.GarageNodeReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		ClusterDomain: clusterDomain,
-		DefaultImage:  defaultGarageImage,
+		Client:                      mgr.GetClient(),
+		APIReader:                   mgr.GetAPIReader(),
+		Scheme:                      mgr.GetScheme(),
+		ClusterDomain:               clusterDomain,
+		DefaultImage:                defaultGarageImage,
+		ManagedPVCAdmissionDisabled: len(webhookCertPath) == 0,
+		ClusterScoped:               clusterScoped,
+		LayoutMutations:             layoutMutations,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GarageNode")
 		os.Exit(1)
@@ -337,6 +437,18 @@ func main() {
 			setupLog.Error(err, "unable to create webhook", "webhook", "GarageNode")
 			os.Exit(1)
 		}
+		podNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+		controllerServiceAccountName = strings.TrimSpace(controllerServiceAccountName)
+		if podNamespace == "" || controllerServiceAccountName == "" {
+			setupLog.Error(errors.New("POD_NAMESPACE and controller service account name are required when webhooks are enabled"),
+				"unable to protect managed PVC replacement barriers")
+			os.Exit(1)
+		}
+		controllerUsername := fmt.Sprintf("system:serviceaccount:%s:%s", podNamespace, controllerServiceAccountName)
+		if err := controller.SetupManagedPVCFinalizerWebhook(mgr.GetWebhookServer(), controllerUsername); err != nil {
+			setupLog.Error(err, "unable to create webhook", "webhook", "ManagedPVCFinalizer")
+			os.Exit(1)
+		}
 		if err := (&garagev1beta1.GarageAdminToken{}).SetupWebhookWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create webhook", "webhook", "GarageAdminToken")
 			os.Exit(1)
@@ -375,11 +487,13 @@ func main() {
 	if enableCOSI {
 		provisioner := cosi.NewProvisioner(mgr.GetClient(), cosiNamespace, clusterDomain)
 		if err := (&cosi.BucketReconciler{
-			Client:      mgr.GetClient(),
-			Scheme:      mgr.GetScheme(),
-			DriverName:  cosiDriverName,
-			Namespace:   cosiNamespace,
-			Provisioner: provisioner,
+			Client:          mgr.GetClient(),
+			APIReader:       mgr.GetAPIReader(),
+			Scheme:          mgr.GetScheme(),
+			DriverName:      cosiDriverName,
+			Namespace:       cosiNamespace,
+			Provisioner:     provisioner,
+			WatchNamespaces: resolvedWatchNamespaces,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to set up BucketReconciler")
 			os.Exit(1)
@@ -401,4 +515,20 @@ func main() {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}
+}
+
+func validateLeaderElectionSafety(enabled, unsafeOverride bool) error {
+	if enabled || unsafeOverride {
+		return nil
+	}
+	return fmt.Errorf("leader election is required; set --leader-elect=true or explicitly acknowledge unsupported operation with --unsafe-allow-no-leader-election")
+}
+
+func bindLeaderElectionFlags(flags *flag.FlagSet, enabled, unsafeOverride *bool) {
+	flags.BoolVar(enabled, "leader-elect", true,
+		"Enable leader election for controller manager. "+
+			"Node-local layout mutation requires exactly one active controller manager.")
+	flags.BoolVar(unsafeOverride, "unsafe-allow-no-leader-election", false,
+		"Explicitly allow the unsupported single-replica mode without leader election. "+
+			"Concurrent active managers can violate single-flight Garage layout mutation.")
 }

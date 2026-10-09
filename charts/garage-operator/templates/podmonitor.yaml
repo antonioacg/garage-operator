@@ -1,0 +1,63 @@
+{{- include "garage-operator.monitoringValidation" . -}}
+{{- if and .Values.metrics.enabled .Values.podMonitor.enabled -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "garage-operator.fullname" . }}
+  namespace: {{ .Values.podMonitor.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "garage-operator.labels" . | nindent 4 }}
+    {{- with .Values.podMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with .Values.podMonitor.jobLabel }}
+  jobLabel: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.podMonitor.targetLabels }}
+  podTargetLabels:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  podMetricsEndpoints:
+  - path: /metrics
+    port: metrics
+    {{- with .Values.podMonitor.interval }}
+    interval: {{ . }}
+    {{- end }}
+    {{- with .Values.podMonitor.scrapeTimeout }}
+    scrapeTimeout: {{ . }}
+    {{- end }}
+    scheme: {{ .Values.podMonitor.scheme }}
+    bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    {{- with .Values.podMonitor.tlsConfig }}
+    tlsConfig:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- if .Values.podMonitor.honorLabels }}
+    honorLabels: true
+    {{- end }}
+    {{- with .Values.podMonitor.relabelings }}
+    relabelings:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with .Values.podMonitor.metricRelabelings }}
+    metricRelabelings:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  namespaceSelector:
+    {{- if .Values.podMonitor.namespaceSelector.matchNames }}
+    matchNames:
+      {{- toYaml .Values.podMonitor.namespaceSelector.matchNames | nindent 6 }}
+    {{- else }}
+    matchNames:
+    - {{ .Release.Namespace }}
+    {{- end }}
+  selector:
+    {{- if .Values.podMonitor.selector.matchLabels }}
+    matchLabels:
+      {{- toYaml .Values.podMonitor.selector.matchLabels | nindent 6 }}
+    {{- else }}
+    matchLabels:
+      {{- include "garage-operator.selectorLabels" . | nindent 6 }}
+    {{- end }}
+{{- end }}

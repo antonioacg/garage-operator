@@ -18,26 +18,38 @@ package v1beta1
 
 import (
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
+	v1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
+// DeletionPolicy controls whether deleting a GarageCluster tears down a whole
+// store or first drains one site from a surviving federated Garage layout.
+type DeletionPolicy string
+
+const (
+	DeletionPolicyDestroy DeletionPolicy = "Destroy"
+	DeletionPolicyDrain   DeletionPolicy = "Drain"
+)
+
 // GarageClusterSpec defines the desired state of GarageCluster
 // +kubebuilder:validation:XValidation:rule="!has(self.gateway) || !self.gateway || has(self.connectTo)",message="connectTo is required when gateway is true"
 // +kubebuilder:validation:XValidation:rule="(has(self.gateway) && self.gateway) || !has(self.connectTo)",message="connectTo can only be specified when gateway is true"
+// +kubebuilder:validation:XValidation:rule="!has(self.layoutManagement) || !has(self.layoutManagement.siteRole) || self.layoutManagement.siteRole != 'Follower' || (has(self.remoteClusters) && size(self.remoteClusters) > 0)",message="layoutManagement.siteRole: Follower requires at least one remoteClusters entry (a Follower with nothing to follow is a cluster nobody can assign roles to)"
+// +kubebuilder:validation:XValidation:rule="!has(self.layoutManagement) || !has(self.layoutManagement.siteRole) || self.layoutManagement.siteRole != 'Follower' || !has(self.connectTo)",message="layoutManagement.siteRole: Follower is not supported with connectTo; edge gateways and management handles act on their layout owner"
+// +kubebuilder:validation:XValidation:rule="!has(self.initContainers) || !has(self.extraContainers) || !self.initContainers.exists(i, self.extraContainers.exists(e, e.name == i.name))",message="initContainers and extraContainers names must be unique across both lists"
 type GarageClusterSpec struct {
 	// Image specifies the Garage container image to use.
 	// Takes precedence over imageRepository if both are set.
-	// +kubebuilder:default="dxflrs/garage:v2.3.0"
 	// +optional
 	Image string `json:"image,omitempty"`
 
 	// ImageRepository overrides just the repository portion of the default Garage image,
 	// preserving the default tag for automatic version upgrades.
-	// For example, setting this to "my-mirror/garage" with the default tag v2.3.0
-	// produces "my-mirror/garage:v2.3.0".
+	// For example, setting this to "my-mirror/garage" with the default tag v2.4.0
+	// produces "my-mirror/garage:v2.4.0".
 	// Ignored if image is set.
 	// +optional
 	ImageRepository string `json:"imageRepository,omitempty"`
@@ -51,8 +63,10 @@ type GarageClusterSpec struct {
 	// +optional
 	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
 
-	// Replicas is the number of Garage nodes to deploy in this cluster.
-	// Set to 0 to keep the cluster declared but stop all pods.
+	// Replicas controls the legacy operator-managed storage or gateway group.
+	// Set it to 0 to disable that group. Ordinary Manual GarageNodes remain
+	// independently declared, as do v1beta2 node-local pools preserved through
+	// the conversion payload.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:default=3
 	Replicas int32 `json:"replicas"`
@@ -136,6 +150,36 @@ type GarageClusterSpec struct {
 	// +optional
 	PodLabels map[string]string `json:"podLabels,omitempty"`
 
+	// InitContainers run before the Garage container, after any operator-injected
+	// init containers. Entries with restartPolicy: Always are native sidecars
+	// (Kubernetes 1.29+ beta, GA in 1.33). Names garage, purge-cluster-layout and
+	// the prefix garage-operator- are reserved. Applies to the Garage pods of
+	// this cluster (the gateway tier when gateway is true).
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:XValidation:rule="self.all(c, c.name != 'garage' && c.name != 'purge-cluster-layout' && !c.name.startsWith('garage-operator-'))",message="container name is operator-reserved"
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	InitContainers []v1beta2.PodExtraContainer `json:"initContainers,omitempty"`
+
+	// ExtraContainers run beside the Garage container in the same pod and network
+	// namespace. They cannot mount operator-owned volumes.
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:XValidation:rule="self.all(c, c.name != 'garage' && c.name != 'purge-cluster-layout' && !c.name.startsWith('garage-operator-'))",message="container name is operator-reserved"
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	ExtraContainers []v1beta2.PodExtraContainer `json:"extraContainers,omitempty"`
+
+	// ExtraVolumes are added to the pod. Operator-owned volume names are reserved
+	// (config, metadata, data, data-<N>, rpc-secret, admin-token, metrics-token).
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:XValidation:rule="self.all(v, !(v.name in ['config','metadata','data','rpc-secret','admin-token','metrics-token']) && !v.name.matches('^data-[0-9]+$'))",message="volume name is operator-reserved"
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	ExtraVolumes []v1beta2.PodExtraVolume `json:"extraVolumes,omitempty"`
+
 	// PriorityClassName for Garage pods
 	// +optional
 	PriorityClassName string `json:"priorityClassName,omitempty"`
@@ -156,16 +200,23 @@ type GarageClusterSpec struct {
 	// +optional
 	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
 
-	// Zone is the Garage layout zone assigned to all nodes in this cluster.
-	// Garage distributes object replicas across zones for fault tolerance — data
-	// survives the loss of an entire zone as long as enough zones remain for quorum.
+	// Zone is the static Garage layout zone used by members of this cluster and
+	// the fallback for storage members whose ZoneFrom label cannot be resolved.
+	// Garage distributes object replicas across actual layout zones for fault
+	// tolerance. When ZoneFrom is configured, one workload-owning cluster may
+	// contain roles in multiple zones.
 	//
-	// Each cluster in a federation must have a unique zone name.
-	// Single-cluster deployments may omit this (Garage uses a default zone).
+	// Single-zone deployments may omit this (Garage uses a default zone).
 	//
 	// Examples: "us-east-1", "rack-a", "dc1", "zone-a"
 	// +optional
 	Zone string `json:"zone,omitempty"`
+
+	// ZoneFrom derives each storage node's layout zone from a label on the
+	// Kubernetes Node its pod is scheduled to, instead of using the single
+	// cluster-wide Zone above. Zone remains the fallback.
+	// +optional
+	ZoneFrom *ZoneSource `json:"zoneFrom,omitempty"`
 
 	// PublicEndpoint configures how remote clusters reach this cluster's nodes
 	// Required for multi-cluster federation
@@ -180,9 +231,10 @@ type GarageClusterSpec struct {
 	RemoteClusters []RemoteClusterConfig `json:"remoteClusters,omitempty"`
 
 	// LayoutManagement controls automatic layout application behavior.
-	// By default, staged layout changes are NOT applied automatically — the operator
-	// stages them and waits for manual approval (or the force-layout-apply annotation).
-	// Set autoApply: true to apply changes automatically once minNodesHealthy are connected.
+	// With autoApply disabled, gateway tombstones are reported but are neither
+	// staged nor applied; remove those exact roles with the Garage CLI or enable
+	// autoApply. The force-layout-apply annotation is only a legacy/bootstrap
+	// below-replication-factor override and does not approve tombstones.
 	// +optional
 	LayoutManagement *LayoutManagementConfig `json:"layoutManagement,omitempty"`
 
@@ -195,6 +247,14 @@ type GarageClusterSpec struct {
 	// +kubebuilder:default="Auto"
 	// +optional
 	LayoutPolicy string `json:"layoutPolicy,omitempty"`
+
+	// DeletionPolicy is Destroy for whole-store teardown or Drain for federated
+	// site retirement. When omitted, standalone clusters retain legacy Destroy
+	// behavior. Federated deletion requires an explicit choice and fails closed as
+	// Drain if admission is bypassed.
+	// +kubebuilder:validation:Enum=Destroy;Drain
+	// +optional
+	DeletionPolicy DeletionPolicy `json:"deletionPolicy,omitempty"`
 
 	// DefaultNodeTags are tags applied to all auto-managed nodes.
 	// Only used when LayoutPolicy is "Auto".
@@ -400,7 +460,7 @@ type StorageConfig struct {
 	// +optional
 	MetadataAutoSnapshotInterval string `json:"metadataAutoSnapshotInterval,omitempty"`
 
-	// MetadataFsync enables fsync for metadata transactions
+	// MetadataFsync enables fsync on metadata writes for this node.
 	// +optional
 	MetadataFsync bool `json:"metadataFsync"`
 
@@ -412,6 +472,47 @@ type StorageConfig struct {
 	// Requires Kubernetes 1.23+. If not specified, defaults to Retain for both policies.
 	// +optional
 	PVCRetentionPolicy *PVCRetentionPolicy `json:"pvcRetentionPolicy,omitempty"`
+
+	// Env is a list of environment variables to set on the Garage container in
+	// the storage tier. Garage config-path and RPC/Admin/metrics credential
+	// variables are operator-reserved because drain safety and mesh identity rely
+	// on the rendered config and pinned immutable Secrets.
+	// +optional
+	Env []corev1.EnvVar `json:"env,omitempty"`
+
+	// EnvFrom is a list of sources to populate environment variables in the
+	// Garage container for the storage tier. A source prefix must not be capable
+	// of injecting an operator-reserved Garage variable.
+	// +optional
+	EnvFrom []corev1.EnvFromSource `json:"envFrom,omitempty"`
+}
+
+// StorageDrainUnverifiedPeersPolicy controls whether automatic drain may
+// proceed when one or more current positive-capacity Garage processes are not
+// managed by this GarageCluster's Kubernetes control plane.
+type StorageDrainUnverifiedPeersPolicy string
+
+const (
+	// StorageDrainUnverifiedPeersBlock is the safe default. External GarageNodes,
+	// foreign/federated roles, and roles whose process incarnation cannot be
+	// mapped to a locally managed pod block automatic drain.
+	StorageDrainUnverifiedPeersBlock StorageDrainUnverifiedPeersPolicy = "Block"
+	// StorageDrainUnverifiedPeersAssumeConsistent is an explicit operator
+	// attestation that every unverified Garage process is already running literal
+	// consistencyMode=consistent and that topology mutations are serialized
+	// across sites. It is not an online safety guarantee.
+	StorageDrainUnverifiedPeersAssumeConsistent StorageDrainUnverifiedPeersPolicy = "AssumeConsistent"
+)
+
+// StorageDrainConfig configures layout-wide positive-capacity removal safety.
+type StorageDrainConfig struct {
+	// UnverifiedPeersPolicy defaults to Block. AssumeConsistent is required for
+	// federated or externally managed processes and is a deliberate maintenance
+	// assertion, not an online safety guarantee.
+	// +kubebuilder:validation:Enum=Block;AssumeConsistent
+	// +kubebuilder:default=Block
+	// +optional
+	UnverifiedPeersPolicy StorageDrainUnverifiedPeersPolicy `json:"unverifiedPeersPolicy,omitempty"`
 }
 
 // PVCRetentionPolicy controls PVC lifecycle for StatefulSet volumes.
@@ -446,6 +547,7 @@ const (
 )
 
 // VolumeConfig configures a persistent volume
+// +kubebuilder:validation:XValidation:rule="!has(self.volumeAttributesClassName) || !has(self.type) || self.type == 'PersistentVolumeClaim'",message="volumeAttributesClassName is only valid for PersistentVolumeClaim volumes"
 type VolumeConfig struct {
 	// Type specifies the volume type: PersistentVolumeClaim (default) or EmptyDir.
 	// When EmptyDir, data is lost on pod restart - only use for testing.
@@ -463,11 +565,29 @@ type VolumeConfig struct {
 	// +optional
 	StorageClassName *string `json:"storageClassName,omitempty"`
 
+	// VolumeAttributesClassName is the name of a cluster-scoped Kubernetes
+	// VolumeAttributesClass applied to every PVC generated for this volume role.
+	// The class's driver must match the StorageClass provisioner; the operator
+	// does not check that or whether the class exists. Valid only for
+	// PersistentVolumeClaim volumes. Unlike storageClassName it may be changed
+	// while replicas are live: the operator updates bound claims in place, which
+	// asks the CSI driver to modify the volume. Requires Kubernetes 1.34+ (or
+	// 1.31-1.33 with the VolumeAttributesClass feature enabled) and a driver that
+	// supports ModifyVolume. Removing a configured value from a live volume is
+	// rejected.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +optional
+	VolumeAttributesClassName *string `json:"volumeAttributesClassName,omitempty"`
+
 	// AccessModes for the PVC. Only valid when Type=PersistentVolumeClaim.
 	// +optional
 	AccessModes []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
 
-	// Selector to select PVs. Only valid when Type=PersistentVolumeClaim.
+	// Selector matches pre-provisioned PVs for newly created claims. Kubernetes
+	// does not dynamically provision a PV when this is set. Only valid when
+	// Type=PersistentVolumeClaim; StorageClassName must also match the target PV.
 	// +optional
 	Selector *metav1.LabelSelector `json:"selector,omitempty"`
 
@@ -479,8 +599,24 @@ type VolumeConfig struct {
 	// +optional
 	Annotations map[string]string `json:"annotations,omitempty"`
 
-	// VolumeClaimTemplateSpec allows full customization of the PVC.
-	// Only valid when Type=PersistentVolumeClaim.
+	// DataSourceRef is the opt-in restore source for every generated PVC of this
+	// volume role. Setting it copies the same same-namespace, non-core group
+	// populator onto each Auto ordinal of this role; the populator must map
+	// target claim i to source-group member i. A core PVC or single-volume clone
+	// is not a safe source. Metadata and data are independent roles: restore
+	// identity by setting this on metadata, object blocks by setting it on data.
+	// It is immutable after the GarageCluster is created.
+	// +optional
+	DataSourceRef *corev1.TypedObjectReference `json:"dataSourceRef,omitempty"`
+
+	// VolumeClaimTemplateSpec is retained for API compatibility but is not
+	// supported by operator-managed workloads. Admission rejects new or changed
+	// values; an unchanged legacy value is tolerated only so it can be removed.
+	// Arbitrary claim-template dataSource or volumeName settings can clone a
+	// metadata node_key or bind multiple Garage identities to one disk. Use the
+	// explicit PVC fields above, or pre-provision a PVC and reference it from an
+	// ordinary GarageNode storage existingClaim.
+	// Deprecated: use explicit PVC fields or GarageNode existingClaim.
 	// +optional
 	VolumeClaimTemplateSpec *corev1.PersistentVolumeClaimSpec `json:"volumeClaimTemplateSpec,omitempty"`
 
@@ -494,6 +630,7 @@ type VolumeConfig struct {
 // DataPathVolumeConfig is PVC config for a single data path.
 // It mirrors VolumeConfig but omits the Paths field to avoid a
 // recursive type reference that breaks controller-gen schema generation.
+// +kubebuilder:validation:XValidation:rule="!has(self.volumeAttributesClassName) || !has(self.type) || self.type == 'PersistentVolumeClaim'",message="volumeAttributesClassName is only valid for PersistentVolumeClaim volumes"
 type DataPathVolumeConfig struct {
 	// Type specifies the volume type: PersistentVolumeClaim (default) or EmptyDir.
 	// +kubebuilder:default="PersistentVolumeClaim"
@@ -508,11 +645,29 @@ type DataPathVolumeConfig struct {
 	// +optional
 	StorageClassName *string `json:"storageClassName,omitempty"`
 
+	// VolumeAttributesClassName is the name of a cluster-scoped Kubernetes
+	// VolumeAttributesClass applied to every PVC generated for this volume role.
+	// The class's driver must match the StorageClass provisioner; the operator
+	// does not check that or whether the class exists. Valid only for
+	// PersistentVolumeClaim volumes. Unlike storageClassName it may be changed
+	// while replicas are live: the operator updates bound claims in place, which
+	// asks the CSI driver to modify the volume. Requires Kubernetes 1.34+ (or
+	// 1.31-1.33 with the VolumeAttributesClass feature enabled) and a driver that
+	// supports ModifyVolume. Removing a configured value from a live volume is
+	// rejected.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +optional
+	VolumeAttributesClassName *string `json:"volumeAttributesClassName,omitempty"`
+
 	// AccessModes for the PVC.
 	// +optional
 	AccessModes []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
 
-	// Selector to select PVs.
+	// Selector matches pre-provisioned PVs for newly created claims. Kubernetes
+	// does not dynamically provision a PV when this is set; StorageClassName must
+	// also match the target PV.
 	// +optional
 	Selector *metav1.LabelSelector `json:"selector,omitempty"`
 
@@ -524,7 +679,17 @@ type DataPathVolumeConfig struct {
 	// +optional
 	Annotations map[string]string `json:"annotations,omitempty"`
 
-	// VolumeClaimTemplateSpec allows full customization of the PVC.
+	// DataSourceRef is the opt-in restore source for this data path's PVC across
+	// every Auto ordinal. Same group-populator contract as VolumeConfig.dataSourceRef.
+	// +optional
+	DataSourceRef *corev1.TypedObjectReference `json:"dataSourceRef,omitempty"`
+
+	// VolumeClaimTemplateSpec is retained for API compatibility but is not
+	// supported by operator-managed workloads. Admission rejects new or changed
+	// values; an unchanged legacy value is tolerated only so it can be removed.
+	// Use the explicit PVC fields above, or pre-provision a PVC and reference it
+	// from an ordinary GarageNode storage existingClaim.
+	// Deprecated: use explicit PVC fields or GarageNode existingClaim.
 	// +optional
 	VolumeClaimTemplateSpec *corev1.PersistentVolumeClaimSpec `json:"volumeClaimTemplateSpec,omitempty"`
 }
@@ -556,8 +721,9 @@ type NetworkConfig struct {
 	// +kubebuilder:default=3901
 	RPCBindPort int32 `json:"rpcBindPort,omitempty"`
 
-	// RPCBindAddress is a custom bind address for the RPC server.
-	// Can be a TCP address (e.g., "0.0.0.0:3901", "[::]:3901").
+	// RPCBindAddress is a custom wildcard TCP bind address for the RPC server.
+	// Managed workloads accept "0.0.0.0:3901" or "[::]:3901" so the
+	// generated Service can reach every Garage process.
 	// If set, this overrides RPCBindPort.
 	// +optional
 	RPCBindAddress string `json:"rpcBindAddress,omitempty"`
@@ -644,9 +810,9 @@ type S3APIConfig struct {
 	// +kubebuilder:default=3900
 	BindPort int32 `json:"bindPort,omitempty"`
 
-	// BindAddress is a custom bind address for the S3 API.
-	// Can be a TCP address (e.g., "0.0.0.0:3900", "[::]:3900") or
-	// a Unix socket path (e.g., "unix:///run/garage/s3.sock").
+	// BindAddress is a custom wildcard TCP bind address for the S3 API.
+	// Managed workloads accept "0.0.0.0:3900" or "[::]:3900" so the
+	// generated Service and probes can reach every Garage process.
 	// If set, this overrides BindPort.
 	// +optional
 	BindAddress string `json:"bindAddress,omitempty"`
@@ -676,8 +842,7 @@ type K2VAPIConfig struct {
 	// +kubebuilder:default=3904
 	BindPort int32 `json:"bindPort,omitempty"`
 
-	// BindAddress is a custom bind address for the K2V API.
-	// Can be a TCP address or Unix socket path (e.g., "unix:///run/garage/k2v.sock").
+	// BindAddress is a custom wildcard TCP bind address for the K2V API.
 	// If set, this overrides BindPort.
 	// +optional
 	BindAddress string `json:"bindAddress,omitempty"`
@@ -691,6 +856,14 @@ type WebAPIConfig struct {
 	// Defaults to true. Set to false to disable.
 	// +optional
 	Enabled *bool `json:"enabled,omitempty"`
+
+	// Scheme is the URL scheme used when publishing bucket website URLs.
+	// Set to https when TLS is terminated in front of the Garage Web API.
+	// Defaults to http.
+	// +kubebuilder:validation:Enum=http;https
+	// +kubebuilder:default=http
+	// +optional
+	Scheme string `json:"scheme,omitempty"`
 
 	// RootDomain is the root domain suffix for bucket website access.
 	// Bucket websites are accessible via <bucket-name>.<root-domain>.
@@ -710,8 +883,7 @@ type WebAPIConfig struct {
 	// +kubebuilder:default=3902
 	BindPort int32 `json:"bindPort,omitempty"`
 
-	// BindAddress is a custom bind address for the Web API.
-	// Can be a TCP address or Unix socket path (e.g., "unix:///run/garage/web.sock").
+	// BindAddress is a custom wildcard TCP bind address for the Web API.
 	// If set, this overrides BindPort.
 	// +optional
 	BindAddress string `json:"bindAddress,omitempty"`
@@ -724,15 +896,19 @@ type WebAPIConfig struct {
 // AdminConfig configures the admin API and metrics.
 // The admin port is always active — restrict access via NetworkPolicy if needed.
 type AdminConfig struct {
-	// BindPort is the port to bind for admin API
+	// BindPort is the port to bind for admin API. The effective Admin API TCP
+	// port is immutable after the GarageCluster is created.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
 	// +kubebuilder:default=3903
 	BindPort int32 `json:"bindPort,omitempty"`
 
-	// BindAddress is a custom bind address for the Admin API.
-	// Can be a TCP address or Unix socket path (e.g., "unix:///run/garage/admin.sock").
-	// If set, this overrides BindPort.
+	// BindAddress is a custom wildcard TCP bind address for the Admin API.
+	// Managed workloads accept "0.0.0.0:3903" or "[::]:3903". Unix sockets,
+	// empty hosts, loopback, and specific hosts are rejected
+	// because Services and direct Pod probes must reach every Garage process.
+	// If set, its port overrides BindPort for all generated endpoints. The
+	// effective Admin API TCP port is immutable after GarageCluster creation.
 	// +optional
 	BindAddress string `json:"bindAddress,omitempty"`
 
@@ -805,7 +981,7 @@ type BlockConfig struct {
 
 	// CompressionLevel is the zstd compression level
 	// 1-19: standard, 20-22: ultra, -1 to -99: fast, "none": disabled
-	// +kubebuilder:validation:Pattern=`^(none|-?[1-9][0-9]*)$`
+	// +kubebuilder:validation:Pattern=`^(none|0|-?[1-9][0-9]*)$`
 	// +optional
 	CompressionLevel *string `json:"compressionLevel,omitempty"`
 
@@ -923,7 +1099,8 @@ type SecurityConfig struct {
 	TLS *TLSConfig `json:"tls,omitempty"`
 }
 
-// TLSConfig configures TLS settings for Garage inter-node RPC communication.
+// TLSConfig is retained for API compatibility but rejected by admission because
+// Garage removed rpc_tls. Use a transparent tunnel or service mesh instead.
 //
 // IMPORTANT LIMITATION: Garage does NOT natively support TLS termination for its APIs
 // (S3, K2V, Web, Admin). TLS settings here only apply to RPC communication between
@@ -997,7 +1174,9 @@ type PublicEndpointConfig struct {
 	// +optional
 	NodePort *NodePortEndpointConfig `json:"nodePort,omitempty"`
 
-	// ExternalIP configuration
+	// ExternalIP is retained for API compatibility but is not supported.
+	// Setting it is rejected because the operator does not consume the explicit
+	// address mapping or template.
 	// +optional
 	ExternalIP *ExternalIPEndpointConfig `json:"externalIP,omitempty"`
 }
@@ -1034,14 +1213,13 @@ type NodePortEndpointConfig struct {
 	BasePort int32 `json:"basePort,omitempty"`
 }
 
-// ExternalIPEndpointConfig for direct external IP exposure
+// ExternalIPEndpointConfig is retained for API compatibility but is unsupported.
 type ExternalIPEndpointConfig struct {
-	// Addresses maps pod names to external IPs
+	// Addresses is retained for API compatibility but is unsupported.
 	// +optional
 	Addresses map[string]string `json:"addresses,omitempty"`
 
-	// AddressTemplate uses go template to generate addresses from pod info
-	// Example: "garage-{{.Index}}.example.com"
+	// AddressTemplate is retained for API compatibility but is unsupported.
 	// +optional
 	AddressTemplate string `json:"addressTemplate,omitempty"`
 }
@@ -1062,9 +1240,9 @@ type RemoteClusterConfig struct {
 	// +required
 	Connection RemoteClusterConnection `json:"connection"`
 
-	// DefaultCapacity is the default storage capacity to assign to remote nodes
-	// that don't yet have a role in the layout. If not specified, defaults to 100Gi.
-	// Set to "0" to add nodes as gateway-only (no storage).
+	// DefaultCapacity is retained for API compatibility but is not supported.
+	// Remote role capacity is copied from the source cluster's committed or
+	// staged layout and cannot be overridden by the importing cluster.
 	// +optional
 	DefaultCapacity *resource.Quantity `json:"defaultCapacity,omitempty"`
 }
@@ -1142,6 +1320,18 @@ type ConnectToConfig struct {
 	AdminTokenSecretRef *corev1.SecretKeySelector `json:"adminTokenSecretRef,omitempty"`
 }
 
+// LayoutSiteRole is the part this site plays in Garage layout changes.
+// +kubebuilder:validation:Enum=Writer;Follower
+type LayoutSiteRole string
+
+const (
+	// LayoutSiteRoleWriter may stage, apply, revert and otherwise change the
+	// shared Garage layout. It is the behavior of an unset siteRole.
+	LayoutSiteRoleWriter LayoutSiteRole = "Writer"
+	// LayoutSiteRoleFollower never changes the shared Garage layout.
+	LayoutSiteRoleFollower LayoutSiteRole = "Follower"
+)
+
 // LayoutManagementConfig controls cluster layout management
 type LayoutManagementConfig struct {
 	// AutoApply automatically applies staged layout changes
@@ -1151,6 +1341,120 @@ type LayoutManagementConfig struct {
 	// MinNodesHealthy is the minimum healthy nodes required before applying layout changes
 	// +optional
 	MinNodesHealthy int `json:"minNodesHealthy,omitempty"`
+
+	// Drain is the layout-wide positive-capacity removal policy. It mirrors the
+	// v1beta2 hub so conversion preserves external/federated assertions even on
+	// connection-only management handles.
+	// +optional
+	Drain *StorageDrainConfig `json:"drain,omitempty"`
+
+	// SiteRole selects whether this GarageCluster may change the shared Garage
+	// layout. Absent is equivalent to Writer, the behavior of every release
+	// before this field existed. A Follower never stages, applies, reverts,
+	// or removes roles; it only reconciles its own workloads and reports
+	// status. Exactly one site in a federation should be the Writer.
+	// +optional
+	SiteRole LayoutSiteRole `json:"siteRole,omitempty"`
+}
+
+// LayoutWriterStatus reports this site's effective layout role.
+type LayoutWriterStatus struct {
+	// Role is the role the controller is currently enforcing.
+	// +kubebuilder:validation:Enum=Writer;Follower
+	Role LayoutSiteRole `json:"role"`
+}
+
+// StorageRolloutStatus records the exact managed pod handoff currently owned
+// by the GarageCluster controller. It is status-only transaction state shared
+// with the v1beta2 hub during API conversion.
+type StorageRolloutStatus struct {
+	// +optional
+	GarageNodeName string `json:"garageNodeName,omitempty"`
+	// +optional
+	NodeLocalPoolName string `json:"nodeLocalPoolName,omitempty"`
+	// +optional
+	KubernetesNodeName string `json:"kubernetesNodeName,omitempty"`
+	GarageNodeUID      string `json:"garageNodeUid"`
+	GarageNodeID       string `json:"garageNodeId"`
+	WorkloadUID        string `json:"workloadUid"`
+	// Recovery fails closed before a 33rd retired controller incarnation so the
+	// exact old-Pod exclusion set remains bounded in the conversion transport.
+	// +kubebuilder:validation:MaxItems=32
+	// +optional
+	RetiredWorkloadUIDs []string `json:"retiredWorkloadUids,omitempty"`
+	// +optional
+	PersistentVolumeClaims []StorageRolloutPersistentVolumeClaimStatus `json:"persistentVolumeClaims,omitempty"`
+	// +optional
+	StatefulSetWorkloadRecreationSafe bool `json:"statefulSetWorkloadRecreationSafe,omitempty"`
+	// +optional
+	KubernetesNodeUID string `json:"kubernetesNodeUid,omitempty"`
+	// +optional
+	WorkloadFenced     bool   `json:"workloadFenced,omitempty"`
+	PreviousPodUID     string `json:"previousPodUid"`
+	DesiredPodSpecHash string `json:"desiredPodSpecHash"`
+	DesiredConfigHash  string `json:"desiredConfigHash"`
+	// +optional
+	ClusterGeneration int64 `json:"clusterGeneration,omitempty"`
+	// +optional
+	GarageNodeGeneration int64 `json:"garageNodeGeneration,omitempty"`
+	// +optional
+	RecoveryRequest string `json:"recoveryRequest,omitempty"`
+	// +optional
+	RecoveryPodName string `json:"recoveryPodName,omitempty"`
+	// +optional
+	RecoveryPodUID string `json:"recoveryPodUid,omitempty"`
+}
+
+// StorageRolloutPersistentVolumeClaimStatus mirrors the hub's exact
+// StatefulSet storage-identity boundary during conversion.
+type StorageRolloutPersistentVolumeClaimStatus struct {
+	Name string `json:"name"`
+	UID  string `json:"uid"`
+}
+
+// StorageDrainActorStatus identifies the exact object authorized to advance a
+// cluster-wide storage-drain transaction.
+type StorageDrainActorStatus struct {
+	APIVersion string `json:"apiVersion"`
+	// +kubebuilder:validation:Enum=GarageCluster;GarageNode
+	Kind      string `json:"kind"`
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+	UID       string `json:"uid"`
+}
+
+// StorageDrainStatus is controller-owned, cluster-wide data-safety evidence
+// used before a positive-capacity Garage process is stopped. Settled history is
+// a quorum-safe all-registered-table barrier only in literal consistent mode;
+// degraded and dangerous modes are unsupported for automatic drain. It mirrors
+// the v1beta2 hub so conversion preserves an in-flight transaction.
+type StorageDrainStatus struct {
+	Actor                 StorageDrainActorStatus `json:"actor"`
+	TransactionID         string                  `json:"transactionId"`
+	TargetHash            string                  `json:"targetHash"`
+	StartedAt             metav1.Time             `json:"startedAt"`
+	RoleRemovalNodeIDs    []string                `json:"roleRemovalNodeIds"`
+	RemovedStorageNodeIDs []string                `json:"removedStorageNodeIds"`
+	// +optional
+	UnavailableSourceNodeIDs []string `json:"unavailableSourceNodeIds,omitempty"`
+	LayoutVersion            uint64   `json:"layoutVersion"`
+	// +optional
+	VerificationNodeIDs []string `json:"verificationNodeIds,omitempty"`
+	// +optional
+	ManagedPodUIDs map[string]string `json:"managedPodUids,omitempty"`
+	// +optional
+	RepairBaselines map[string]uint64 `json:"repairBaselines,omitempty"`
+	// +optional
+	RepairWorkerIDs map[string]uint64 `json:"repairWorkerIds,omitempty"`
+	// +optional
+	ResyncErrorBaselines map[string]uint64 `json:"resyncErrorBaselines,omitempty"`
+	QueueLength          uint64            `json:"queueLength"`
+	ErrorCount           uint64            `json:"errorCount"`
+	RequiresEmptyQueue   bool              `json:"requiresEmptyQueue"`
+	// +optional
+	QuietSince *metav1.Time `json:"quietSince,omitempty"`
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
 }
 
 // GarageClusterStatus defines the observed state of GarageCluster
@@ -1164,8 +1468,23 @@ type GarageClusterStatus struct {
 	Replicas int32 `json:"replicas"`
 
 	// Selector is the serialized label selector for pods managed by this cluster.
-	// Required for the scale subresource to work with HPA/VPA.
+	// This is the aggregate cluster selector and is not used by the scale
+	// subresource.
 	Selector string `json:"selector"`
+
+	// ScaleReplicas is the actual number of non-terminating Pods selected by
+	// ScaleSelector. For a storage view this includes only the default
+	// StatefulSet/PVC group and excludes node-local pools and gateways. For a
+	// v1beta1 edge-gateway view it includes the gateway Pods.
+	// +optional
+	ScaleReplicas int32 `json:"scaleReplicas,omitempty"`
+
+	// ScaleSelector is the serialized exact Pod selector paired with
+	// ScaleReplicas by the scale subresource. It is deliberately narrower than
+	// Selector so hidden v1beta2 node-local pools or unified gateways do not
+	// contaminate v1beta1 scale status.
+	// +optional
+	ScaleSelector string `json:"scaleSelector,omitempty"`
 
 	// ClusterID is the unique identifier of the Garage cluster
 	// +optional
@@ -1227,17 +1546,41 @@ type GarageClusterStatus struct {
 	// +optional
 	LayoutHistory *LayoutHistoryStatus `json:"layoutHistory,omitempty"`
 
-	// BlockErrors is the count of blocks with sync errors across all nodes
+	// BlockErrors is the count of blocks with sync errors across all nodes.
+	// Absent means not observed (Admin API unreachable, or a node that can
+	// hold blocks did not answer; silent capacityless gateways are ignored).
+	// 0 means observed with no errors.
 	// +optional
-	BlockErrors int32 `json:"blockErrors,omitempty"`
+	BlockErrors *int32 `json:"blockErrors,omitempty"`
 
 	// BlockErrorDetails provides detailed information about block errors
 	// +optional
 	BlockErrorDetails *BlockErrorsStatus `json:"blockErrorDetails,omitempty"`
 
-	// ResyncQueueLength is the total block resync queue depth across all nodes
+	// ResyncQueueLength is the total block resync queue depth across all nodes.
+	// Absent means not observed (Admin API unreachable, or a node that can
+	// hold blocks did not answer; silent capacityless gateways are ignored).
+	// 0 means observed and drained.
 	// +optional
-	ResyncQueueLength int64 `json:"resyncQueueLength,omitempty"`
+	ResyncQueueLength *int64 `json:"resyncQueueLength,omitempty"`
+
+	// StorageDrain records the single cluster-wide positive-capacity removal and
+	// block-migration proof.
+	// +optional
+	StorageDrain *StorageDrainStatus `json:"storageDrain,omitempty"`
+
+	// AutoModePVCHandoffs mirrors the hub version's controller-owned retained
+	// PVC identity handoffs so conversion cannot erase an in-flight replacement.
+	// +optional
+	// +listType=map
+	// +listMapKey=pvcName
+	AutoModePVCHandoffs []AutoModePVCHandoffStatus `json:"autoModePvcHandoffs,omitempty"`
+
+	// FactorMigration is mirrored from the storage version so v1beta1 status
+	// conversion and delete admission cannot erase or overlook an in-flight
+	// replication-factor migration.
+	// +optional
+	FactorMigration *FactorMigrationStatus `json:"factorMigration,omitempty"`
 
 	// ScrubStatus contains the status of data scrub operations
 	// +optional
@@ -1270,6 +1613,16 @@ type GarageClusterStatus struct {
 	// +optional
 	DrainingNodes int `json:"drainingNodes,omitempty"`
 
+	// StorageRollout is controller-owned durable state for the single managed
+	// pod handoff currently in progress.
+	// +optional
+	StorageRollout *StorageRolloutStatus `json:"storageRollout,omitempty"`
+
+	// LayoutWriter reports the layout role the controller is currently
+	// enforcing for this site. Nil until the controller first records it.
+	// +optional
+	LayoutWriter *LayoutWriterStatus `json:"layoutWriter,omitempty"`
+
 	// ObservedGeneration is the last observed generation
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
@@ -1279,6 +1632,41 @@ type GarageClusterStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// AutoModePVCHandoffStatus mirrors the v1beta2 retained Auto-mode PVC handoff
+// for lossless status conversion.
+type AutoModePVCHandoffStatus struct {
+	SlotName                   string `json:"slotName"`
+	PVCName                    string `json:"pvcName"`
+	PVCUID                     string `json:"pvcUid"`
+	PreviousGarageNodeUID      string `json:"previousGarageNodeUid"`
+	ReplacementReservationHash string `json:"replacementReservationHash,omitempty"`
+	ReplacementGarageNodeUID   string `json:"replacementGarageNodeUid,omitempty"`
+}
+
+// FactorMigrationStatus mirrors the v1beta2 coordinated replication-factor
+// migration transaction for lossless conversion and admission safety.
+type FactorMigrationStatus struct {
+	// +kubebuilder:validation:Enum=Validating;ScalingDown;Purging;Verifying;RebuildingLayout;Converging;Completed;Failed
+	// +optional
+	Phase string `json:"phase,omitempty"`
+	// +optional
+	FromFactor int `json:"fromFactor,omitempty"`
+	// +optional
+	ToFactor int `json:"toFactor,omitempty"`
+	// +optional
+	Force bool `json:"force,omitempty"`
+	// +optional
+	PurgeID string `json:"purgeId,omitempty"`
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+	// +optional
+	PhaseStartedAt *metav1.Time `json:"phaseStartedAt,omitempty"`
+	// +optional
+	CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // WorkersStatus contains detailed information about background workers
@@ -1342,7 +1730,10 @@ type LayoutHistoryStatus struct {
 	// +optional
 	MinAck int64 `json:"minAck,omitempty"`
 
-	// Versions contains the history of layout versions
+	// Versions contains at most 64 current, draining, and recent historical
+	// layout versions for diagnosis. Controller safety decisions read Garage's
+	// complete live layout history instead of relying on this bounded projection.
+	// +kubebuilder:validation:MaxItems=64
 	// +optional
 	Versions []LayoutVersionInfo `json:"versions,omitempty"`
 }
@@ -1724,7 +2115,7 @@ type GarageBuildInfo struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:deprecatedversion:warning="garage.rajsingh.info/v1beta1 GarageCluster is deprecated; migrate to garage.rajsingh.info/v1beta2"
 // +kubebuilder:subresource:status
-// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.selector
+// +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.scaleReplicas,selectorpath=.status.scaleSelector
 // +kubebuilder:resource:shortName=gc
 // +kubebuilder:printcolumn:name="Replicas",type="integer",JSONPath=".spec.replicas"
 // +kubebuilder:printcolumn:name="Ready",type="integer",JSONPath=".status.readyReplicas"

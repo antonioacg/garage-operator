@@ -22,14 +22,26 @@ rules:
   - patch
   - update
   - watch
+# Namespace selectors in GarageReferenceGrant evaluate source Namespace labels.
+# Namespaces are cluster-scoped, so this permission belongs in the cluster role.
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - ""
   resources:
   - pods
   verbs:
+  - create
   - delete
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - ""
@@ -38,10 +50,24 @@ rules:
   verbs:
   - create
   - patch
+# Kubernetes Nodes are read to resolve spec.zoneFrom.nodeLabel and updated with
+# operator-owned activation labels and HostPath claims for drain-safe node-local-pool membership.
+# Cluster-scoped, so namespace-scoped installs cannot use node-local pools.
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
 # Apps resources
 - apiGroups:
   - apps
   resources:
+  - daemonsets
   - deployments
   - statefulsets
   verbs:
@@ -51,6 +77,16 @@ rules:
   - list
   - patch
   - update
+  - watch
+# Read-only: the released-environment migration walks Deployment -> ReplicaSet
+# -> Pod to prove which live Garage processes share an RPC identity.
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
+  verbs:
+  - get
+  - list
   - watch
 # Policy resources for PodDisruptionBudget
 - apiGroups:
@@ -130,4 +166,34 @@ rules:
   - get
   - list
   - watch
+{{- if .Values.gatewayAPI.enabled }}
+# Gateway API HTTPRoutes for website-enabled buckets (spec.websiteExposure)
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - httproutes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+{{- end }}
+{{- if include "garage-operator.ingressEnabled" . }}
+# Ingress resources for website-enabled buckets (spec.websiteExposure)
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - ingresses
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+{{- end }}
 {{- end }}

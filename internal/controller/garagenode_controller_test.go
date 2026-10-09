@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -29,10 +30,12 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -44,6 +47,30 @@ import (
 )
 
 const testNodeZone = "dc1"
+
+func deleteTestManagedNodePVCs(ctx context.Context, kubeClient client.Client, namespace, nodeName string) error {
+	claims := &corev1.PersistentVolumeClaimList{}
+	if err := kubeClient.List(ctx, claims, client.InNamespace(namespace), client.MatchingLabels{
+		labelGarageNode: nodeName,
+	}); err != nil {
+		return err
+	}
+	for i := range claims.Items {
+		if len(claims.Items[i].Finalizers) > 0 {
+			claims.Items[i].Finalizers = nil
+			if err := kubeClient.Update(ctx, &claims.Items[i]); err != nil {
+				if errors.IsNotFound(err) {
+					continue
+				}
+				return err
+			}
+		}
+		if err := kubeClient.Delete(ctx, &claims.Items[i]); err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
 
 var _ = Describe("GarageNode Controller", func() {
 	Context("When reconciling a resource", func() {
@@ -193,7 +220,9 @@ var _ = Describe("GarageNode Controller", func() {
 				},
 			}
 			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			Expect(publishTestClusterConfig(ctx, k8sClient, cluster)).To(Succeed())
 			defer func() {
+				_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, clusterName)
 				cluster.Finalizers = nil
 				_ = k8sClient.Update(ctx, cluster)
 				_ = k8sClient.Delete(ctx, cluster)
@@ -488,10 +517,12 @@ var _ = Describe("GarageNode per-node features", func() {
 			},
 		}
 		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+		Expect(publishTestClusterConfig(ctx, k8sClient, cluster)).To(Succeed())
 		return cluster
 	}
 
 	cleanupCluster := func(ctx context.Context, name string) {
+		_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, name)
 		c := &garagev1beta2.GarageCluster{}
 		if err := k8sClient.Get(ctx, types.NamespacedName{Name: name, Namespace: featureNamespace}, c); err == nil {
 			c.Finalizers = nil
@@ -507,6 +538,7 @@ var _ = Describe("GarageNode per-node features", func() {
 			_ = k8sClient.Update(ctx, n)
 			_ = k8sClient.Delete(ctx, n)
 		}
+		_ = deleteTestManagedNodePVCs(ctx, k8sClient, featureNamespace, name)
 	}
 
 	reconciler := func() *GarageNodeReconciler {
@@ -525,7 +557,7 @@ var _ = Describe("GarageNode per-node features", func() {
 		AfterEach(func() {
 			cleanupNode(ctx, nodeName)
 			cleanupCluster(ctx, clusterName)
-			_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: nodeName + "-config", Namespace: featureNamespace}})
+			_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, clusterName)
 		})
 
 		It("writes rpc_public_addr from spec.network.rpcPublicAddr into the per-node ConfigMap", func() {
@@ -550,8 +582,8 @@ var _ = Describe("GarageNode per-node features", func() {
 			Expect(reconciler().reconcileNodeConfigMap(ctx, node, cluster)).To(Succeed())
 
 			By("verifying the ConfigMap contains the node's rpc_public_addr")
-			cm := &corev1.ConfigMap{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-config", Namespace: featureNamespace}, cm)).To(Succeed())
+			cm, err := testNodeConfigMap(ctx, k8sClient, cluster, node)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(cm.Data["garage.toml"]).To(ContainSubstring(`rpc_public_addr = "` + testIPv4RPCAddr + `"`))
 		})
 
@@ -590,8 +622,8 @@ var _ = Describe("GarageNode per-node features", func() {
 			Expect(reconciler().reconcileNodeConfigMap(ctx, node, clusterWithAddr)).To(Succeed())
 
 			By("verifying the node's address wins over the cluster's address")
-			cm := &corev1.ConfigMap{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-config", Namespace: featureNamespace}, cm)).To(Succeed())
+			cm, err := testNodeConfigMap(ctx, k8sClient, clusterWithAddr, node)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(cm.Data["garage.toml"]).To(ContainSubstring(`rpc_public_addr = "node-addr:3901"`))
 			Expect(cm.Data["garage.toml"]).NotTo(ContainSubstring("cluster-addr"))
 		})
@@ -632,8 +664,8 @@ var _ = Describe("GarageNode per-node features", func() {
 
 			Expect(reconciler().reconcileNodeConfigMap(ctx, gwNode, clusterWithAddr)).To(Succeed())
 
-			cm := &corev1.ConfigMap{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-config", Namespace: featureNamespace}, cm)).To(Succeed())
+			cm, err := testNodeConfigMap(ctx, k8sClient, clusterWithAddr, gwNode)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(cm.Data["garage.toml"]).NotTo(ContainSubstring("storage-lb.example.com"),
 				"gateway node must not inherit the storage tier rpc_public_addr")
 			Expect(cm.Data["garage.toml"]).NotTo(ContainSubstring("rpc_public_addr ="),
@@ -650,7 +682,7 @@ var _ = Describe("GarageNode per-node features", func() {
 		AfterEach(func() {
 			cleanupNode(ctx, nodeName)
 			cleanupCluster(ctx, clusterName)
-			_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: nodeName + "-config", Namespace: featureNamespace}})
+			_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, clusterName)
 		})
 
 		It("sets metadata_fsync=true and omits data_fsync when DataFsync is false", func() {
@@ -678,8 +710,8 @@ var _ = Describe("GarageNode per-node features", func() {
 			Expect(reconciler().reconcileNodeConfigMap(ctx, node, cluster)).To(Succeed())
 
 			By("verifying metadata_fsync is set and data_fsync is absent")
-			cm := &corev1.ConfigMap{}
-			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-config", Namespace: featureNamespace}, cm)).To(Succeed())
+			cm, err := testNodeConfigMap(ctx, k8sClient, cluster, node)
+			Expect(err).NotTo(HaveOccurred())
 			Expect(cm.Data["garage.toml"]).To(ContainSubstring("metadata_fsync = true"))
 			// data_fsync=false must not emit the line; note metadata_fsync contains the
 			// substring "data_fsync" so we anchor with a newline to avoid false matches.
@@ -800,6 +832,189 @@ var _ = Describe("GarageNode per-node features", func() {
 		})
 	})
 
+	Context("NodeVolumeConfig PVC metadata", func() {
+		It("applies user labels and annotations while preserving operator labels", func() {
+			const backupPolicyAnnotation = "dr.example.com/policy"
+			size := resource.MustParse("10Gi")
+			selector := &metav1.LabelSelector{MatchLabels: map[string]string{"disk.example.com/name": "manual-data"}}
+			node := &garagev1beta1.GarageNode{
+				ObjectMeta: metav1.ObjectMeta{Name: "pvc-metadata-node", Namespace: featureNamespace},
+				Spec: garagev1beta1.GarageNodeSpec{
+					ClusterRef: garagev1beta1.ClusterReference{Name: "pvc-metadata-cluster"},
+					Zone:       testNodeZone,
+					Capacity:   &size,
+					Storage: &garagev1beta1.NodeStorageConfig{
+						Data: &garagev1beta1.NodeVolumeConfig{
+							Size:        &size,
+							Selector:    selector,
+							Labels:      map[string]string{"backup": "enabled", labelCluster: "overridden"},
+							Annotations: map[string]string{backupPolicyAnnotation: "daily"},
+						},
+					},
+				},
+			}
+			cluster := &garagev1beta2.GarageCluster{ObjectMeta: metav1.ObjectMeta{Name: "pvc-metadata-cluster", Namespace: featureNamespace}}
+
+			pvcs := reconciler().buildNodeVolumeClaimTemplates(node, cluster)
+			var dataPVC *corev1.PersistentVolumeClaim
+			for i := range pvcs {
+				if pvcs[i].Name == dataVolName {
+					dataPVC = &pvcs[i]
+				}
+			}
+
+			Expect(dataPVC).NotTo(BeNil())
+			Expect(dataPVC.Labels).To(HaveKeyWithValue("backup", "enabled"))
+			Expect(dataPVC.Labels).To(HaveKeyWithValue(labelCluster, cluster.Name))
+			Expect(dataPVC.Annotations).To(HaveKeyWithValue(backupPolicyAnnotation, "daily"))
+			Expect(dataPVC.Spec.Selector).To(Equal(selector))
+		})
+
+		It("inherits selectors only for exact operator-owned replacement profiles", func() {
+			size := resource.MustParse("10Gi")
+			cluster := &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "selector-upgrade", Namespace: featureNamespace, UID: types.UID("cluster-uid"),
+				},
+				Spec: garagev1beta2.GarageClusterSpec{
+					LayoutPolicy: LayoutPolicyAuto,
+					Storage: &garagev1beta2.StorageSpec{
+						Replicas: 1,
+						Metadata: &garagev1beta2.VolumeConfig{Size: &size, Selector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{testDiskTypeLabel: metadataVolName},
+						}},
+						Data: &garagev1beta2.VolumeConfig{Paths: []garagev1beta2.DataPath{
+							{Path: testFastDataPath, Volume: &garagev1beta2.DataPathVolumeConfig{Size: &size, Selector: &metav1.LabelSelector{
+								MatchLabels: map[string]string{testDiskTypeLabel: testFastValue},
+							}}},
+						}},
+					},
+				},
+			}
+			controller := true
+			source := &garagev1beta1.GarageNode{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: cluster.Name + "-storage-0", Namespace: featureNamespace,
+					Labels: map[string]string{
+						labelAppManagedBy: managedByOperatorValue,
+						labelTier:         tierStorage,
+						labelCluster:      cluster.Name,
+					},
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: garagev1beta2.GroupVersion.String(), Kind: kindGarageCluster,
+						Name: cluster.Name, UID: cluster.UID, Controller: &controller,
+					}},
+				},
+				Spec: garagev1beta1.GarageNodeSpec{
+					ClusterRef: garagev1beta1.ClusterReference{Name: cluster.Name},
+					Storage: &garagev1beta1.NodeStorageConfig{
+						Metadata:  &garagev1beta1.NodeVolumeConfig{Size: &size},
+						DataPaths: []garagev1beta1.NodeVolumeConfig{{Size: &size, Path: testFastDataPath}},
+					},
+				},
+			}
+
+			replacement := source.Spec.DeepCopy()
+			applyInheritedManagedPVCSelectors(replacement, source, cluster)
+			Expect(replacement.Storage.Metadata.Selector).To(Equal(cluster.Spec.Storage.Metadata.Selector))
+			Expect(replacement.Storage.DataPaths[0].Selector).To(Equal(cluster.Spec.Storage.Data.Paths[0].Volume.Selector))
+
+			// Snapshotting must not alias the parent API object.
+			replacement.Storage.Metadata.Selector.MatchLabels[testDiskTypeLabel] = "mutated"
+			Expect(cluster.Spec.Storage.Metadata.Selector.MatchLabels).To(HaveKeyWithValue(testDiskTypeLabel, metadataVolName))
+
+			forged := source.DeepCopy()
+			forged.OwnerReferences = nil
+			forgedSpec := forged.Spec.DeepCopy()
+			applyInheritedManagedPVCSelectors(forgedSpec, forged, cluster)
+			Expect(forgedSpec.Storage.Metadata.Selector).To(BeNil(),
+				"managed labels without the exact parent controller UID must not inherit a profile")
+		})
+	})
+
+	Context("restored PVC selector upgrade boundary", func() {
+		const (
+			clusterName = "selector-upgrade-sts"
+			nodeName    = clusterName + "-storage-0"
+		)
+
+		AfterEach(func() {
+			cleanupNode(ctx, nodeName)
+			cleanupCluster(ctx, clusterName)
+			_ = k8sClient.Delete(ctx, &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{
+				Name: nodeName, Namespace: featureNamespace,
+			}})
+		})
+
+		It("leaves an existing selector-less StatefulSet and its claims untouched", func() {
+			oneGi := resource.MustParse("1Gi")
+			tenGi := resource.MustParse("10Gi")
+			cluster := &garagev1beta2.GarageCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: featureNamespace},
+				Spec: garagev1beta2.GarageClusterSpec{
+					LayoutPolicy: LayoutPolicyAuto,
+					Replication:  &garagev1beta2.ReplicationConfig{Factor: 1},
+					Storage: &garagev1beta2.StorageSpec{
+						Replicas: 1,
+						Metadata: &garagev1beta2.VolumeConfig{Size: &oneGi},
+						Data:     &garagev1beta2.VolumeConfig{Size: &tenGi},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+			Expect(publishTestClusterConfig(ctx, k8sClient, cluster)).To(Succeed())
+
+			capacity := resource.MustParse("100Gi")
+			node := &garagev1beta1.GarageNode{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: nodeName, Namespace: featureNamespace,
+					Labels: map[string]string{
+						labelAppManagedBy: managedByOperatorValue,
+						labelTier:         tierStorage,
+						labelCluster:      clusterName,
+					},
+				},
+				Spec: garagev1beta1.GarageNodeSpec{
+					ClusterRef: garagev1beta1.ClusterReference{Name: clusterName},
+					Zone:       testNodeZone,
+					Capacity:   &capacity,
+					Storage: &garagev1beta1.NodeStorageConfig{
+						Metadata: &garagev1beta1.NodeVolumeConfig{Size: &oneGi},
+						Data:     &garagev1beta1.NodeVolumeConfig{Size: &tenGi},
+					},
+				},
+			}
+			Expect(controllerutil.SetControllerReference(cluster, node, k8sClient.Scheme())).To(Succeed())
+			Expect(k8sClient.Create(ctx, node)).To(Succeed())
+
+			r := reconciler()
+			Expect(r.reconcileStatefulSet(ctx, node, cluster)).To(Succeed())
+			before := &appsv1.StatefulSet{}
+			key := types.NamespacedName{Name: nodeName, Namespace: featureNamespace}
+			Expect(k8sClient.Get(ctx, key, before)).To(Succeed())
+			for i := range before.Spec.VolumeClaimTemplates {
+				Expect(before.Spec.VolumeClaimTemplates[i].Spec.Selector).To(BeNil())
+			}
+
+			cluster.Spec.Storage.Metadata.Selector = &metav1.LabelSelector{
+				MatchLabels: map[string]string{testDiskTypeLabel: metadataVolName},
+			}
+			cluster.Spec.Storage.Data.Selector = &metav1.LabelSelector{
+				MatchLabels: map[string]string{testDiskTypeLabel: dataVolName},
+			}
+			Expect(r.reconcileStatefulSet(ctx, node, cluster)).To(Succeed())
+
+			after := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, key, after)).To(Succeed())
+			Expect(after.UID).To(Equal(before.UID), "the StatefulSet must not be orphan-recreated")
+			Expect(after.ResourceVersion).To(Equal(before.ResourceVersion), "selector-only parent drift must not update the StatefulSet")
+			for i := range after.Spec.VolumeClaimTemplates {
+				Expect(after.Spec.VolumeClaimTemplates[i].Spec.Selector).To(BeNil(),
+					"existing immutable claim templates must retain their historical selector")
+			}
+		})
+	})
+
 	Context("imagePullPolicy override in StatefulSet", func() {
 		const (
 			clusterName = "node-ipp-cluster"
@@ -838,6 +1053,89 @@ var _ = Describe("GarageNode per-node features", func() {
 			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName, Namespace: featureNamespace}, sts)).To(Succeed())
 			Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
 			Expect(sts.Spec.Template.Spec.Containers[0].ImagePullPolicy).To(Equal(corev1.PullAlways))
+		})
+	})
+
+	Context("operator-owned pod labels", func() {
+		const (
+			clusterName = "node-label-cluster"
+			nodeName    = "node-label-node"
+		)
+
+		AfterEach(func() {
+			cleanupNode(ctx, nodeName)
+			cleanupCluster(ctx, clusterName)
+			_ = k8sClient.Delete(ctx, &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: featureNamespace}})
+			for _, name := range []string{"default-scale-pod", "node-local-scale-pod"} {
+				_ = k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: featureNamespace}})
+			}
+		})
+
+		It("makes canonical selector labels win and keeps Scale scoped to the default group", func() {
+			cluster := makeFeatureCluster(ctx, clusterName)
+			cluster.Spec.LayoutPolicy = LayoutPolicyAuto
+			cluster.Spec.Storage.PodLabels = map[string]string{
+				labelAppManagedBy: "hostile-cluster", labelCluster: "wrong-node-cluster",
+				labelTier: tierGateway, labelStorageGroup: storageGroupNodeLocal,
+				labelScaleTarget: scaleTargetDisabled, "example.com/cluster-label": "cluster-kept",
+			}
+			capacity := resource.MustParse("100Gi")
+			node := &garagev1beta1.GarageNode{
+				ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: featureNamespace},
+				Spec: garagev1beta1.GarageNodeSpec{
+					ClusterRef: garagev1beta1.ClusterReference{Name: clusterName},
+					Zone:       testNodeZone, Capacity: &capacity,
+					PodLabels: map[string]string{
+						labelAppManagedBy: "hostile-node", labelGarageNode: "forged-node",
+						labelCluster: "wrong-node-cluster", labelTier: tierGateway,
+						labelStorageGroup: storageGroupNodeLocal, labelScaleTarget: scaleTargetDisabled,
+						"example.com/node-label": "node-kept",
+					},
+					Storage: &garagev1beta1.NodeStorageConfig{
+						Data: &garagev1beta1.NodeVolumeConfig{Size: ptrQuantity(resource.MustParse("100Gi"))},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, node)).To(Succeed())
+			Expect(reconciler().reconcileStatefulSet(ctx, node, cluster)).To(Succeed())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName, Namespace: featureNamespace}, sts)).To(Succeed())
+			for key, value := range sts.Spec.Selector.MatchLabels {
+				Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue(key, value),
+					"StatefulSet template must satisfy every immutable selector label")
+			}
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue(labelAppManagedBy, operatorName))
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue(labelGarageNode, nodeName))
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue(labelCluster, clusterName))
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue(labelTier, tierStorage))
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue(labelStorageGroup, storageGroupDefault))
+			Expect(sts.Spec.Template.Labels).NotTo(HaveKey(labelScaleTarget))
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("example.com/cluster-label", "cluster-kept"))
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("example.com/node-label", "node-kept"))
+
+			defaultPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: "default-scale-pod", Namespace: featureNamespace, Labels: map[string]string{},
+			}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: fmGarageContainer, Image: hostileLabelTestImage}}}}
+			for key, value := range sts.Spec.Template.Labels {
+				defaultPod.Labels[key] = value
+			}
+			nodeLocalPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: "node-local-scale-pod", Namespace: featureNamespace,
+				Labels: map[string]string{
+					labelCluster: clusterName, labelTier: tierStorage,
+					labelStorageGroup: storageGroupNodeLocal,
+				},
+			}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: fmGarageContainer, Image: hostileLabelTestImage}}}}
+			Expect(k8sClient.Create(ctx, defaultPod)).To(Succeed())
+			Expect(k8sClient.Create(ctx, nodeLocalPod)).To(Succeed())
+			observation, err := (&GarageClusterReconciler{Client: k8sClient}).observeGarageClusterScale(ctx, cluster)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(observation.replicas).To(Equal(int32(1)))
+			Expect(observation.selector).To(Equal(
+				"garage.rajsingh.info/cluster=" + clusterName +
+					",garage.rajsingh.info/storage-group=default,garage.rajsingh.info/tier=storage",
+			))
 		})
 	})
 
@@ -1039,6 +1337,7 @@ var _ = Describe("GarageNode multi-HDD storage layout", func() {
 			},
 		}
 		Expect(k8sClient.Create(ctx, c)).To(Succeed())
+		Expect(publishTestClusterConfig(ctx, k8sClient, c)).To(Succeed())
 		return c
 	}
 
@@ -1055,7 +1354,7 @@ var _ = Describe("GarageNode multi-HDD storage layout", func() {
 			_ = k8sClient.Update(ctx, c)
 			_ = k8sClient.Delete(ctx, c)
 		}
-		_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: nodeName + "-config", Namespace: testNamespace}})
+		_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, clusterName)
 	}
 
 	AfterEach(func() { cleanup(ctx) })
@@ -1098,11 +1397,11 @@ var _ = Describe("GarageNode multi-HDD storage layout", func() {
 		for _, t := range templates {
 			names = append(names, t.Name)
 		}
-		Expect(names).To(ContainElement("metadata"))
+		Expect(names).To(ContainElement(metadataVolName))
 		for i := 0; i < 2; i++ {
 			Expect(names).To(ContainElement(fmt.Sprintf("data-%d", i)))
 		}
-		Expect(names).NotTo(ContainElement("data"), "single-HDD PVC must not be emitted in multi-HDD mode")
+		Expect(names).NotTo(ContainElement(dataVolName), "single-HDD PVC must not be emitted in multi-HDD mode")
 	})
 
 	It("writes a TOML data_dir array into the per-node ConfigMap", func() {
@@ -1119,6 +1418,7 @@ var _ = Describe("GarageNode multi-HDD storage layout", func() {
 					DataPaths: []garagev1beta1.NodeVolumeConfig{
 						{Size: ptrQuantity(resource.MustParse("50Gi"))},
 						{Size: ptrQuantity(resource.MustParse("70Gi"))},
+						{Size: ptrQuantity(resource.MustParse("500m"))},
 					},
 				},
 			},
@@ -1128,12 +1428,13 @@ var _ = Describe("GarageNode multi-HDD storage layout", func() {
 		r := &GarageNodeReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		Expect(r.reconcileNodeConfigMap(ctx, node, cluster)).To(Succeed())
 
-		cm := &corev1.ConfigMap{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-config", Namespace: testNamespace}, cm)).To(Succeed())
+		cm, err := testNodeConfigMap(ctx, k8sClient, cluster, node)
+		Expect(err).NotTo(HaveOccurred())
 		toml := cm.Data["garage.toml"]
 		Expect(toml).To(ContainSubstring("data_dir = ["))
-		Expect(toml).To(ContainSubstring(`{ path = "/data/data-0", capacity = "50Gi" }`))
-		Expect(toml).To(ContainSubstring(`{ path = "/data/data-1", capacity = "70Gi" }`))
+		Expect(toml).To(ContainSubstring(`{ path = "/data/data-0", capacity = "53687091200" }`))
+		Expect(toml).To(ContainSubstring(`{ path = "/data/data-1", capacity = "75161927680" }`))
+		Expect(toml).To(ContainSubstring(`{ path = "/data/data-2", capacity = "1" }`))
 	})
 
 	// #205: pre-fix legacy-STS migrations created multi-HDD GarageNodes with
@@ -1196,17 +1497,17 @@ var _ = Describe("GarageNode multi-HDD storage layout", func() {
 				_ = k8sClient.Update(ctx, n)
 				_ = k8sClient.Delete(ctx, n)
 			}
-			_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: nodeName + "-config", Namespace: testNamespace}})
+			_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, clusterName)
 		}()
 
 		r := &GarageNodeReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		Expect(r.reconcileNodeConfigMap(ctx, node, cluster)).To(Succeed())
 
-		cm := &corev1.ConfigMap{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-config", Namespace: testNamespace}, cm)).To(Succeed())
+		cm, err := testNodeConfigMap(ctx, k8sClient, cluster, node)
+		Expect(err).NotTo(HaveOccurred())
 		toml := cm.Data["garage.toml"]
-		Expect(toml).To(ContainSubstring(`{ path = "/data/data-0", capacity = "33Gi" }`))
-		Expect(toml).To(ContainSubstring(`{ path = "/data/data-1", capacity = "44Gi" }`))
+		Expect(toml).To(ContainSubstring(`{ path = "/data/data-0", capacity = "35433480192" }`))
+		Expect(toml).To(ContainSubstring(`{ path = "/data/data-1", capacity = "47244640256" }`))
 	})
 
 	// #219: a non-readOnly dataPaths[] entry with neither Size nor a bound
@@ -1237,7 +1538,7 @@ var _ = Describe("GarageNode multi-HDD storage layout", func() {
 				_ = k8sClient.Update(ctx, n)
 				_ = k8sClient.Delete(ctx, n)
 			}
-			_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: nodeName + "-config", Namespace: testNamespace}})
+			_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, clusterName)
 		}()
 
 		r := &GarageNodeReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
@@ -1246,9 +1547,8 @@ var _ = Describe("GarageNode multi-HDD storage layout", func() {
 		Expect(err.Error()).To(ContainSubstring("has no capacity"))
 
 		// No invalid ConfigMap should have been written.
-		cm := &corev1.ConfigMap{}
-		getErr := k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-config", Namespace: testNamespace}, cm)
-		Expect(errors.IsNotFound(getErr)).To(BeTrue())
+		_, getErr := testNodeConfigMap(ctx, k8sClient, cluster, node)
+		Expect(getErr).To(MatchError(ContainSubstring("found 0 live ConfigMap revisions")))
 	})
 
 	// #219 positive control: a readOnly entry needs no capacity and still renders.
@@ -1276,13 +1576,13 @@ var _ = Describe("GarageNode multi-HDD storage layout", func() {
 				_ = k8sClient.Update(ctx, n)
 				_ = k8sClient.Delete(ctx, n)
 			}
-			_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: nodeName + "-config", Namespace: testNamespace}})
+			_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, clusterName)
 		}()
 
 		r := &GarageNodeReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		Expect(r.reconcileNodeConfigMap(ctx, node, cluster)).To(Succeed())
-		cm := &corev1.ConfigMap{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-config", Namespace: testNamespace}, cm)).To(Succeed())
+		cm, err := testNodeConfigMap(ctx, k8sClient, cluster, node)
+		Expect(err).NotTo(HaveOccurred())
 		Expect(cm.Data["garage.toml"]).To(ContainSubstring(`{ path = "/data/data-0", read_only = true }`))
 	})
 
@@ -1314,15 +1614,15 @@ var _ = Describe("GarageNode multi-HDD storage layout", func() {
 				_ = k8sClient.Update(ctx, n)
 				_ = k8sClient.Delete(ctx, n)
 			}
-			_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: nodeName + "-config", Namespace: testNamespace}})
+			_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, clusterName)
 		}()
 
 		r := &GarageNodeReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		Expect(r.reconcileNodeConfigMap(ctx, node, cluster)).To(Succeed())
-		cm := &corev1.ConfigMap{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-config", Namespace: testNamespace}, cm)).To(Succeed())
+		cm, err := testNodeConfigMap(ctx, k8sClient, cluster, node)
+		Expect(err).NotTo(HaveOccurred())
 		toml := cm.Data["garage.toml"]
-		Expect(toml).To(ContainSubstring(`{ path = "/mnt/ssd-fast", capacity = "50Gi" }`))
+		Expect(toml).To(ContainSubstring(`{ path = "/mnt/ssd-fast", capacity = "53687091200" }`))
 		Expect(toml).To(ContainSubstring(`{ path = "/mnt/legacy-cold", read_only = true }`))
 
 		_, mounts := r.buildNodeVolumesAndMounts(node, cluster)
@@ -1357,6 +1657,7 @@ var _ = Describe("GarageNode per-node env/envFrom/logging/snapshots", func() {
 			},
 		}
 		Expect(k8sClient.Create(ctx, c)).To(Succeed())
+		Expect(publishTestClusterConfig(ctx, k8sClient, c)).To(Succeed())
 		return c
 	}
 
@@ -1373,8 +1674,10 @@ var _ = Describe("GarageNode per-node env/envFrom/logging/snapshots", func() {
 			_ = k8sClient.Update(ctx, c)
 			_ = k8sClient.Delete(ctx, c)
 		}
-		_ = k8sClient.Delete(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: nodeName + "-config", Namespace: testNamespace}})
+		_ = deleteTestGarageConfigResourcesForCluster(ctx, k8sClient, clusterName)
 		_ = k8sClient.Delete(ctx, &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: testNamespace}})
+		_ = k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: nodeName + "-0", Namespace: testNamespace}})
+		_ = deleteTestManagedNodePVCs(ctx, k8sClient, testNamespace, nodeName)
 	}
 
 	AfterEach(func() { cleanup(ctx) })
@@ -1404,6 +1707,7 @@ var _ = Describe("GarageNode per-node env/envFrom/logging/snapshots", func() {
 		Expect(k8sClient.Create(ctx, node)).To(Succeed())
 
 		r := &GarageNodeReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		Expect(r.reconcileNodeConfigMap(ctx, node, cluster)).To(Succeed())
 		Expect(r.reconcileStatefulSet(ctx, node, cluster)).To(Succeed())
 
 		sts := &appsv1.StatefulSet{}
@@ -1416,6 +1720,106 @@ var _ = Describe("GarageNode per-node env/envFrom/logging/snapshots", func() {
 		Expect(envByName["FOO"]).To(Equal("cluster-foo"))
 		Expect(envByName["BAR"]).To(Equal("node-bar"), "node env should override cluster env with the same Name")
 		Expect(envByName["BAZ"]).To(Equal("node-baz"))
+	})
+
+	It("projects the released empty gateway marker for unified gateway nodes", func() {
+		cluster := makeCluster(ctx, nil, nil)
+		node := &garagev1beta1.GarageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: testNamespace},
+			Spec: garagev1beta1.GarageNodeSpec{
+				ClusterRef: garagev1beta1.ClusterReference{Name: clusterName},
+				Zone:       testNodeZone,
+				Gateway:    true,
+				Storage: &garagev1beta1.NodeStorageConfig{
+					Metadata: &garagev1beta1.NodeVolumeConfig{Size: ptrQuantity(resource.MustParse("1Gi"))},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+
+		r := &GarageNodeReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		Expect(r.reconcileStatefulSet(ctx, node, cluster)).To(Succeed())
+
+		sts := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName, Namespace: testNamespace}, sts)).To(Succeed())
+		Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue(
+			annotationGatewayDataMarker, gatewayDataMarkerLegacyContent,
+		))
+		var markerVolume *corev1.Volume
+		for i := range sts.Spec.Template.Spec.Volumes {
+			if sts.Spec.Template.Spec.Volumes[i].Name == gatewayDataMarkerVolumeName {
+				markerVolume = &sts.Spec.Template.Spec.Volumes[i]
+				break
+			}
+		}
+		Expect(markerVolume).NotTo(BeNil())
+		Expect(markerVolume.DownwardAPI).NotTo(BeNil())
+		Expect(markerVolume.DownwardAPI.Items).To(HaveLen(1))
+		Expect(markerVolume.DownwardAPI.Items[0].FieldRef.FieldPath).To(Equal(gatewayDataMarkerFieldPath))
+	})
+
+	It("repairs StatefulSet template metadata drift without replacing the OnDelete Pod", func() {
+		cluster := makeCluster(ctx, nil, nil)
+		node := &garagev1beta1.GarageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: testNamespace},
+			Spec: garagev1beta1.GarageNodeSpec{
+				ClusterRef: garagev1beta1.ClusterReference{Name: clusterName},
+				Zone:       testNodeZone,
+				Gateway:    true,
+				Storage: &garagev1beta1.NodeStorageConfig{
+					Metadata: &garagev1beta1.NodeVolumeConfig{Size: ptrQuantity(resource.MustParse("1Gi"))},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+
+		r := &GarageNodeReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		Expect(r.reconcileStatefulSet(ctx, node, cluster)).To(Succeed())
+		key := types.NamespacedName{Name: nodeName, Namespace: testNamespace}
+		before := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, key, before)).To(Succeed())
+		podSpecHash := before.Spec.Template.Annotations[annotationPodSpecHash]
+		configHash := before.Spec.Template.Annotations[annotationConfigHash]
+
+		podLabels := make(map[string]string, len(before.Spec.Template.Labels))
+		for k, v := range before.Spec.Template.Labels {
+			podLabels[k] = v
+		}
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      nodeName + "-0",
+				Namespace: testNamespace,
+				Labels:    podLabels,
+				OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(
+					before, appsv1.SchemeGroupVersion.WithKind("StatefulSet"),
+				)},
+			},
+			Spec: *before.Spec.Template.Spec.DeepCopy(),
+		}
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: "metadata", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		})
+		Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		podUID := pod.UID
+
+		delete(before.Spec.Template.Labels, labelCluster)
+		delete(before.Spec.Template.Annotations, annotationGatewayDataMarker)
+		before.Labels[labelAppManagedBy] = "drifted"
+		Expect(k8sClient.Update(ctx, before)).To(Succeed())
+
+		Expect(r.reconcileStatefulSet(ctx, node, cluster)).To(Succeed())
+		after := &appsv1.StatefulSet{}
+		Expect(k8sClient.Get(ctx, key, after)).To(Succeed())
+		Expect(after.UID).To(Equal(before.UID))
+		Expect(after.Spec.Template.Labels).To(HaveKeyWithValue(labelCluster, clusterName))
+		Expect(after.Spec.Template.Annotations).To(HaveKeyWithValue(annotationGatewayDataMarker, gatewayDataMarkerLegacyContent))
+		Expect(after.Spec.Template.Annotations[annotationPodSpecHash]).To(Equal(podSpecHash))
+		Expect(after.Spec.Template.Annotations[annotationConfigHash]).To(Equal(configHash))
+		Expect(after.Labels).To(HaveKeyWithValue(labelAppManagedBy, operatorName))
+
+		unchangedPod := &corev1.Pod{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, unchangedPod)).To(Succeed())
+		Expect(unchangedPod.UID).To(Equal(podUID))
 	})
 
 	It("uses per-node logging override over cluster logging", func() {
@@ -1437,6 +1841,7 @@ var _ = Describe("GarageNode per-node env/envFrom/logging/snapshots", func() {
 		Expect(k8sClient.Create(ctx, node)).To(Succeed())
 
 		r := &GarageNodeReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		Expect(r.reconcileNodeConfigMap(ctx, node, cluster)).To(Succeed())
 		Expect(r.reconcileStatefulSet(ctx, node, cluster)).To(Succeed())
 
 		sts := &appsv1.StatefulSet{}
@@ -1449,6 +1854,42 @@ var _ = Describe("GarageNode per-node env/envFrom/logging/snapshots", func() {
 			}
 		}
 		Expect(rustLog).To(Equal("debug"))
+	})
+
+	It("updates PVC retention policy on an existing StatefulSet", func() {
+		cluster := makeCluster(ctx, nil, nil)
+		cluster.Spec.Storage.PVCRetentionPolicy = &garagev1beta2.PVCRetentionPolicy{
+			WhenDeleted: pvcRetentionDelete,
+		}
+		capacity := resource.MustParse("100Gi")
+		node := &garagev1beta1.GarageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: testNamespace},
+			Spec: garagev1beta1.GarageNodeSpec{
+				ClusterRef: garagev1beta1.ClusterReference{Name: clusterName},
+				Zone:       testNodeZone,
+				Capacity:   &capacity,
+				Storage: &garagev1beta1.NodeStorageConfig{
+					Data: &garagev1beta1.NodeVolumeConfig{Size: ptrQuantity(resource.MustParse("100Gi"))},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+
+		r := &GarageNodeReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		Expect(r.reconcileStatefulSet(ctx, node, cluster)).To(Succeed())
+		sts := &appsv1.StatefulSet{}
+		key := types.NamespacedName{Name: nodeName, Namespace: testNamespace}
+		Expect(k8sClient.Get(ctx, key, sts)).To(Succeed())
+		Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted).
+			To(Equal(appsv1.DeletePersistentVolumeClaimRetentionPolicyType))
+
+		cluster.Spec.Storage.PVCRetentionPolicy = &garagev1beta2.PVCRetentionPolicy{
+			WhenDeleted: testRetentionRetain,
+		}
+		Expect(r.reconcileStatefulSet(ctx, node, cluster)).To(Succeed())
+		Expect(k8sClient.Get(ctx, key, sts)).To(Succeed())
+		Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted).
+			To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
 	})
 
 	It("writes per-node metadata snapshot overrides into the ConfigMap", func() {
@@ -1472,11 +1913,99 @@ var _ = Describe("GarageNode per-node env/envFrom/logging/snapshots", func() {
 		r := &GarageNodeReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
 		Expect(r.reconcileNodeConfigMap(ctx, node, cluster)).To(Succeed())
 
-		cm := &corev1.ConfigMap{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: nodeName + "-config", Namespace: testNamespace}, cm)).To(Succeed())
+		cm, err := testNodeConfigMap(ctx, k8sClient, cluster, node)
+		Expect(err).NotTo(HaveOccurred())
 		toml := cm.Data["garage.toml"]
 		Expect(toml).To(ContainSubstring(`metadata_snapshots_dir = "/data/snaps"`))
 		Expect(toml).To(ContainSubstring(`metadata_auto_snapshot_interval = "12h"`))
+	})
+})
+
+var _ = Describe("GarageNode capacity-less gateway cycle", func() {
+	It("fails closed without promoting or deleting either gateway identity", func() {
+		testScheme := runtime.NewScheme()
+		Expect(garagev1beta1.AddToScheme(testScheme)).To(Succeed())
+		Expect(garagev1beta2.AddToScheme(testScheme)).To(Succeed())
+
+		const (
+			clusterName   = "gateway-cycle"
+			originalName  = clusterName + "-gateway-0"
+			siblingNodeID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		)
+		cluster := &garagev1beta2.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: testNamespace, UID: types.UID("gateway-cluster-uid")},
+			Spec: garagev1beta2.GarageClusterSpec{
+				LayoutPolicy: LayoutPolicyAuto,
+				Storage:      &garagev1beta2.StorageSpec{Replicas: 1},
+				Gateway:      &garagev1beta2.GatewaySpec{Replicas: 1},
+			},
+		}
+		original := &garagev1beta1.GarageNode{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: originalName, Namespace: testNamespace, UID: types.UID("gateway-node-uid"),
+				Labels: map[string]string{
+					labelCluster:      clusterName,
+					labelTier:         tierGateway,
+					labelAppManagedBy: managedByOperatorValue,
+				},
+				Annotations: map[string]string{garagev1beta1.AnnotationCycle: annotationTrue},
+				Finalizers:  []string{garageNodeFinalizer},
+			},
+			Spec: garagev1beta1.GarageNodeSpec{
+				ClusterRef: garagev1beta1.ClusterReference{Name: clusterName},
+				Gateway:    true,
+				Storage: &garagev1beta1.NodeStorageConfig{
+					Metadata: &garagev1beta1.NodeVolumeConfig{Size: ptrQuantity(resource.MustParse("1Gi"))},
+				},
+			},
+			Status: garagev1beta1.GarageNodeStatus{
+				CyclePhase:       garagev1beta1.CyclePhaseSyncing,
+				CycleSiblingName: originalName + cycleSiblingSuffix,
+			},
+		}
+		Expect(controllerutil.SetControllerReference(cluster, original, testScheme)).To(Succeed())
+
+		siblingSpec := *original.Spec.DeepCopy()
+		siblingSpec.NodeID = ""
+		sibling := &garagev1beta1.GarageNode{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: originalName + cycleSiblingSuffix, Namespace: testNamespace,
+				UID:    types.UID("gateway-sibling-uid"),
+				Labels: cycleSiblingLabels(original),
+			},
+			Spec:   siblingSpec,
+			Status: garagev1beta1.GarageNodeStatus{NodeID: siblingNodeID},
+		}
+		Expect(controllerutil.SetControllerReference(original, sibling, testScheme)).To(Succeed())
+
+		fakeClient := fake.NewClientBuilder().WithScheme(testScheme).
+			WithObjects(original, sibling).
+			WithStatusSubresource(&garagev1beta1.GarageNode{}).
+			Build()
+		r := &GarageNodeReconciler{Client: fakeClient, Scheme: testScheme}
+
+		_, err := r.reconcileCycle(context.Background(), original, cluster, cluster)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(original.Annotations).NotTo(HaveKey(garagev1beta1.AnnotationDrain),
+			"blocked gateway cycles must not enter the positive-capacity drain protocol")
+
+		blockedSibling := &garagev1beta1.GarageNode{}
+		Expect(fakeClient.Get(context.Background(), types.NamespacedName{
+			Name: sibling.Name, Namespace: sibling.Namespace,
+		}, blockedSibling)).To(Succeed())
+		Expect(blockedSibling.Labels).To(HaveKeyWithValue(labelCycleSibling, annotationTrue))
+		Expect(metav1.IsControlledBy(blockedSibling, original)).To(BeTrue())
+
+		preserved := &garagev1beta1.GarageNode{}
+		Expect(fakeClient.Get(context.Background(), types.NamespacedName{
+			Name: original.Name, Namespace: original.Namespace,
+		}, preserved)).To(Succeed())
+		Expect(preserved.DeletionTimestamp.IsZero()).To(BeTrue())
+		condition := meta.FindStatusCondition(preserved.Status.Conditions, garagev1beta1.ConditionCycling)
+		Expect(condition).NotTo(BeNil())
+		Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+		Expect(condition.Reason).To(Equal(garagev1beta1.ReasonCycleBlocked))
+		Expect(condition.Message).To(ContainSubstring("gateway identities are not supported"))
 	})
 })
 
@@ -1560,14 +2089,23 @@ var _ = Describe("stsPVCRetentionPolicy", func() {
 		}}
 	}
 
-	It("returns nil for gateway nodes (gateway STS owns its own policy)", func() {
+	// The unset case resolves to an explicit Retain/Retain rather than nil. It is
+	// the same effective policy the API server would default to, but stated so
+	// the reconcile-time DeepEqual against the stored StatefulSet can match;
+	// nil compared against the defaulted value rewrote the STS every pass.
+	It("does not inherit the storage policy on gateway nodes (gateway STS owns its own)", func() {
 		got := stsPVCRetentionPolicy(mkCluster(&garagev1beta2.PVCRetentionPolicy{WhenDeleted: pvcRetentionDelete}), mkNode(true))
-		Expect(got).To(BeNil())
+		Expect(got).NotTo(BeNil())
+		Expect(got.WhenDeleted).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType),
+			"storage WhenDeleted=Delete must not leak onto a gateway node")
+		Expect(got.WhenScaled).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
 	})
 
-	It("returns nil when cluster.storage.pvcRetentionPolicy is unset (k8s default of Retain stands)", func() {
+	It("states the API server's Retain default when cluster.storage.pvcRetentionPolicy is unset", func() {
 		got := stsPVCRetentionPolicy(mkCluster(nil), mkNode(false))
-		Expect(got).To(BeNil())
+		Expect(got).NotTo(BeNil(), "nil can never equal the stored defaulted value; see stsPVCRetentionPolicy")
+		Expect(got.WhenDeleted).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
+		Expect(got.WhenScaled).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
 	})
 
 	It("translates WhenDeleted=Delete and WhenScaled=Delete", func() {
@@ -1598,6 +2136,7 @@ var _ = Describe("expandNodePVCs", func() {
 	const (
 		ns       = "default"
 		nodeName = "expand-node"
+		nodeUID  = "expand-node-uid"
 	)
 	var (
 		ctx     context.Context
@@ -1607,7 +2146,14 @@ var _ = Describe("expandNodePVCs", func() {
 
 	mkPVC := func(name, size string) *corev1.PersistentVolumeClaim {
 		return &corev1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: ns, UID: types.UID(name + "-uid"),
+				Labels: map[string]string{
+					labelAppManagedBy: operatorName, labelAppComponent: "node",
+					labelGarageNode: nodeName, labelCluster: "expand-cluster",
+				},
+				Annotations: map[string]string{managedPVCNodeUIDAnnotation: nodeUID},
+			},
 			Spec: corev1.PersistentVolumeClaimSpec{
 				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 				Resources:   corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(size)}},
@@ -1615,11 +2161,45 @@ var _ = Describe("expandNodePVCs", func() {
 		}
 	}
 
+	installLiveStatefulSetEvidence := func(
+		fc client.Client,
+		r *GarageNodeReconciler,
+		node *garagev1beta1.GarageNode,
+	) {
+		statefulSet := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Name: node.Name, Namespace: ns, UID: types.UID(node.Name + "-statefulset-uid")},
+			Spec: appsv1.StatefulSetSpec{
+				VolumeClaimTemplates: r.buildNodeVolumeClaimTemplates(node, cluster),
+			},
+		}
+		Expect(controllerutil.SetControllerReference(node, statefulSet, scheme)).To(Succeed())
+		Expect(fc.Create(ctx, statefulSet)).To(Succeed())
+
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: node.Name + "-0", Namespace: ns, UID: types.UID(node.Name + "-pod-uid")},
+		}
+		for i := range statefulSet.Spec.VolumeClaimTemplates {
+			claimName := fmt.Sprintf("%s-%s-0", statefulSet.Spec.VolumeClaimTemplates[i].Name, statefulSet.Name)
+			node.Status.ManagedPVCs = append(node.Status.ManagedPVCs, garagev1beta1.ManagedNodePVCStatus{
+				Name: claimName, UID: types.UID(claimName + "-uid"),
+			})
+			pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+				Name: statefulSet.Spec.VolumeClaimTemplates[i].Name,
+				VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: claimName,
+				}},
+			})
+		}
+		Expect(controllerutil.SetControllerReference(statefulSet, pod, scheme)).To(Succeed())
+		Expect(fc.Create(ctx, pod)).To(Succeed())
+	}
+
 	BeforeEach(func() {
 		ctx = context.Background()
 		cluster = &garagev1beta2.GarageCluster{ObjectMeta: metav1.ObjectMeta{Name: "expand-cluster", Namespace: ns}}
 		scheme = runtime.NewScheme()
 		Expect(corev1.AddToScheme(scheme)).To(Succeed())
+		Expect(appsv1.AddToScheme(scheme)).To(Succeed())
 		Expect(garagev1beta1.AddToScheme(scheme)).To(Succeed())
 		Expect(garagev1beta2.AddToScheme(scheme)).To(Succeed())
 	})
@@ -1634,7 +2214,7 @@ var _ = Describe("expandNodePVCs", func() {
 		newMeta := resource.MustParse("5Gi")
 		oldData := resource.MustParse("10Gi")
 		node := &garagev1beta1.GarageNode{
-			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: ns, UID: nodeUID},
 			Spec: garagev1beta1.GarageNodeSpec{
 				Storage: &garagev1beta1.NodeStorageConfig{
 					Metadata: &garagev1beta1.NodeVolumeConfig{Size: &newMeta},
@@ -1642,6 +2222,7 @@ var _ = Describe("expandNodePVCs", func() {
 				},
 			},
 		}
+		installLiveStatefulSetEvidence(fc, r, node)
 		Expect(r.expandNodePVCs(ctx, node, cluster)).To(Succeed())
 
 		got := &corev1.PersistentVolumeClaim{}
@@ -1657,13 +2238,14 @@ var _ = Describe("expandNodePVCs", func() {
 
 		smaller := resource.MustParse("1Gi")
 		node := &garagev1beta1.GarageNode{
-			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: ns, UID: nodeUID},
 			Spec: garagev1beta1.GarageNodeSpec{
 				Storage: &garagev1beta1.NodeStorageConfig{
 					Metadata: &garagev1beta1.NodeVolumeConfig{Size: &smaller},
 				},
 			},
 		}
+		installLiveStatefulSetEvidence(fc, r, node)
 		Expect(r.expandNodePVCs(ctx, node, cluster)).To(Succeed())
 
 		got := &corev1.PersistentVolumeClaim{}
@@ -1692,6 +2274,121 @@ var _ = Describe("expandNodePVCs", func() {
 		Expect(fc.Get(ctx, types.NamespacedName{Name: "legacy-meta", Namespace: ns}, got)).To(Succeed())
 		Expect(got.Spec.Resources.Requests[corev1.ResourceStorage]).To(Equal(resource.MustParse("1Gi")))
 	})
+
+	It("refuses to expand a foreign convention-named PVC", func() {
+		foreign := mkPVC("metadata-"+nodeName+"-0", "1Gi")
+		foreign.Annotations = nil
+		fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(foreign).Build()
+		r := &GarageNodeReconciler{Client: fc, Scheme: scheme}
+		bigger := resource.MustParse("5Gi")
+		node := &garagev1beta1.GarageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: ns, UID: "node-uid"},
+			Spec: garagev1beta1.GarageNodeSpec{Storage: &garagev1beta1.NodeStorageConfig{
+				Metadata: &garagev1beta1.NodeVolumeConfig{Size: &bigger},
+			}},
+		}
+		Expect(r.expandNodePVCs(ctx, node, cluster)).To(MatchError(ContainSubstring("labels alone are not ownership")))
+		got := &corev1.PersistentVolumeClaim{}
+		Expect(fc.Get(ctx, client.ObjectKeyFromObject(foreign), got)).To(Succeed())
+		Expect(got.Spec.Resources.Requests[corev1.ResourceStorage]).To(Equal(resource.MustParse("1Gi")))
+	})
+
+	It("refuses a convention-named PVC pinned to a previous GarageNode UID", func() {
+		claim := mkPVC("metadata-"+nodeName+"-0", "1Gi")
+		claim.Annotations = map[string]string{managedPVCNodeUIDAnnotation: "previous-node-uid"}
+		fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(claim).Build()
+		r := &GarageNodeReconciler{Client: fc, Scheme: scheme}
+		bigger := resource.MustParse("5Gi")
+		node := &garagev1beta1.GarageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: ns, UID: "current-node-uid"},
+			Spec: garagev1beta1.GarageNodeSpec{Storage: &garagev1beta1.NodeStorageConfig{
+				Metadata: &garagev1beta1.NodeVolumeConfig{Size: &bigger},
+			}},
+		}
+		Expect(r.expandNodePVCs(ctx, node, cluster)).To(MatchError(ContainSubstring("does not match")))
+	})
+
+	It("refuses a precreated PVC carrying the current public GarageNode UID", func() {
+		claim := mkPVC("metadata-"+nodeName+"-0", "1Gi")
+		claim.Annotations = map[string]string{managedPVCNodeUIDAnnotation: "current-node-uid"}
+		fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(claim).Build()
+		r := &GarageNodeReconciler{Client: fc, Scheme: scheme}
+		node := &garagev1beta1.GarageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: ns, UID: "current-node-uid"},
+			Spec: garagev1beta1.GarageNodeSpec{Storage: &garagev1beta1.NodeStorageConfig{
+				Metadata: &garagev1beta1.NodeVolumeConfig{Size: ptr.To(resource.MustParse("5Gi"))},
+			}},
+		}
+		templates := r.buildNodeVolumeClaimTemplates(node, cluster)
+
+		Expect(r.validateConventionNamedNodePVCs(ctx, node, cluster, templates)).
+			To(MatchError(ContainSubstring("without an exact live GarageNode-controlled StatefulSet")))
+	})
+
+	It("pins the bounded legacy PVC UID and accepts only that identity after StatefulSet replacement", func() {
+		legacy := mkPVC("metadata-"+nodeName+"-0", "1Gi")
+		legacy.Annotations = nil
+		fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(legacy).
+			WithStatusSubresource(&garagev1beta1.GarageNode{}).Build()
+		r := &GarageNodeReconciler{Client: fc, Scheme: scheme}
+		size := resource.MustParse("5Gi")
+		node := &garagev1beta1.GarageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: ns, UID: "current-node-uid"},
+			Spec: garagev1beta1.GarageNodeSpec{Storage: &garagev1beta1.NodeStorageConfig{
+				Metadata: &garagev1beta1.NodeVolumeConfig{Size: &size},
+			}},
+		}
+		Expect(fc.Create(ctx, node)).To(Succeed())
+		templates := r.buildNodeVolumeClaimTemplates(node, cluster)
+		Expect(r.validateConventionNamedNodePVCs(ctx, node, cluster, templates)).To(MatchError(ContainSubstring("labels alone are not ownership")))
+		statefulSet := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName, Namespace: ns, UID: "statefulset-uid"},
+			Spec:       appsv1.StatefulSetSpec{VolumeClaimTemplates: templates},
+		}
+		Expect(controllerutil.SetControllerReference(node, statefulSet, scheme)).To(Succeed())
+		Expect(fc.Create(ctx, statefulSet)).To(Succeed())
+		Expect(r.validateConventionNamedNodePVCs(ctx, node, cluster, templates)).To(MatchError(ContainSubstring("exact StatefulSet Pod default/expand-node-0 is absent")))
+
+		wrongPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: nodeName + "-0", Namespace: ns, UID: "wrong-pod-uid"},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "garage", Image: "garage:test"}},
+				Volumes: []corev1.Volume{{Name: "other", VolumeSource: corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "other-claim"},
+				}}},
+			},
+		}
+		Expect(controllerutil.SetControllerReference(statefulSet, wrongPod, scheme)).To(Succeed())
+		Expect(fc.Create(ctx, wrongPod)).To(Succeed())
+		Expect(r.validateConventionNamedNodePVCs(ctx, node, cluster, templates)).To(MatchError(ContainSubstring("does not reference it")))
+		Expect(fc.Delete(ctx, wrongPod)).To(Succeed())
+
+		livePod := wrongPod.DeepCopy()
+		livePod.ResourceVersion = ""
+		livePod.UID = "live-pod-uid"
+		livePod.Spec.Volumes[0].PersistentVolumeClaim.ClaimName = legacy.Name
+		Expect(controllerutil.SetControllerReference(statefulSet, livePod, scheme)).To(Succeed())
+		Expect(fc.Create(ctx, livePod)).To(Succeed())
+		Expect(r.validateConventionNamedNodePVCs(ctx, node, cluster, templates)).To(Succeed())
+		pinned := &corev1.PersistentVolumeClaim{}
+		Expect(fc.Get(ctx, client.ObjectKeyFromObject(legacy), pinned)).To(Succeed())
+		Expect(pinned.Annotations).To(HaveKeyWithValue(managedPVCNodeUIDAnnotation, string(node.UID)))
+		Expect(node.Status.ManagedPVCs).To(ContainElement(garagev1beta1.ManagedNodePVCStatus{Name: legacy.Name, UID: legacy.UID}))
+
+		pinned.Annotations = nil
+		Expect(fc.Update(ctx, pinned)).To(Succeed())
+		Expect(r.validateConventionNamedNodePVCs(ctx, node, cluster, templates)).To(Succeed())
+
+		replacement := pinned.DeepCopy()
+		replacement.UID = "replacement-pvc-uid"
+		controllerutil.RemoveFinalizer(pinned, managedPVCFinalizer)
+		Expect(fc.Update(ctx, pinned)).To(Succeed())
+		Expect(fc.Delete(ctx, pinned)).To(Succeed())
+		replacement.ResourceVersion = ""
+		Expect(fc.Create(ctx, replacement)).To(Succeed())
+		Expect(r.validateConventionNamedNodePVCs(ctx, node, cluster, templates)).
+			To(MatchError(ContainSubstring("GarageNode status records UID")))
+	})
 })
 
 // Bug #4 — orphaned-finalize path. When the parent GarageCluster CR is gone
@@ -1718,6 +2415,7 @@ var _ = Describe("GarageNode orphaned-finalize against external admin endpoint",
 		bctx = context.Background()
 		scheme = runtime.NewScheme()
 		Expect(corev1.AddToScheme(scheme)).To(Succeed())
+		Expect(appsv1.AddToScheme(scheme)).To(Succeed())
 		Expect(garagev1beta1.AddToScheme(scheme)).To(Succeed())
 		Expect(garagev1beta2.AddToScheme(scheme)).To(Succeed())
 	})
@@ -1727,6 +2425,9 @@ var _ = Describe("GarageNode orphaned-finalize against external admin endpoint",
 	mockGarage := func(extraNodeID string) (*httptest.Server, *int32, *int32) {
 		var updates, applies int32
 		mux := http.NewServeMux()
+		mux.HandleFunc("/v2/GetClusterLayoutHistory", func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(settledLayoutHistoryResponse())
+		})
 		mux.HandleFunc("/v2/GetClusterLayout", func(w http.ResponseWriter, _ *http.Request) {
 			roles := []garage.LayoutRole{{ID: extraNodeID, Zone: "z"}}
 			layout := garage.ClusterLayout{Version: 1, Roles: roles}
@@ -1776,6 +2477,7 @@ var _ = Describe("GarageNode orphaned-finalize against external admin endpoint",
 			Spec: garagev1beta1.GarageNodeSpec{
 				ClusterRef: garagev1beta1.ClusterReference{Name: goneClusterName},
 				Zone:       "z",
+				Gateway:    true,
 			},
 			Status: garagev1beta1.GarageNodeStatus{
 				NodeID:               nodeID,
@@ -1828,6 +2530,7 @@ var _ = Describe("GarageNode orphaned-finalize against external admin endpoint",
 			Spec: garagev1beta1.GarageNodeSpec{
 				ClusterRef: garagev1beta1.ClusterReference{Name: goneClusterName},
 				Zone:       "z",
+				Gateway:    true,
 			},
 			Status: garagev1beta1.GarageNodeStatus{
 				NodeID:               nodeID,
@@ -1865,6 +2568,7 @@ var _ = Describe("GarageNode orphaned-finalize against external admin endpoint",
 			Spec: garagev1beta1.GarageNodeSpec{
 				ClusterRef: garagev1beta1.ClusterReference{Name: goneClusterName},
 				Zone:       "z",
+				Gateway:    true,
 			},
 			Status: garagev1beta1.GarageNodeStatus{NodeID: nodeID},
 		}
@@ -1932,27 +2636,35 @@ var _ = Describe("nodesForClusterConfigMap mapper", func() {
 		}
 	}
 
-	It("enqueues every GarageNode whose ClusterRef matches the labelled cluster CM", func() {
+	It("enqueues every GarageNode whose ClusterRef matches the exact owned cluster config revision", func() {
 		const clusterName = "stable-cluster"
+		cluster := &garagev1beta2.GarageCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: clusterName, Namespace: ns, UID: types.UID("stable-cluster-uid")},
+		}
 		cm := &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      clusterName + "-config",
+				Name:      garageConfigRevisionName(clusterName+"-config", strings.Repeat("a", 64)),
 				Namespace: ns,
 				Labels: map[string]string{
 					labelCluster:      clusterName,
 					labelAppManagedBy: operatorName,
 				},
+				Annotations: map[string]string{annotationGarageConfigBaseName: clusterName + "-config"},
+				OwnerReferences: []metav1.OwnerReference{
+					*metav1.NewControllerRef(cluster, garagev1beta2.GroupVersion.WithKind(kindGarageCluster)),
+				},
 			},
 		}
 
 		fc := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+			cluster,
 			mkNode("n1", clusterName),
 			mkNode("n2", clusterName),
 			mkNode("n-other", "other-cluster"),
 		).Build()
 		r := &GarageNodeReconciler{Client: fc, Scheme: scheme}
 
-		reqs := r.nodesForClusterConfigMap(bctx, cm)
+		reqs := r.nodesForClusterConfigResource(bctx, cm)
 		names := make([]string, 0, len(reqs))
 		for _, req := range reqs {
 			names = append(names, req.Name)
@@ -1975,7 +2687,7 @@ var _ = Describe("nodesForClusterConfigMap mapper", func() {
 		).Build()
 		r := &GarageNodeReconciler{Client: fc, Scheme: scheme}
 
-		Expect(r.nodesForClusterConfigMap(bctx, cm)).To(BeEmpty())
+		Expect(r.nodesForClusterConfigResource(bctx, cm)).To(BeEmpty())
 	})
 
 	It("ignores the gateway-only CM (<cluster>-gateway-config) since no GarageNode consumes it", func() {
@@ -1996,6 +2708,160 @@ var _ = Describe("nodesForClusterConfigMap mapper", func() {
 		).Build()
 		r := &GarageNodeReconciler{Client: fc, Scheme: scheme}
 
-		Expect(r.nodesForClusterConfigMap(bctx, cm)).To(BeEmpty())
+		Expect(r.nodesForClusterConfigResource(bctx, cm)).To(BeEmpty())
+	})
+})
+
+var _ = Describe("nodeForManagedPod mapper", func() {
+	const ns = "pod-mapper-ns"
+
+	r := &GarageNodeReconciler{}
+	requestNames := func(pod *corev1.Pod) []string {
+		reqs := r.nodeForManagedPod(context.Background(), pod)
+		names := make([]string, 0, len(reqs))
+		for _, req := range reqs {
+			names = append(names, req.Namespace+"/"+req.Name)
+		}
+		return names
+	}
+
+	It("maps an indirectly owned StatefulSet Pod to its labelled GarageNode", func() {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      testManualGarageNodeName + "-0",
+				Namespace: ns,
+				Labels: map[string]string{
+					labelAppManagedBy: operatorName,
+					labelGarageNode:   testManualGarageNodeName,
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: appsv1.SchemeGroupVersion.String(), Kind: kindStatefulSet,
+					Name: testManualGarageNodeName, Controller: ptr.To(true),
+				}},
+			},
+		}
+		Expect(requestNames(pod)).To(Equal([]string{ns + "/" + testManualGarageNodeName}))
+	})
+
+	It("maps a scheduled node-local-pool DaemonSet Pod to its deterministic GarageNode", func() {
+		pod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "site-storage-fast-abcde",
+				Namespace: ns,
+				Labels: map[string]string{
+					labelAppManagedBy:  operatorName,
+					labelCluster:       testSiteName,
+					labelTier:          tierStorage,
+					labelStorageGroup:  storageGroupNodeLocal,
+					labelNodeLocalPool: testFastValue,
+				},
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: appsv1.SchemeGroupVersion.String(), Kind: "DaemonSet",
+					Name: "site-storage-fast", Controller: ptr.To(true),
+				}},
+			},
+			Spec: corev1.PodSpec{NodeName: testKubernetesWorkerA},
+		}
+		Expect(requestNames(pod)).To(Equal([]string{
+			ns + "/" + nodeLocalPoolGarageNodeName(testSiteName, testFastValue, testKubernetesWorkerA),
+		}))
+	})
+
+	It("ignores lookalike Pods that are not operator-managed or lack the expected owner", func() {
+		unmanaged := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Labels: map[string]string{
+				labelGarageNode: testManualGarageNodeName,
+			},
+		}}
+		Expect(requestNames(unmanaged)).To(BeEmpty())
+
+		wrongOwner := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Labels: map[string]string{
+				labelAppManagedBy: operatorName,
+				labelGarageNode:   testManualGarageNodeName,
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "v1", Kind: "Secret", Name: "lookalike", Controller: ptr.To(true),
+			}},
+		}}
+		Expect(requestNames(wrongOwner)).To(BeEmpty())
+	})
+})
+
+var _ = Describe("buildNodeVolumesAndMounts EmptyDir rendering (#283)", func() {
+	r := &GarageNodeReconciler{}
+	cluster := &garagev1beta2.GarageCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "ephem", Namespace: testNamespace},
+		Spec:       garagev1beta2.GarageClusterSpec{Storage: &garagev1beta2.StorageSpec{Replicas: 1}},
+	}
+
+	volByName := func(vols []corev1.Volume, name string) *corev1.Volume {
+		for i := range vols {
+			if vols[i].Name == name {
+				return &vols[i]
+			}
+		}
+		return nil
+	}
+
+	It("renders EmptyDir volumes for a sizeless ephemeral node, and every mount resolves to a volume", func() {
+		node := &garagev1beta1.GarageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "ephem-storage-0", Namespace: testNamespace},
+			Spec: garagev1beta1.GarageNodeSpec{
+				ClusterRef: garagev1beta1.ClusterReference{Name: cluster.Name},
+				Storage: &garagev1beta1.NodeStorageConfig{
+					Metadata: &garagev1beta1.NodeVolumeConfig{Type: garagev1beta1.VolumeTypeEmptyDir},
+					Data:     &garagev1beta1.NodeVolumeConfig{Type: garagev1beta1.VolumeTypeEmptyDir},
+				},
+			},
+		}
+		vols, mounts := r.buildNodeVolumesAndMounts(node, cluster)
+
+		meta := volByName(vols, metadataVolName)
+		Expect(meta).NotTo(BeNil())
+		Expect(meta.EmptyDir).NotTo(BeNil(), "metadata must be an EmptyDir, not a PVC")
+		Expect(meta.EmptyDir.SizeLimit).To(BeNil())
+
+		data := volByName(vols, dataVolName)
+		Expect(data).NotTo(BeNil())
+		Expect(data.EmptyDir).NotTo(BeNil(), "data must be an EmptyDir, not a PVC")
+
+		// The bug: a mount with no backing volume makes the STS invalid. Assert
+		// every mount name resolves to a defined volume.
+		for _, m := range mounts {
+			Expect(volByName(vols, m.Name)).NotTo(BeNil(), "mount %q has no backing volume", m.Name)
+		}
+
+		// And no PVC templates are generated for an all-EmptyDir node.
+		Expect(r.buildNodeVolumeClaimTemplates(node, cluster)).To(BeEmpty())
+	})
+
+	It("sets EmptyDir sizeLimit from the volume size (ephemeral-limited shape)", func() {
+		node := &garagev1beta1.GarageNode{
+			ObjectMeta: metav1.ObjectMeta{Name: "ephem-storage-0", Namespace: testNamespace},
+			Spec: garagev1beta1.GarageNodeSpec{
+				ClusterRef: garagev1beta1.ClusterReference{Name: cluster.Name},
+				Storage: &garagev1beta1.NodeStorageConfig{
+					Metadata: &garagev1beta1.NodeVolumeConfig{Type: garagev1beta1.VolumeTypeEmptyDir, Size: ptrQuantity(resource.MustParse("1Gi"))},
+					Data:     &garagev1beta1.NodeVolumeConfig{Type: garagev1beta1.VolumeTypeEmptyDir, Size: ptrQuantity(resource.MustParse("10Gi"))},
+				},
+			},
+		}
+		vols, _ := r.buildNodeVolumesAndMounts(node, cluster)
+
+		meta := volByName(vols, metadataVolName)
+		Expect(meta.EmptyDir).NotTo(BeNil())
+		Expect(meta.EmptyDir.SizeLimit).NotTo(BeNil())
+		Expect(meta.EmptyDir.SizeLimit.Cmp(resource.MustParse("1Gi"))).To(Equal(0))
+
+		data := volByName(vols, dataVolName)
+		Expect(data.EmptyDir).NotTo(BeNil())
+		Expect(data.EmptyDir.SizeLimit).NotTo(BeNil())
+		Expect(data.EmptyDir.SizeLimit.Cmp(resource.MustParse("10Gi"))).To(Equal(0))
+
+		// Still no PVC templates — a sized EmptyDir is a tmpfs sizeLimit, not a PVC.
+		Expect(r.buildNodeVolumeClaimTemplates(node, cluster)).To(BeEmpty())
 	})
 })

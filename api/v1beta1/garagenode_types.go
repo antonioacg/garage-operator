@@ -17,9 +17,11 @@ limitations under the License.
 package v1beta1
 
 import (
+	v1beta2 "github.com/rajsinghtech/garage-operator/api/v1beta2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 // NodeNetworkConfig configures per-node RPC address overrides.
@@ -31,6 +33,8 @@ type NodeNetworkConfig struct {
 	// Overrides the cluster-level network.rpcPublicAddr for this specific node.
 	// When publicEndpoint is also set to LoadBalancer and this is empty, the operator
 	// derives rpc_public_addr from the assigned LoadBalancer ingress IP automatically.
+	// On a node-local-pool-backed node it is published only in the replicated layout
+	// tags; the shared DaemonSet ConfigMap cannot carry per-node settings.
 	// +optional
 	RPCPublicAddr string `json:"rpcPublicAddr,omitempty"`
 }
@@ -98,15 +102,20 @@ type NodeLoggingConfig struct {
 
 // NodeVolumeConfig defines the source of a storage volume for a GarageNode.
 // Parallel to GarageCluster's VolumeConfig, extended with existingClaim for
-// pre-provisioned PVCs. Either ExistingClaim or Size must be specified.
+// pre-provisioned PVCs. A volume must name an ExistingClaim, request a Size,
+// or explicitly use EmptyDir; ReadOnly alone is not a Kubernetes volume source.
 //
 // ExistingClaim and Size may also be set together inside a multi-HDD
 // `storage.dataPaths[]` entry — there ExistingClaim binds the PVC and Size
 // is the capacity advertised to Garage in `data_dir = [{path, capacity}]`.
 // Combining them on `storage.{metadata,data}` is allowed by the webhook but
 // has no effect since those slots don't emit a TOML capacity field.
+// +kubebuilder:validation:XValidation:rule="!has(self.volumeAttributesClassName) || !has(self.type) || self.type != 'EmptyDir'",message="volumeAttributesClassName is only valid for PersistentVolumeClaim volumes"
+// +kubebuilder:validation:XValidation:rule="!has(self.volumeAttributesClassName) || !has(self.existingClaim) || size(self.existingClaim) == 0",message="volumeAttributesClassName cannot be combined with existingClaim: the referenced claim is user-managed"
 type NodeVolumeConfig struct {
 	// ExistingClaim references a pre-existing PVC by name in the cluster namespace.
+	// GarageNode cycle automation never reuses or infers a replacement from this
+	// claim; create a distinct replacement GarageNode and drain this identity.
 	// +optional
 	ExistingClaim string `json:"existingClaim,omitempty"`
 
@@ -121,6 +130,22 @@ type NodeVolumeConfig struct {
 	// +optional
 	StorageClassName *string `json:"storageClassName,omitempty"`
 
+	// VolumeAttributesClassName is the name of a cluster-scoped Kubernetes
+	// VolumeAttributesClass applied to every PVC generated for this volume role.
+	// The class's driver must match the StorageClass provisioner; the operator
+	// does not check that or whether the class exists. Valid only for
+	// PersistentVolumeClaim volumes. Unlike storageClassName it may be changed
+	// while replicas are live: the operator updates bound claims in place, which
+	// asks the CSI driver to modify the volume. Requires Kubernetes 1.34+ (or
+	// 1.31-1.33 with the VolumeAttributesClass feature enabled) and a driver that
+	// supports ModifyVolume. Removing a configured value from a live volume is
+	// rejected.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	// +optional
+	VolumeAttributesClassName *string `json:"volumeAttributesClassName,omitempty"`
+
 	// Type specifies the volume type. Defaults to PersistentVolumeClaim.
 	// Use EmptyDir for ephemeral storage (e.g. testing).
 	// +optional
@@ -130,6 +155,28 @@ type NodeVolumeConfig struct {
 	// Defaults to [ReadWriteOnce] if not specified.
 	// +optional
 	AccessModes []corev1.PersistentVolumeAccessMode `json:"accessModes,omitempty"`
+
+	// Selector matches pre-provisioned PersistentVolumes for a newly created
+	// claim. Kubernetes does not dynamically provision a PV when this is set;
+	// StorageClassName must also match the target PV. It is immutable for a live
+	// GarageNode because changing an already bound claim cannot move the durable
+	// node_key or block data safely.
+	// +optional
+	Selector *metav1.LabelSelector `json:"selector,omitempty"`
+
+	// Labels to set on dynamically provisioned PVCs.
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
+
+	// Annotations to set on dynamically provisioned PVCs.
+	// +optional
+	Annotations map[string]string `json:"annotations,omitempty"`
+
+	// DataSourceRef is the opt-in restore source for this node's newly created PVC.
+	// Auto-generated nodes inherit the parent volume's source. Manual nodes may set
+	// it on a new claim; it cannot be combined with existingClaim.
+	// +optional
+	DataSourceRef *corev1.TypedObjectReference `json:"dataSourceRef,omitempty"`
 
 	// Path is the in-container mount path for this volume. Only honored on
 	// multi-HDD `storage.dataPaths[]` entries — both the K8s volumeMount and
@@ -144,16 +191,30 @@ type NodeVolumeConfig struct {
 
 	// ReadOnly marks the entry as a legacy read-only path on multi-HDD
 	// `storage.dataPaths[]`. Renders as garage.toml `read_only = true`;
-	// no `capacity` is emitted. Ignored on `storage.{metadata,data}`.
+	// no `capacity` is emitted. New use on `storage.{metadata,data}` is rejected;
+	// unchanged released objects are tolerated only for cleanup and migration.
 	// +optional
 	ReadOnly bool `json:"readOnly,omitempty"`
 }
 
+// NodeBacking selects the workload that backs a GarageNode's pod.
+type NodeBacking string
+
+const (
+	// NodeBackingStatefulSet is the default: the GarageNode owns a
+	// single-replica StatefulSet.
+	NodeBackingStatefulSet NodeBacking = "StatefulSet"
+	// NodeBackingNodeLocalPool marks the GarageNode as backed by a cluster-owned
+	// node-local-pool workload on a specific Kubernetes node.
+	NodeBackingNodeLocalPool NodeBacking = "NodeLocalPool"
+)
+
 // GarageNodeSpec defines the desired state of GarageNode.
 //
-// GarageNode is only used when the parent GarageCluster has layoutPolicy: Manual.
-// In Manual mode, the cluster StatefulSet is not created — instead, each GarageNode
-// creates its own single-replica StatefulSet with independent storage configuration.
+// A GarageNode represents one durable Garage process identity and layout role.
+// In Manual mode users create GarageNodes directly. Auto-mode default storage,
+// unified gateways, and named node-local pools also use operator-owned GarageNodes
+// internally so every identity follows the same layout and drain lifecycle.
 //
 // Use Manual layout when you need:
 //   - Heterogeneous storage (different size or storage class per node)
@@ -161,21 +222,25 @@ type NodeVolumeConfig struct {
 //   - Fine-grained zone assignment within a cluster
 //   - External nodes (VMs, bare metal, or nodes in another K8s cluster)
 //
-// For uniform clusters, prefer layoutPolicy: Auto — the operator handles everything
-// without creating GarageNode resources.
+// For a uniform default PVC group, prefer layoutPolicy: Auto — the operator creates
+// and manages the GarageNode resources.
 //
 // Pod configuration fields are inherited from the parent GarageCluster and can be
 // overridden per-node. Fields not specified here fall through to the cluster default.
 //
 // +kubebuilder:validation:XValidation:rule="self.gateway || has(self.external) || has(self.capacity)",message="capacity is required for non-gateway managed nodes"
+// +kubebuilder:validation:XValidation:rule="!has(self.initContainers) || !has(self.extraContainers) || !self.initContainers.exists(i, self.extraContainers.exists(e, e.name == i.name))",message="initContainers and extraContainers names must be unique across both lists"
 type GarageNodeSpec struct {
 	// ClusterRef references the GarageCluster this node belongs to.
 	// The GarageNode inherits configuration from this cluster.
 	// +required
 	ClusterRef ClusterReference `json:"clusterRef"`
 
-	// NodeID is the public key of the Garage node.
-	// If not specified, the operator will auto-discover from the pod.
+	// NodeID is the public key of the Garage node. For an external node it is
+	// authoritative because there is no managed Pod. For a managed node it is
+	// only an expected identity pin: before any layout or status mutation the
+	// operator directly queries the exact owned Pod and requires equality. If
+	// omitted, the operator discovers the identity from that Pod.
 	// +kubebuilder:validation:Pattern=`^[a-fA-F0-9]{64}$`
 	// +optional
 	NodeID string `json:"nodeId,omitempty"`
@@ -185,13 +250,28 @@ type GarageNodeSpec struct {
 	// +required
 	Zone string `json:"zone"`
 
+	// ZoneFrom derives the layout zone from a label on the Kubernetes Node this
+	// node's pod is scheduled to, instead of using the static Zone above. Zone
+	// stays required and is the fallback before the pod is scheduled or when the
+	// readable Node does not carry the label. If the operator cannot read the
+	// required Kubernetes Node, reconciliation fails closed; it does not silently
+	// substitute Zone. Cluster-scoped installation is required.
+	//
+	// The resolved value is reported as status.zone.
+	//
+	// Not valid on external nodes — there is no pod, so there is no Kubernetes
+	// Node to read a label from.
+	// +optional
+	ZoneFrom *ZoneSource `json:"zoneFrom,omitempty"`
+
 	// Capacity is the storage capacity to report to Garage for this node.
 	// Required unless Gateway is true.
 	// +optional
 	Capacity *resource.Quantity `json:"capacity,omitempty"`
 
 	// Gateway marks this node as a gateway-only node (no storage).
-	// Gateway nodes handle API requests but don't store data blocks.
+	// Gateway nodes handle API requests but don't store data blocks. Immutable:
+	// delete and drain the old identity before changing its storage tier.
 	// +optional
 	Gateway bool `json:"gateway"`
 
@@ -203,6 +283,30 @@ type GarageNodeSpec struct {
 	// When set, no StatefulSet is created - the node is assumed to exist externally.
 	// +optional
 	External *ExternalNodeConfig `json:"external,omitempty"`
+
+	// Backing selects the workload that backs this node's pod.
+	// StatefulSet (default when empty): this GarageNode owns a single-replica
+	// StatefulSet. NodeLocalPool: the pod comes from a cluster-owned node-local workload
+	// in spec.storage.nodeLocalPools — no StatefulSet, ConfigMap, or Service is
+	// created by this GarageNode; it only manages the Garage layout role for the
+	// Kubernetes Node and membership set named below. Immutable after creation.
+	// +kubebuilder:validation:Enum=StatefulSet;NodeLocalPool
+	// +optional
+	Backing NodeBacking `json:"backing,omitempty"`
+
+	// KubernetesNodeName is the name of the Kubernetes node this GarageNode
+	// represents. Required when backing is NodeLocalPool: node_id discovery
+	// selects the managed node-local-pool Pod scheduled on this Kubernetes node.
+	// Immutable for node-local-pool-backed GarageNodes.
+	// +optional
+	KubernetesNodeName string `json:"kubernetesNodeName,omitempty"`
+
+	// NodeLocalPoolName is the name of the parent GarageCluster's
+	// spec.storage.nodeLocalPools entry that owns this node. Required and
+	// immutable when backing is NodeLocalPool; omitted for StatefulSet-backed and
+	// external GarageNodes.
+	// +optional
+	NodeLocalPoolName string `json:"nodeLocalPoolName,omitempty"`
 
 	// Storage configures storage volumes for this node's StatefulSet.
 	// Required for managed nodes (not External).
@@ -252,6 +356,35 @@ type GarageNodeSpec struct {
 	// Merged with labels from GarageCluster (node-specific takes precedence).
 	// +optional
 	PodLabels map[string]string `json:"podLabels,omitempty"`
+
+	// InitContainers run before the Garage container, after any operator-injected
+	// init containers. Entries with restartPolicy: Always are native sidecars
+	// (Kubernetes 1.29+ beta, GA in 1.33). Names garage, purge-cluster-layout and
+	// the prefix garage-operator- are reserved.
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:XValidation:rule="self.all(c, c.name != 'garage' && c.name != 'purge-cluster-layout' && !c.name.startsWith('garage-operator-'))",message="container name is operator-reserved"
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	InitContainers []v1beta2.PodExtraContainer `json:"initContainers,omitempty"`
+
+	// ExtraContainers run beside the Garage container in the same pod and network
+	// namespace. They cannot mount operator-owned volumes.
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:XValidation:rule="self.all(c, c.name != 'garage' && c.name != 'purge-cluster-layout' && !c.name.startsWith('garage-operator-'))",message="container name is operator-reserved"
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	ExtraContainers []v1beta2.PodExtraContainer `json:"extraContainers,omitempty"`
+
+	// ExtraVolumes are added to the pod. Operator-owned volume names are reserved
+	// (config, metadata, data, data-<N>, rpc-secret, admin-token, metrics-token).
+	// +kubebuilder:validation:MaxItems=32
+	// +kubebuilder:validation:XValidation:rule="self.all(v, !(v.name in ['config','metadata','data','rpc-secret','admin-token','metrics-token']) && !v.name.matches('^data-[0-9]+$'))",message="volume name is operator-reserved"
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	ExtraVolumes []v1beta2.PodExtraVolume `json:"extraVolumes,omitempty"`
 
 	// PriorityClassName overrides the priority class for this node's pod.
 	// If not specified, inherits from GarageCluster.
@@ -307,12 +440,16 @@ type GarageNodeSpec struct {
 
 	// Env overrides environment variables for this node's container. Merged with
 	// cluster-level env (from spec.storage.env or spec.gateway.env, depending on
-	// tier); per-node entries take precedence on key collision.
+	// tier); per-node entries take precedence on ordinary key collisions.
+	// Garage config-path and RPC/Admin/metrics credential variables are
+	// operator-reserved because drain safety and mesh identity rely on the
+	// rendered config and pinned immutable Secrets.
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
 	// EnvFrom overrides envFrom sources for this node's container. Replaces (does
-	// not merge) the cluster-level envFrom when set.
+	// not merge) the cluster-level envFrom when set. A source prefix must not be
+	// capable of injecting an operator-reserved Garage variable.
 	// +optional
 	EnvFrom []corev1.EnvFromSource `json:"envFrom,omitempty"`
 
@@ -347,7 +484,9 @@ type ExternalNodeConfig struct {
 	// +kubebuilder:default=3901
 	Port int32 `json:"port,omitempty"`
 
-	// RemoteClusterRef references a GarageCluster in another namespace/cluster
+	// RemoteClusterRef is retained for API compatibility but is not supported.
+	// Setting it is rejected because the operator has no remote-cluster client
+	// integration for GarageNode reconciliation.
 	// +optional
 	RemoteClusterRef *ClusterReference `json:"remoteClusterRef,omitempty"`
 }
@@ -357,6 +496,12 @@ type GarageNodeStatus struct {
 	// NodeID is the discovered or assigned node ID
 	// +optional
 	NodeID string `json:"nodeId,omitempty"`
+
+	// Zone is the layout zone actually assigned to this node. Equal to
+	// spec.zone unless spec.zoneFrom resolved a different value from the
+	// Kubernetes Node the pod is scheduled to.
+	// +optional
+	Zone string `json:"zone,omitempty"`
 
 	// Phase represents the current phase
 	// +kubebuilder:validation:Enum=Pending;Creating;Running;Ready;Degraded;Updating;Deleting;Failed;Unknown
@@ -391,6 +536,16 @@ type GarageNodeStatus struct {
 	// +optional
 	Tags []string `json:"tags,omitempty"`
 
+	// ManagedPVCs records convention-named PVC reservations made by this
+	// controller. A pending entry contains only a one-way nonce commitment; a
+	// bound entry contains the exact server-assigned UID. Names and public
+	// annotations are not ownership proof. Legacy claims are pinned here once
+	// while their exact live StatefulSet and Pod still prove continuity.
+	// +optional
+	// +listType=map
+	// +listMapKey=name
+	ManagedPVCs []ManagedNodePVCStatus `json:"managedPVCs,omitempty"`
+
 	// DataPartition contains disk space info for the data partition
 	// Note: Garage reports a single partition even with multiple data paths
 	// +optional
@@ -404,11 +559,13 @@ type GarageNodeStatus struct {
 	// +optional
 	Version string `json:"version,omitempty"`
 
-	// DBEngine is the database engine used by this node (lmdb, sqlite, fjall)
+	// DBEngine is retained for API compatibility but is not currently populated;
+	// Garage's node-status API does not report the active database engine.
 	// +optional
 	DBEngine string `json:"dbEngine,omitempty"`
 
-	// GarageFeatures lists the enabled Cargo features on this node
+	// GarageFeatures is retained for API compatibility but is not currently
+	// populated because Garage's node-status API does not report build features.
 	// +optional
 	GarageFeatures []string `json:"garageFeatures,omitempty"`
 
@@ -416,29 +573,48 @@ type GarageNodeStatus struct {
 	// +optional
 	Partitions int `json:"partitions,omitempty"`
 
-	// StoredData is the amount of data stored on this node
+	// StoredData is retained for API compatibility but is not currently populated;
+	// Garage reports assigned partitions and disk free space, not per-node stored bytes.
 	// +optional
 	StoredData *resource.Quantity `json:"storedData,omitempty"`
 
-	// RepairInProgress indicates if a repair operation is running
+	// RepairInProgress is retained for API compatibility but is not currently
+	// populated because Garage's Admin API exposes no per-node repair status.
 	// +optional
 	RepairInProgress bool `json:"repairInProgress"`
 
-	// RepairType is the type of repair operation in progress
+	// RepairType is retained for API compatibility but is not currently populated.
 	// +optional
 	RepairType string `json:"repairType,omitempty"`
 
-	// RepairProgress is a human-readable repair progress description
+	// RepairProgress is retained for API compatibility but is not currently populated.
 	// +optional
 	RepairProgress string `json:"repairProgress,omitempty"`
 
-	// BlockErrors is the count of blocks with sync errors on this node
+	// BlockErrors is retained for API compatibility but is not currently populated;
+	// Garage's node-status API does not expose a per-node block error count.
 	// +optional
 	BlockErrors int32 `json:"blockErrors,omitempty"`
 
 	// ObservedGeneration is the last observed generation
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// ObservedPodUID is the UID of the workload pod whose Garage identity was
+	// directly observed. The operator persists it with the first authenticated
+	// NodeID and refreshes it with status so a replacement pod cannot inherit
+	// stale identity, connectivity, or layout evidence from its predecessor.
+	// +optional
+	ObservedPodUID string `json:"observedPodUid,omitempty"`
+
+	// ParentDeletionRequestGeneration is a controller-owned handoff from the
+	// GarageCluster reconciler. A non-zero value means that parent generation
+	// still intends to delete this GarageNode after reversible drain preparation.
+	// Binding the request to the parent generation makes a spec change cancel the
+	// request before any role is removed. A user-set drain annotation never sets
+	// this field and therefore remains prepare-only.
+	// +optional
+	ParentDeletionRequestGeneration int64 `json:"parentDeletionRequestGeneration,omitempty"`
 
 	// ClusterAdminEndpoint is the resolved Garage Admin API endpoint last used
 	// to manage this node's layout entry. Captured on each successful reconcile
@@ -470,8 +646,9 @@ type GarageNodeStatus struct {
 	// +optional
 	CycleSiblingName string `json:"cycleSiblingName,omitempty"`
 
-	// CycleSiblingNodeID is the discovered Garage node ID of the cycle sibling,
-	// used to check its layout sync tracker before this node is removed.
+	// CycleSiblingNodeID is the exact discovered Garage node ID of the cycle
+	// sibling. It binds later promotion to the identity that was admitted into the
+	// settled layout and the source's durable drain destination proof.
 	// +optional
 	CycleSiblingNodeID string `json:"cycleSiblingNodeId,omitempty"`
 
@@ -480,6 +657,29 @@ type GarageNodeStatus struct {
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// ManagedNodePVCStatus is the controller-owned identity reservation for one
+// convention-named GarageNode PVC.
+// +kubebuilder:validation:XValidation:rule="has(self.uid) != has(self.pendingReservationHash)",message="exactly one of uid and pendingReservationHash must be set"
+type ManagedNodePVCStatus struct {
+	// Name is the exact PersistentVolumeClaim name.
+	Name string `json:"name"`
+
+	// UID is the immutable API-server identity observed when the claim was
+	// created or safely migrated.
+	// Exactly one of UID and PendingReservationHash is set.
+	// +optional
+	UID types.UID `json:"uid,omitempty"`
+
+	// PendingReservationHash is a SHA-256 commitment to a cryptographically
+	// random nonce stamped on a PVC before its UID can be observed. It closes
+	// the create/status-update crash window without making the public status
+	// value sufficient to forge a controller reservation.
+	// Exactly one of UID and PendingReservationHash is set.
+	// +kubebuilder:validation:Pattern=`^[a-f0-9]{64}$`
+	// +optional
+	PendingReservationHash string `json:"pendingReservationHash,omitempty"`
 }
 
 // DiskPartitionStatus contains disk space information for a partition
@@ -502,7 +702,9 @@ type DiskPartitionStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:shortName=gn
 // +kubebuilder:printcolumn:name="Cluster",type="string",JSONPath=".spec.clusterRef.name"
-// +kubebuilder:printcolumn:name="Zone",type="string",JSONPath=".spec.zone"
+// Zone reports status.zone (the effective zone) rather than spec.zone so the
+// column stays truthful when spec.zoneFrom derives it from a Node label.
+// +kubebuilder:printcolumn:name="Zone",type="string",JSONPath=".status.zone"
 // +kubebuilder:printcolumn:name="Capacity",type="string",JSONPath=".spec.capacity"
 // +kubebuilder:printcolumn:name="Gateway",type="boolean",JSONPath=".spec.gateway"
 // +kubebuilder:printcolumn:name="Connected",type="boolean",JSONPath=".status.connected"

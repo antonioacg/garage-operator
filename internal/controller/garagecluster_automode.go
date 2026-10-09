@@ -20,12 +20,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -77,7 +79,7 @@ func parseAutoModeOrdinal(nodeName, clusterName string) (int32, bool) {
 // clusterOwnsAutoModePerNodeService reports whether the cluster controller
 // owns the per-pod RPC LoadBalancer Service for this node (in which case the
 // GarageNode controller must not create a duplicate). True when the GarageNode
-// CR carries the operator-managed label AND was named via autoModeGarageNodeName
+// CR carries the operator-managed label AND occupies an Auto storage ordinal
 // AND has publicEndpoint configured as LoadBalancer (the only shape for which
 // reconcilePerNodeLoadBalancerServices creates `<cluster>-<ord>-rpc`).
 func clusterOwnsAutoModePerNodeService(node *garagev1beta1.GarageNode) bool {
@@ -87,10 +89,13 @@ func clusterOwnsAutoModePerNodeService(node *garagev1beta1.GarageNode) bool {
 	if node.Spec.PublicEndpoint.Type != publicEndpointTypeLoadBalancer {
 		return false
 	}
+	if node.Spec.PublicEndpoint.LoadBalancer == nil || !node.Spec.PublicEndpoint.LoadBalancer.PerNode {
+		return false
+	}
 	if node.Labels[labelAppManagedBy] != managedByOperatorValue {
 		return false
 	}
-	if _, ok := parseAutoModeOrdinal(node.Name, node.Spec.ClusterRef.Name); !ok {
+	if _, ok := parseAutoModeOrdinal(autoNodeSlotForCycle(node), node.Spec.ClusterRef.Name); !ok {
 		return false
 	}
 	return true
@@ -103,11 +108,11 @@ func clusterOwnsAutoModePerNodeService(node *garagev1beta1.GarageNode) bool {
 // `<node>-rpc` name.
 func effectiveNodeRPCServiceName(node *garagev1beta1.GarageNode, cluster *garagev1beta2.GarageCluster) string {
 	if clusterOwnsAutoModePerNodeService(node) {
-		if ord, ok := parseAutoModeOrdinal(node.Name, cluster.Name); ok {
+		if ord, ok := parseAutoModeOrdinal(autoNodeSlotForCycle(node), cluster.Name); ok {
 			return perNodeRPCServiceName(cluster.Name, ord)
 		}
 	}
-	return node.Name + "-rpc"
+	return boundedDNS1123LabelName(node.Name + "-rpc")
 }
 
 // reconcileAutoModeStorageNodes generates and reconciles one GarageNode CR per
@@ -119,11 +124,13 @@ func effectiveNodeRPCServiceName(node *garagev1beta1.GarageNode, cluster *garage
 //
 //   - Creates missing GarageNodes for ordinals 0..replicas-1
 //   - Updates existing GarageNodes when zone, capacity, tags, or storage drifts
-//   - Deletes GarageNodes for ordinals >= replicas (scale-down)
+//   - Drains GarageNodes for ordinals >= replicas one at a time (scale-down)
 //
 // Deletion of a GarageNode triggers its own finalizer, which handles layout
-// removal and waits appropriately. We simply call Delete() and let the
-// finalizer do its work.
+// removal and waits appropriately. Before calling Delete(), this reconciler
+// verifies that no storage-node finalizer or Garage layout transition is
+// already active. This serializes scale-down with additive node-local-pool
+// drains and prevents overlapping partition moves.
 func (r *GarageClusterReconciler) reconcileAutoModeStorageNodes(ctx context.Context, cluster *garagev1beta2.GarageCluster) error {
 	log := logf.FromContext(ctx)
 
@@ -138,8 +145,19 @@ func (r *GarageClusterReconciler) reconcileAutoModeStorageNodes(ctx context.Cont
 	if err != nil {
 		return fmt.Errorf("listing operator-owned storage GarageNodes: %w", err)
 	}
+	if adopted, err := r.ensureAutoModeCycleOwnership(ctx, cluster, existing, tierStorage); err != nil {
+		return err
+	} else if adopted {
+		return nil
+	}
 
+	type pendingUpdate struct {
+		current *garagev1beta1.GarageNode
+		desired *garagev1beta1.GarageNode
+	}
 	desiredByName := make(map[string]bool, desiredReplicas)
+	var toCreate []*garagev1beta1.GarageNode
+	var toUpdate []pendingUpdate
 	for i := int32(0); i < desiredReplicas; i++ {
 		desiredByName[autoModeGarageNodeName(cluster.Name, i)] = true
 
@@ -148,27 +166,40 @@ func (r *GarageClusterReconciler) reconcileAutoModeStorageNodes(ctx context.Cont
 			return fmt.Errorf("building desired GarageNode for ordinal %d: %w", i, err)
 		}
 
-		// Graceful node cycle (#231): a cycle for this ordinal provisions a
-		// sibling named "<ordinal>-cycle" which is promoted to an operator-managed
-		// node once the original is drained and deleted. In the brief window after
-		// the original "<cluster>-storage-N" is deleted, the promoted sibling holds
-		// the ordinal's layout slot. Treat the ordinal as satisfied so we don't
-		// recreate a fresh "<cluster>-storage-N" (which would re-replicate from
-		// scratch and undo the cycle). Keep the promoted sibling in the keep-set.
-		siblingName := desired.Name + cycleSiblingSuffix
-		if sib, ok := existing[siblingName]; ok && !isCycleSibling(sib) {
-			desiredByName[siblingName] = true
-			continue
+		// A completed cycle may leave one or more historical -cycle suffixes after
+		// repeated replacements. Keep deleting ancestors out of the parent scale
+		// loop and let the sole live promoted descendant satisfy this ordinal.
+		descendantNames, current, err := resolveAutoModeCycleSlotForCluster(existing, desired.Name, cluster, tierStorage)
+		if err != nil {
+			return fmt.Errorf("resolving promoted storage cycle for ordinal %d: %w", i, err)
 		}
-
-		current, found := existing[desired.Name]
-		if !found {
-			log.Info("Creating Auto-mode GarageNode", "name", desired.Name)
-			if err := r.Create(ctx, desired); err != nil && !errors.IsAlreadyExists(err) {
-				return fmt.Errorf("creating GarageNode %s: %w", desired.Name, err)
+		for _, name := range descendantNames {
+			desiredByName[name] = true
+		}
+		if current != nil {
+			repaired, labelErr := r.repairAutoModeNodeLabels(ctx, cluster, current,
+				expectedAutoModeNodeLabels(cluster, tierStorage, desired.Name))
+			if labelErr != nil {
+				return fmt.Errorf("repairing Auto storage GarageNode %s labels: %w", current.Name, labelErr)
 			}
-			// On AlreadyExists (stale informer cache or pre-existing user-created
-			// GarageNode), the next reconcile's list+diff loop will handle drift.
+			if repaired {
+				// Keep metadata repair separate from a spec/layout transition. The next
+				// reconcile consumes the fresh labels before doing other work.
+				return nil
+			}
+			changed, handoffErr := r.reconcileCurrentAutoModePVCHandoffs(ctx, cluster, current, desired.Name)
+			if handoffErr != nil {
+				return fmt.Errorf("reconciling retained PVC handoff for storage ordinal %d: %w", i, handoffErr)
+			}
+			if changed {
+				return nil
+			}
+		}
+		if current == nil {
+			if nameErr := validateManagedGarageNodeName(desired); nameErr != nil {
+				return fmt.Errorf("refusing to create Auto storage GarageNode ordinal %d: %w", i, nameErr)
+			}
+			toCreate = append(toCreate, desired)
 			continue
 		}
 
@@ -176,57 +207,78 @@ func (r *GarageClusterReconciler) reconcileAutoModeStorageNodes(ctx context.Cont
 		// about; the rest (resources, scheduling) are inherited at reconcile
 		// time from the cluster and aren't worth diffing here.
 		if autoModeStorageNodeNeedsUpdate(current, desired) {
-			log.Info("Updating Auto-mode GarageNode (drift detected)", "name", desired.Name)
-			current.Spec.Zone = desired.Spec.Zone
-			current.Spec.Capacity = desired.Spec.Capacity
-			current.Spec.Tags = desired.Spec.Tags
-			current.Spec.Env = desired.Spec.Env
-			current.Spec.EnvFrom = desired.Spec.EnvFrom
-			// PublicEndpoint propagates from the cluster spec; treat as
-			// authoritative (the operator owns this field on auto-mode nodes).
-			current.Spec.PublicEndpoint = desired.Spec.PublicEndpoint
-			// We intentionally do not overwrite Storage.{Metadata,Data}.ExistingClaim
-			// when it's already set — that's used by migration to bind the new
-			// GarageNode to legacy PVCs, and overwriting would re-create from
-			// scratch and lose the data.
-			if current.Spec.Storage == nil {
-				current.Spec.Storage = desired.Spec.Storage
-			} else if desired.Spec.Storage != nil {
-				// Update sizes/storage class but preserve existingClaim values.
-				if current.Spec.Storage.Metadata == nil {
-					current.Spec.Storage.Metadata = desired.Spec.Storage.Metadata
-				} else if current.Spec.Storage.Metadata.ExistingClaim == "" && desired.Spec.Storage.Metadata != nil {
-					current.Spec.Storage.Metadata.Size = desired.Spec.Storage.Metadata.Size
-					current.Spec.Storage.Metadata.StorageClassName = desired.Spec.Storage.Metadata.StorageClassName
-				}
-				// Single-HDD data drift.
-				if desired.Spec.Storage.Data != nil {
-					if current.Spec.Storage.Data == nil {
-						current.Spec.Storage.Data = desired.Spec.Storage.Data
-					} else if current.Spec.Storage.Data.ExistingClaim == "" {
-						current.Spec.Storage.Data.Size = desired.Spec.Storage.Data.Size
-						current.Spec.Storage.Data.StorageClassName = desired.Spec.Storage.Data.StorageClassName
-					}
-				}
-				// Multi-HDD: replace DataPaths only when current entries are not
-				// pinned to existingClaim (which is set by migration).
-				if len(desired.Spec.Storage.DataPaths) > 0 {
-					pinned := false
-					for _, p := range current.Spec.Storage.DataPaths {
-						if p.ExistingClaim != "" {
-							pinned = true
-							break
-						}
-					}
-					if !pinned {
-						current.Spec.Storage.DataPaths = desired.Spec.Storage.DataPaths
-					}
-				}
+			if nameErr := validateManagedGarageNodeName(desired); nameErr != nil {
+				return fmt.Errorf("refusing to roll Auto storage GarageNode ordinal %d: %w", i, nameErr)
 			}
-			if err := r.Update(ctx, current); err != nil {
-				return fmt.Errorf("updating GarageNode %s: %w", current.Name, err)
+			toUpdate = append(toUpdate, pendingUpdate{current: current, desired: desired})
+		}
+	}
+
+	// Additions and role-affecting updates are one topology batch. Do not issue
+	// it while any earlier storage, gateway, or remote-originated layout version
+	// is still active. The very first batch is allowed before an Admin API
+	// exists; its newly created GarageNodes become the barrier for every later
+	// tier in this reconciliation.
+	if len(toCreate) > 0 || len(toUpdate) > 0 {
+		ready, storageBootstrap, waitingMessage, barrierErr := r.clusterLayoutReadyForMutation(ctx, cluster, true)
+		if barrierErr != nil {
+			waitingMessage = "refusing to start an Auto-mode storage addition/update until Garage layout convergence can be verified: " + barrierErr.Error()
+		}
+		if barrierErr != nil || !ready {
+			if err := r.setScaleDownBlockedCondition(ctx, cluster, metav1.ConditionFalse,
+				garagev1beta1.ReasonScaleDownSafe, "no storage scale-down is in progress"); err != nil {
+				return err
+			}
+			return r.setStorageTopologyReadyCondition(ctx, cluster, metav1.ConditionFalse,
+				garagev1beta1.ReasonStorageTopologyWaitingForLayoutSync, waitingMessage)
+		}
+		if !storageBootstrap {
+			if len(toCreate) > 0 {
+				toCreate = toCreate[:1]
+				toUpdate = nil
+			} else {
+				toUpdate = toUpdate[:1]
 			}
 		}
+
+		changedNames := make([]string, 0, len(toCreate)+len(toUpdate))
+		for _, desired := range toCreate {
+			hasHandoff, handoffErr := r.reserveAutoModeReplacement(ctx, cluster, desired)
+			if handoffErr != nil {
+				return fmt.Errorf("reserving retained PVC handoff for storage GarageNode %s: %w", desired.Name, handoffErr)
+			}
+			log.Info("Creating Auto-mode GarageNode (serialized topology batch)", "name", desired.Name)
+			if err := r.Create(ctx, desired); err != nil && !errors.IsAlreadyExists(err) {
+				return fmt.Errorf("creating GarageNode %s: %w", desired.Name, err)
+			}
+			if hasHandoff {
+				if desired.UID == "" {
+					return fmt.Errorf("creating storage GarageNode %s returned an empty UID for retained PVC handoff", desired.Name)
+				}
+				if err := r.bindAutoModeReplacement(ctx, cluster, desired, desired.Name); err != nil {
+					return fmt.Errorf("binding retained PVC handoff to storage GarageNode %s: %w", desired.Name, err)
+				}
+			}
+			// On AlreadyExists (stale informer cache or pre-existing user-created
+			// GarageNode), the next reconcile's list+diff loop handles drift.
+			changedNames = append(changedNames, desired.Name)
+		}
+		for _, update := range toUpdate {
+			log.Info("Updating Auto-mode GarageNode (serialized topology batch)", "name", update.current.Name)
+			applyAutoModeStorageNodeUpdate(update.current, update.desired)
+			if err := r.Update(ctx, update.current); err != nil {
+				return fmt.Errorf("updating GarageNode %s: %w", update.current.Name, err)
+			}
+			changedNames = append(changedNames, update.current.Name)
+		}
+		sort.Strings(changedNames)
+		if err := r.setScaleDownBlockedCondition(ctx, cluster, metav1.ConditionFalse,
+			garagev1beta1.ReasonScaleDownSafe, "no storage scale-down is in progress"); err != nil {
+			return err
+		}
+		return r.setStorageTopologyReadyCondition(ctx, cluster, metav1.ConditionFalse,
+			garagev1beta1.ReasonStorageTopologyAdding,
+			"waiting for Auto-mode storage GarageNode changes to enter a settled Garage layout: "+strings.Join(changedNames, ", "))
 	}
 
 	// Collect operator-owned GarageNodes that fall outside the desired range.
@@ -237,19 +289,30 @@ func (r *GarageClusterReconciler) reconcileAutoModeStorageNodes(ctx context.Cont
 		}
 		toDelete = append(toDelete, n)
 	}
+	sort.Slice(toDelete, func(i, j int) bool {
+		left, leftOK := parseAutoModeOrdinal(autoNodeSlotForCycle(toDelete[i]), cluster.Name)
+		right, rightOK := parseAutoModeOrdinal(autoNodeSlotForCycle(toDelete[j]), cluster.Name)
+		if leftOK && rightOK && left != right {
+			// Retire the highest ordinal first, matching StatefulSet scale-down
+			// semantics and keeping the lowest stable identities.
+			return left > right
+		}
+		return toDelete[i].Name > toDelete[j].Name
+	})
 
 	// Refuse a scale-down that would drop the cluster below its replication
 	// factor. The per-node finalizer cannot remove a layout role once fewer
 	// roled nodes than the factor remain (Garage returns IsReplicationConstraint
-	// and the finalizer logs+returns nil), so deleting the CRs here would orphan
-	// the layout roles permanently. Keep the excess nodes and surface the block
-	// on a condition; the keep-set creates/updates above already ran.
+	// and the finalizer retains the CR for retry), so keep the excess nodes and
+	// surface the block before starting needless deletion. The keep-set
+	// creates/updates above already ran.
 	// The proactive guard applies only to a standalone (non-federated) cluster:
 	// in a federation the replication factor is satisfied across ALL regions'
 	// storage nodes, so a count of this region's nodes alone is not authoritative
 	// and would wrongly wedge a legitimate local scale-down. Federated clusters
 	// rely on the per-node finalizer's IsReplicationConstraint backstop, which
-	// refuses a layout-role removal that would actually drop below the factor.
+	// retains the CR and retries a layout-role removal that would actually drop
+	// below the factor.
 	if len(toDelete) > 0 && len(cluster.Spec.RemoteClusters) == 0 {
 		factor := replicationFactorOf(cluster)
 		surviving := countLiveStorageNodes(existing, desiredByName)
@@ -261,23 +324,77 @@ func (r *GarageClusterReconciler) reconcileAutoModeStorageNodes(ctx context.Cont
 			if err := r.setScaleDownBlockedCondition(ctx, cluster, metav1.ConditionTrue, garagev1beta1.ReasonScaleDownWouldBreakQuorum, msg); err != nil {
 				return err
 			}
+			return r.setStorageTopologyReadyCondition(ctx, cluster, metav1.ConditionFalse,
+				garagev1beta1.ReasonScaleDownWouldBreakQuorum, msg)
+		}
+	}
+
+	if len(toDelete) > 0 {
+		candidate := toDelete[0]
+		ready, _, waitingMessage, err := r.clusterLayoutReadyForMutation(ctx, cluster, false, candidate.Name)
+		if err != nil {
+			waitingMessage = "refusing to start an Auto-mode storage drain until Garage layout convergence can be verified: " + err.Error()
+		}
+		if err != nil || !ready {
+			if statusErr := r.setScaleDownBlockedCondition(ctx, cluster, metav1.ConditionFalse,
+				garagev1beta1.ReasonScaleDownSafe, "storage scale-down is waiting, not safety-blocked"); statusErr != nil {
+				return statusErr
+			}
+			return r.setStorageTopologyReadyCondition(ctx, cluster, metav1.ConditionFalse,
+				garagev1beta1.ReasonStorageTopologyWaitingForLayoutSync, waitingMessage)
+		}
+		if err := r.prepareGarageNodeDeletionDrain(ctx, cluster, candidate); err != nil {
+			if statusErr := r.setScaleDownBlockedCondition(ctx, cluster, metav1.ConditionFalse,
+				garagev1beta1.ReasonScaleDownSafe, "storage scale-down is waiting for reversible drain preflight"); statusErr != nil {
+				return statusErr
+			}
+			if statusErr := r.setStorageTopologyReadyCondition(ctx, cluster, metav1.ConditionFalse,
+				garagev1beta1.ReasonStorageTopologyWaitingForLayoutSync,
+				"refusing to mark GarageNode terminating until storage-drain preflight succeeds: "+err.Error()); statusErr != nil {
+				return statusErr
+			}
+			// Keep reconciling so the generic OnDelete rollout can converge a newly
+			// requested consistent configuration before this reversible preflight is
+			// retried.
 			return nil
 		}
-	}
 
-	for _, n := range toDelete {
-		log.Info("Deleting Auto-mode GarageNode (scale-down)", "name", n.Name)
-		if err := r.Delete(ctx, n); err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("deleting GarageNode %s: %w", n.Name, err)
+		log.Info("Deleting one Auto-mode GarageNode (serialized scale-down)", "name", candidate.Name)
+		if err := r.prepareRetainedAutoModePVCHandoffs(ctx, cluster, candidate); err != nil {
+			return fmt.Errorf("preparing retained PVC handoff for storage GarageNode %s: %w", candidate.Name, err)
 		}
+		if err := r.Delete(ctx, candidate); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("deleting GarageNode %s: %w", candidate.Name, err)
+		}
+		if err := r.setScaleDownBlockedCondition(ctx, cluster, metav1.ConditionFalse,
+			garagev1beta1.ReasonScaleDownSafe, "storage scale-down is progressing safely"); err != nil {
+			return err
+		}
+		return r.setStorageTopologyReadyCondition(ctx, cluster, metav1.ConditionFalse,
+			garagev1beta1.ReasonStorageTopologyDraining,
+			fmt.Sprintf("draining Auto-mode storage GarageNode %s; the next ordinal remains online until this Garage layout transition finishes", candidate.Name))
 	}
 
-	// Scale-down (if any) is now safe; clear any prior block signal.
+	// Desired object membership is converged. It is not safe to report topology
+	// readiness until every desired GarageNode has completed reconciliation and
+	// Garage has retired every older layout version.
 	if err := r.setScaleDownBlockedCondition(ctx, cluster, metav1.ConditionFalse, garagev1beta1.ReasonScaleDownSafe, "storage scale-down within replication factor"); err != nil {
 		return err
 	}
-
-	return nil
+	if desiredReplicas == 0 && len(existing) == 0 {
+		return r.clearStorageTopologyReadyCondition(ctx, cluster)
+	}
+	ready, _, waitingMessage, barrierErr := r.clusterLayoutReadyForMutation(ctx, cluster, false)
+	if barrierErr != nil {
+		waitingMessage = "Auto-mode storage membership exists, but Garage layout convergence cannot be verified: " + barrierErr.Error()
+	}
+	if barrierErr != nil || !ready {
+		return r.setStorageTopologyReadyCondition(ctx, cluster, metav1.ConditionFalse,
+			garagev1beta1.ReasonStorageTopologyWaitingForLayoutSync, waitingMessage)
+	}
+	return r.setStorageTopologyReadyCondition(ctx, cluster, metav1.ConditionTrue,
+		garagev1beta1.ReasonStorageTopologyConverged,
+		"Auto-mode storage GarageNodes match the desired membership and Garage reports no active data migration")
 }
 
 // countLiveStorageNodes counts operator-owned storage GarageNodes that would
@@ -327,26 +444,49 @@ func (r *GarageClusterReconciler) setScaleDownBlockedCondition(ctx context.Conte
 	return UpdateStatusWithRetry(ctx, r.Client, cluster, apply)
 }
 
+func (r *GarageClusterReconciler) setStorageTopologyReadyCondition(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+	status metav1.ConditionStatus,
+	reason, message string,
+) error {
+	apply := func() {
+		meta.SetStatusCondition(&cluster.Status.Conditions, metav1.Condition{
+			Type:               garagev1beta1.ConditionStorageTopologyReady,
+			Status:             status,
+			Reason:             reason,
+			Message:            message,
+			ObservedGeneration: cluster.Generation,
+		})
+	}
+	apply()
+	return UpdateStatusWithRetry(ctx, r.Client, cluster, apply)
+}
+
+func (r *GarageClusterReconciler) clearStorageTopologyReadyCondition(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+) error {
+	if meta.FindStatusCondition(cluster.Status.Conditions, garagev1beta1.ConditionStorageTopologyReady) == nil {
+		return nil
+	}
+	apply := func() {
+		meta.RemoveStatusCondition(&cluster.Status.Conditions, garagev1beta1.ConditionStorageTopologyReady)
+	}
+	apply()
+	return UpdateStatusWithRetry(ctx, r.Client, cluster, apply)
+}
+
 // listAutoModeStorageNodes returns operator-owned GarageNodes for the storage
-// tier of this cluster, keyed by name.
+// tier of this cluster, keyed by name. It discovers exact-owned nodes even when
+// one of the mutable generated labels has drifted; unowned label-selected
+// objects remain present so the cycle ownership fence can reject them.
 func (r *GarageClusterReconciler) listAutoModeStorageNodes(ctx context.Context, cluster *garagev1beta2.GarageCluster) (map[string]*garagev1beta1.GarageNode, error) {
-	nodeList := &garagev1beta1.GarageNodeList{}
-	if err := r.List(ctx, nodeList,
-		client.InNamespace(cluster.Namespace),
-		client.MatchingLabels(map[string]string{
-			labelCluster:      cluster.Name,
-			labelTier:         tierStorage,
-			labelAppManagedBy: managedByOperatorValue,
-		}),
-	); err != nil {
-		return nil, err
+	canonicalNames := make([]string, 0, cluster.StorageReplicas())
+	for ordinal := int32(0); ordinal < cluster.StorageReplicas(); ordinal++ {
+		canonicalNames = append(canonicalNames, autoModeGarageNodeName(cluster.Name, ordinal))
 	}
-	out := make(map[string]*garagev1beta1.GarageNode, len(nodeList.Items))
-	for i := range nodeList.Items {
-		n := &nodeList.Items[i]
-		out[n.Name] = n
-	}
-	return out, nil
+	return r.listAutoModeNodes(ctx, cluster, tierStorage, canonicalNames)
 }
 
 // buildAutoModeStorageNode constructs the desired GarageNode for a given ordinal.
@@ -389,6 +529,15 @@ func (r *GarageClusterReconciler) buildAutoModeStorageNode(
 		zone = defaultZoneName
 	}
 
+	// spec.zoneFrom (#294) is carried down to the node so the per-node
+	// controller can resolve it once its pod is scheduled — the zone is a
+	// property of where the pod landed, which nothing knows at generation time.
+	// Deliberately storage-only: see buildAutoModeGatewayNode.
+	var zoneFrom *garagev1beta1.ZoneSource
+	if cluster.Spec.ZoneFrom != nil {
+		zoneFrom = &garagev1beta1.ZoneSource{NodeLabel: cluster.Spec.ZoneFrom.NodeLabel}
+	}
+
 	// Pod name for tag-based identification matches the legacy STS pod name
 	// (<name>-<ordinal>) so existing layout-tag tooling continues to work.
 	podName := fmt.Sprintf("%s-%d", name, 0)
@@ -409,7 +558,24 @@ func (r *GarageClusterReconciler) buildAutoModeStorageNode(
 			storage.Metadata.Size = &s
 		}
 		storage.Metadata.StorageClassName = cluster.Spec.Storage.Metadata.StorageClassName
+		storage.Metadata.VolumeAttributesClassName = cloneStringPtr(cluster.Spec.Storage.Metadata.VolumeAttributesClassName)
 		storage.Metadata.AccessModes = cluster.Spec.Storage.Metadata.AccessModes
+		if cluster.Spec.Storage.Metadata.Selector != nil {
+			storage.Metadata.Selector = cluster.Spec.Storage.Metadata.Selector.DeepCopy()
+		}
+		storage.Metadata.Labels = maps.Clone(cluster.Spec.Storage.Metadata.Labels)
+		storage.Metadata.Annotations = maps.Clone(cluster.Spec.Storage.Metadata.Annotations)
+		if cluster.Spec.Storage.Metadata.DataSourceRef != nil {
+			storage.Metadata.DataSourceRef = cluster.Spec.Storage.Metadata.DataSourceRef.DeepCopy()
+		}
+		// Propagate the volume type so `storage.metadata.type: EmptyDir` reaches
+		// the per-node GarageNode (#283). Without this the node controller sees a
+		// bare `{}` metadata volume and either produces an invalid StatefulSet
+		// (no size → no PVC template, no EmptyDir, but the pod still mounts `meta`)
+		// or silently provisions a PVC (size set). Mirrors the multi-path branch.
+		if cluster.Spec.Storage.Metadata.Type != "" {
+			storage.Metadata.Type = garagev1beta1.VolumeType(cluster.Spec.Storage.Metadata.Type)
+		}
 	}
 
 	// Data volume(s):
@@ -475,10 +641,33 @@ func (r *GarageClusterReconciler) buildAutoModeStorageNode(
 				} else {
 					v.StorageClassName = topLevel.StorageClassName
 				}
+				// Like dataSourceRef, a class is per volume role: it is never
+				// inherited from the top-level data volume.
+				if p.Volume != nil {
+					v.VolumeAttributesClassName = cloneStringPtr(p.Volume.VolumeAttributesClassName)
+				}
 				if p.Volume != nil && len(p.Volume.AccessModes) > 0 {
 					v.AccessModes = p.Volume.AccessModes
 				} else {
 					v.AccessModes = topLevel.AccessModes
+				}
+				if p.Volume != nil && p.Volume.Selector != nil {
+					v.Selector = p.Volume.Selector.DeepCopy()
+				} else if topLevel.Selector != nil {
+					v.Selector = topLevel.Selector.DeepCopy()
+				}
+				if p.Volume != nil && len(p.Volume.Labels) > 0 {
+					v.Labels = maps.Clone(p.Volume.Labels)
+				} else {
+					v.Labels = maps.Clone(topLevel.Labels)
+				}
+				if p.Volume != nil && len(p.Volume.Annotations) > 0 {
+					v.Annotations = maps.Clone(p.Volume.Annotations)
+				} else {
+					v.Annotations = maps.Clone(topLevel.Annotations)
+				}
+				if p.Volume != nil && p.Volume.DataSourceRef != nil {
+					v.DataSourceRef = p.Volume.DataSourceRef.DeepCopy()
 				}
 				// Propagate Volume.Type so cluster-level `type: EmptyDir` on a
 				// per-disk volume reaches the GarageNode unchanged (audit #4).
@@ -495,7 +684,23 @@ func (r *GarageClusterReconciler) buildAutoModeStorageNode(
 				storage.Data.Size = &s
 			}
 			storage.Data.StorageClassName = cluster.Spec.Storage.Data.StorageClassName
+			storage.Data.VolumeAttributesClassName = cloneStringPtr(cluster.Spec.Storage.Data.VolumeAttributesClassName)
 			storage.Data.AccessModes = cluster.Spec.Storage.Data.AccessModes
+			if cluster.Spec.Storage.Data.Selector != nil {
+				storage.Data.Selector = cluster.Spec.Storage.Data.Selector.DeepCopy()
+			}
+			storage.Data.Labels = maps.Clone(cluster.Spec.Storage.Data.Labels)
+			storage.Data.Annotations = maps.Clone(cluster.Spec.Storage.Data.Annotations)
+			if cluster.Spec.Storage.Data.DataSourceRef != nil {
+				storage.Data.DataSourceRef = cluster.Spec.Storage.Data.DataSourceRef.DeepCopy()
+			}
+			// Propagate the volume type so `storage.data.type: EmptyDir` reaches
+			// the per-node GarageNode (#283) — same rationale as the metadata
+			// block above and the multi-path branch. On EmptyDir any `size` is
+			// carried through as the EmptyDir sizeLimit by the node controller.
+			if cluster.Spec.Storage.Data.Type != "" {
+				storage.Data.Type = garagev1beta1.VolumeType(cluster.Spec.Storage.Data.Type)
+			}
 		}
 	}
 
@@ -507,6 +712,7 @@ func (r *GarageClusterReconciler) buildAutoModeStorageNode(
 				labelCluster:      cluster.Name,
 				labelTier:         tierStorage,
 				labelAppManagedBy: managedByOperatorValue,
+				labelAutoNodeSlot: name,
 			},
 		},
 		Spec: garagev1beta1.GarageNodeSpec{
@@ -515,6 +721,7 @@ func (r *GarageClusterReconciler) buildAutoModeStorageNode(
 			},
 			NodeID:   nodeID,
 			Zone:     zone,
+			ZoneFrom: zoneFrom,
 			Capacity: cap,
 			Tags:     tags,
 			Storage:  storage,
@@ -678,10 +885,71 @@ func envFromSourcesEqual(a, b []corev1.EnvFromSource) bool {
 	return true
 }
 
+// zoneSourcesEqual compares two optional ZoneSources.
+func zoneSourcesEqual(a, b *garagev1beta1.ZoneSource) bool {
+	if (a == nil) != (b == nil) {
+		return false
+	}
+	return a == nil || a.NodeLabel == b.NodeLabel
+}
+
+// applyAutoModeStorageNodeUpdate copies the fields owned by the default
+// Auto-mode pool while preserving migration-pinned existingClaim references.
+func applyAutoModeStorageNodeUpdate(current, desired *garagev1beta1.GarageNode) {
+	current.Spec.Zone = desired.Spec.Zone
+	current.Spec.ZoneFrom = desired.Spec.ZoneFrom
+	current.Spec.Capacity = desired.Spec.Capacity
+	current.Spec.Tags = desired.Spec.Tags
+	current.Spec.Env = desired.Spec.Env
+	current.Spec.EnvFrom = desired.Spec.EnvFrom
+	current.Spec.PublicEndpoint = desired.Spec.PublicEndpoint
+	current.Spec.Network = desired.Spec.Network.DeepCopy()
+
+	if current.Spec.Storage == nil {
+		current.Spec.Storage = desired.Spec.Storage
+		return
+	}
+	if desired.Spec.Storage == nil {
+		return
+	}
+
+	if current.Spec.Storage.Metadata == nil {
+		current.Spec.Storage.Metadata = desired.Spec.Storage.Metadata
+	} else if current.Spec.Storage.Metadata.ExistingClaim == "" && desired.Spec.Storage.Metadata != nil {
+		current.Spec.Storage.Metadata.Size = desired.Spec.Storage.Metadata.Size
+		current.Spec.Storage.Metadata.StorageClassName = desired.Spec.Storage.Metadata.StorageClassName
+		// volumeAttributesClassName is the one PVC attribute the cluster may
+		// change on a live child: the GarageNode controller patches the bound
+		// claim in place.
+		current.Spec.Storage.Metadata.VolumeAttributesClassName = cloneStringPtr(desired.Spec.Storage.Metadata.VolumeAttributesClassName)
+	}
+	if desired.Spec.Storage.Data != nil {
+		if current.Spec.Storage.Data == nil {
+			current.Spec.Storage.Data = desired.Spec.Storage.Data
+		} else if current.Spec.Storage.Data.ExistingClaim == "" {
+			current.Spec.Storage.Data.Size = desired.Spec.Storage.Data.Size
+			current.Spec.Storage.Data.StorageClassName = desired.Spec.Storage.Data.StorageClassName
+			current.Spec.Storage.Data.VolumeAttributesClassName = cloneStringPtr(desired.Spec.Storage.Data.VolumeAttributesClassName)
+		}
+	}
+	if len(desired.Spec.Storage.DataPaths) == 0 {
+		return
+	}
+	for _, path := range current.Spec.Storage.DataPaths {
+		if path.ExistingClaim != "" {
+			return
+		}
+	}
+	current.Spec.Storage.DataPaths = desired.Spec.Storage.DataPaths
+}
+
 // autoModeStorageNodeNeedsUpdate returns true when the desired GarageNode spec
 // differs from the current one on a field the operator owns.
 func autoModeStorageNodeNeedsUpdate(current, desired *garagev1beta1.GarageNode) bool {
 	if current.Spec.Zone != desired.Spec.Zone {
+		return true
+	}
+	if !zoneSourcesEqual(current.Spec.ZoneFrom, desired.Spec.ZoneFrom) {
 		return true
 	}
 	// Per-ordinal rpc_public_addr drift (spec.storage.rpcPublicAddr changes).
@@ -721,12 +989,18 @@ func autoModeStorageNodeNeedsUpdate(current, desired *garagev1beta1.GarageNode) 
 			if cm.Size != nil && dm.Size != nil && cm.Size.Cmp(*dm.Size) != 0 {
 				return true
 			}
+			if !equality.Semantic.DeepEqual(cm.VolumeAttributesClassName, dm.VolumeAttributesClassName) {
+				return true
+			}
 		}
 		if cd, dd := current.Spec.Storage.Data, desired.Spec.Storage.Data; cd != nil && dd != nil && cd.ExistingClaim == "" && dd.ExistingClaim == "" {
 			if (cd.Size == nil) != (dd.Size == nil) {
 				return true
 			}
 			if cd.Size != nil && dd.Size != nil && cd.Size.Cmp(*dd.Size) != 0 {
+				return true
+			}
+			if !equality.Semantic.DeepEqual(cd.VolumeAttributesClassName, dd.VolumeAttributesClassName) {
 				return true
 			}
 		}
@@ -746,6 +1020,9 @@ func autoModeStorageNodeNeedsUpdate(current, desired *garagev1beta1.GarageNode) 
 					if cdp[i].Size != nil && ddp[i].Size != nil && cdp[i].Size.Cmp(*ddp[i].Size) != 0 {
 						return true
 					}
+					if !equality.Semantic.DeepEqual(cdp[i].VolumeAttributesClassName, ddp[i].VolumeAttributesClassName) {
+						return true
+					}
 				}
 			}
 		}
@@ -761,13 +1038,61 @@ func (r *GarageClusterReconciler) deleteAutoModeStorageNodes(ctx context.Context
 	if err != nil {
 		return err
 	}
-	for name, n := range existing {
-		log.Info("Deleting Auto-mode GarageNode (storage tier removed)", "name", name)
-		if err := r.Delete(ctx, n); err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("deleting GarageNode %s: %w", name, err)
+	if len(existing) == 0 {
+		if err := r.setScaleDownBlockedCondition(ctx, cluster, metav1.ConditionFalse,
+			garagev1beta1.ReasonScaleDownSafe, "removed Auto-mode storage membership is fully drained"); err != nil {
+			return err
 		}
+		return r.clearStorageTopologyReadyCondition(ctx, cluster)
 	}
-	return nil
+
+	candidates := make([]*garagev1beta1.GarageNode, 0, len(existing))
+	for _, node := range existing {
+		candidates = append(candidates, node)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		left, leftOK := parseAutoModeOrdinal(autoNodeSlotForCycle(candidates[i]), cluster.Name)
+		right, rightOK := parseAutoModeOrdinal(autoNodeSlotForCycle(candidates[j]), cluster.Name)
+		if leftOK && rightOK && left != right {
+			return left > right
+		}
+		return candidates[i].Name > candidates[j].Name
+	})
+
+	ready, _, waitingMessage, barrierErr := r.clusterLayoutReadyForMutation(ctx, cluster, false, candidates[0].Name)
+	if barrierErr != nil {
+		waitingMessage = "refusing to drain the removed Auto-mode storage tier until Garage layout convergence can be verified: " + barrierErr.Error()
+	}
+	if barrierErr != nil || !ready {
+		if err := r.setScaleDownBlockedCondition(ctx, cluster, metav1.ConditionFalse,
+			garagev1beta1.ReasonScaleDownSafe, "removed storage tier drain is waiting, not safety-blocked"); err != nil {
+			return err
+		}
+		return r.setStorageTopologyReadyCondition(ctx, cluster, metav1.ConditionFalse,
+			garagev1beta1.ReasonStorageTopologyWaitingForLayoutSync, waitingMessage)
+	}
+
+	candidate := candidates[0]
+	if err := r.prepareGarageNodeDeletionDrain(ctx, cluster, candidate); err != nil {
+		if statusErr := r.setScaleDownBlockedCondition(ctx, cluster, metav1.ConditionFalse,
+			garagev1beta1.ReasonScaleDownSafe, "removed storage tier drain is waiting for reversible preparation"); statusErr != nil {
+			return statusErr
+		}
+		return r.setStorageTopologyReadyCondition(ctx, cluster, metav1.ConditionFalse,
+			garagev1beta1.ReasonStorageTopologyWaitingForLayoutSync,
+			"refusing to mark removed-tier GarageNode terminating until storage-drain preparation succeeds: "+err.Error())
+	}
+	log.Info("Deleting one Auto-mode GarageNode (storage tier removed)", "name", candidate.Name)
+	if err := r.Delete(ctx, candidate); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("deleting GarageNode %s: %w", candidate.Name, err)
+	}
+	if err := r.setScaleDownBlockedCondition(ctx, cluster, metav1.ConditionFalse,
+		garagev1beta1.ReasonScaleDownSafe, "removed storage tier drain is progressing safely"); err != nil {
+		return err
+	}
+	return r.setStorageTopologyReadyCondition(ctx, cluster, metav1.ConditionFalse,
+		garagev1beta1.ReasonStorageTopologyDraining,
+		fmt.Sprintf("draining removed Auto-mode storage GarageNode %s before retiring another member", candidate.Name))
 }
 
 // ejectAutoModeStorageNodes removes the operator's controllerOwnerRef from each
@@ -776,31 +1101,61 @@ func (r *GarageClusterReconciler) deleteAutoModeStorageNodes(ctx context.Context
 // GarageNodes are handed over to the user, who manages them directly going
 // forward. The user is then free to delete/modify them at will.
 func (r *GarageClusterReconciler) ejectAutoModeStorageNodes(ctx context.Context, cluster *garagev1beta2.GarageCluster) error {
-	log := logf.FromContext(ctx)
-	existing, err := r.listAutoModeStorageNodes(ctx, cluster)
+	// Pass no canonical names: once a node is ejected it keeps its canonical
+	// name but no longer carries this cluster's controller reference, which the
+	// canonical-name fence in listAutoModeNodes rejects as "occupied". Passing
+	// them would make every pass after a partial or completed ejection fail
+	// before it could finish the remaining nodes (the hand-off then never
+	// completes). Only nodes still owned by or labelled for this cluster are
+	// ejection candidates.
+	existing, err := r.listAutoModeNodes(ctx, cluster, tierStorage, nil)
 	if err != nil {
 		return err
 	}
-	for name, n := range existing {
+	for name := range existing {
+		if err := r.ejectAutoModeNode(ctx, cluster, name); err != nil {
+			return fmt.Errorf("ejecting GarageNode %s: %w", name, err)
+		}
+	}
+	return r.clearStorageTopologyReadyCondition(ctx, cluster)
+}
+
+// ejectAutoModeNode hands one Auto-mode GarageNode over to the user: it drops
+// this cluster's ownerReference and the operator's managed-by label. It re-reads
+// the node and retries on conflict, because the GarageNode controller updates
+// the same object (finalizers, status-adjacent metadata) concurrently and a
+// single stale-resourceVersion Update would otherwise abort the whole hand-off.
+func (r *GarageClusterReconciler) ejectAutoModeNode(ctx context.Context, cluster *garagev1beta2.GarageCluster, name string) error {
+	log := logf.FromContext(ctx)
+	key := types.NamespacedName{Namespace: cluster.Namespace, Name: name}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		n := &garagev1beta1.GarageNode{}
+		if err := r.safetyReader().Get(ctx, key, n); err != nil {
+			if errors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
 		// Strip the controllerOwnerRef pointing at the GarageCluster.
-		newOwners := n.OwnerReferences[:0]
+		newOwners := make([]metav1.OwnerReference, 0, len(n.OwnerReferences))
 		for _, ref := range n.OwnerReferences {
 			if ref.UID == cluster.UID {
 				continue
 			}
 			newOwners = append(newOwners, ref)
 		}
+		// Strip the managed-by label so subsequent listAutoModeNodes calls
+		// don't pick this up again (the user now owns it).
+		_, managed := n.Labels[labelAppManagedBy]
+		if len(newOwners) == len(n.OwnerReferences) && !managed {
+			return nil
+		}
 		n.OwnerReferences = newOwners
-		// Strip the managed-by label so subsequent listAutoModeStorageNodes
-		// calls don't pick this up again (the user now owns it).
 		delete(n.Labels, labelAppManagedBy)
 
 		log.Info("Ejecting Auto-mode GarageNode (Auto→Manual)", "name", name)
-		if err := r.Update(ctx, n); err != nil {
-			return fmt.Errorf("ejecting GarageNode %s: %w", name, err)
-		}
-	}
-	return nil
+		return r.Update(ctx, n)
+	})
 }
 
 // migrateLegacyStorageSTSIfNeeded migrates a pre-#190 cluster-level storage
@@ -932,20 +1287,47 @@ func (r *GarageClusterReconciler) migrateLegacyStorageSTSIfNeeded(ctx context.Co
 	// belt-and-suspenders).
 	nodeIDByOrdinal := r.discoverLegacyNodeIDsByOrdinal(ctx, cluster, replicas)
 
-	for ord := int32(0); ord < replicas; ord++ {
-		metadataPVC := fmt.Sprintf("%s-%s-%d", metadataVolName, cluster.Name, ord)
+	// Whether the legacy STS provisioned each volume via a volumeClaimTemplate.
+	// A pre-v0.6 EmptyDir cluster (#286) has no volumeClaimTemplates, so there
+	// is nothing to adopt — migration for those volumes is "create fresh" and
+	// buildAutoModeStorageNode renders EmptyDir from spec.storage (post-#284).
+	// This is spec-independent: it reflects what the running workload actually
+	// has, so a cluster whose spec drifted still migrates against reality. A
+	// PVC-backed legacy volume is always adopted (preserving data + the
+	// node_key that fixes node identity) regardless of the current spec type.
+	legacyVCTNames := map[string]bool{}
+	for i := range legacySTS.Spec.VolumeClaimTemplates {
+		legacyVCTNames[legacySTS.Spec.VolumeClaimTemplates[i].Name] = true
+	}
+	metadataIsPVC := legacyVCTNames[metadataVolName]
+	dataIsPVC := legacyVCTNames[dataVolName]
 
-		// Verify the metadata PVC exists; abort if not.
-		mPVC := &corev1.PersistentVolumeClaim{}
-		if err := r.Get(ctx, types.NamespacedName{Name: metadataPVC, Namespace: cluster.Namespace}, mPVC); err != nil {
-			msg := fmt.Sprintf("ordinal %d: metadata PVC %q not found: %v", ord, metadataPVC, err)
-			return r.failMigration(ctx, cluster, msg)
+	for ord := int32(0); ord < replicas; ord++ {
+		nodeID := nodeIDByOrdinal[ord]
+
+		// Metadata: adopt the legacy PVC by name only when the legacy STS was
+		// PVC-backed. For EmptyDir metadata there is no PVC and no persisted
+		// node_key, so leave metadataPVC empty (fresh EmptyDir volume) and drop
+		// any discovered node ID — it is stale the moment the fresh pod boots
+		// with a new identity.
+		metadataPVC := ""
+		if metadataIsPVC {
+			metadataPVC = fmt.Sprintf("%s-%s-%d", metadataVolName, cluster.Name, ord)
+			mPVC := &corev1.PersistentVolumeClaim{}
+			if err := r.Get(ctx, types.NamespacedName{Name: metadataPVC, Namespace: cluster.Namespace}, mPVC); err != nil {
+				msg := fmt.Sprintf("ordinal %d: metadata PVC %q not found: %v", ord, metadataPVC, err)
+				return r.failMigration(ctx, cluster, msg)
+			}
+		} else {
+			nodeID = ""
 		}
 
 		// Resolve the data PVCs for this ordinal. Prefer the multi-HDD layout
-		// when present; otherwise fall back to the single-HDD name.
+		// when present; otherwise fall back to the single-HDD name — but only
+		// when the legacy data volume was PVC-backed. EmptyDir data has nothing
+		// to adopt, so leave dataPVCs empty (fresh EmptyDir volume via spec).
 		dataPVCs := dataPVCsByOrdinal[ord]
-		if len(dataPVCs) == 0 {
+		if len(dataPVCs) == 0 && dataIsPVC {
 			single := fmt.Sprintf("%s-%s-%d", dataVolName, cluster.Name, ord)
 			dPVC := &corev1.PersistentVolumeClaim{}
 			if err := r.Get(ctx, types.NamespacedName{Name: single, Namespace: cluster.Namespace}, dPVC); err != nil {
@@ -955,7 +1337,7 @@ func (r *GarageClusterReconciler) migrateLegacyStorageSTSIfNeeded(ctx context.Co
 			dataPVCs = []legacyDataPVC{{name: single, size: pvcRequestedStorage(dPVC)}}
 		}
 
-		desired, err := r.buildAutoModeStorageNode(cluster, ord, nodeIDByOrdinal[ord], metadataPVC, dataPVCs)
+		desired, err := r.buildAutoModeStorageNode(cluster, ord, nodeID, metadataPVC, dataPVCs)
 		if err != nil {
 			return fmt.Errorf("building migrated GarageNode for ordinal %d: %w", ord, err)
 		}
@@ -1173,10 +1555,16 @@ func pvcRequestedStorage(pvc *corev1.PersistentVolumeClaim) *resource.Quantity {
 // pod-name tags to ordinals so the migrated GarageNodes can lock to the same
 // node IDs as the legacy pods. Returns an empty map on any error — the
 // metadata PVC's node_key is the canonical source of identity, so this is
-// strictly belt-and-suspenders.
+// strictly belt-and-suspenders. Federated clusters deliberately skip this
+// heuristic: sites may share namespace, cluster name, and ordinal tags, making
+// a legacy layout-only match ambiguous across Kubernetes clusters.
 func (r *GarageClusterReconciler) discoverLegacyNodeIDsByOrdinal(ctx context.Context, cluster *garagev1beta2.GarageCluster, replicas int32) map[int32]string {
 	out := map[int32]string{}
 	log := logf.FromContext(ctx)
+	if len(cluster.Spec.RemoteClusters) > 0 {
+		log.V(1).Info("Migration: skipping ambiguous layout-based node-ID discovery for federated cluster; identity will be supplied by metadata PVC")
+		return out
+	}
 
 	garageClient, err := GetGarageClient(ctx, r.Client, cluster, r.ClusterDomain)
 	if err != nil {

@@ -1,6 +1,10 @@
 # Garage Kubernetes Operator
 
 > **Agent Notes**: Reference /Users/rajsingh/Documents/GitHub/garage for Garage source code. Update this file with important learnings.
+>
+> Follow [CONTRIBUTING.md](CONTRIBUTING.md) for the public contribution,
+> design, testing, pull request, and release workflow. Tool-specific guidance
+> does not override it.
 
 A Kubernetes operator for [Garage](https://garagehq.deuxfleurs.fr/) - distributed S3-compatible object storage.
 UPSTREAM CODEBASE ../garage
@@ -60,6 +64,19 @@ config/samples/         # Example CRs
 │  └───────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+### Primary watches ignore status-only writes
+
+Neither the GarageCluster nor the GarageNode controller re-enters Reconcile
+on its own `/status` write. GarageCluster's primary watch
+(`garageClusterPrimaryPredicate`) passes generation, label, annotation,
+finalizer and deletionTimestamp changes, plus changes to the cross-controller
+coordination records `status.storageRollout` and `status.storageDrain`
+(ignoring the drain's `queueLength`/`errorCount` counters). Any reconcile path
+that writes status and needs to continue must return an explicit
+`RequeueAfter` (use `time.Nanosecond` for "right away"). As a safety net,
+`Reconcile` turns an empty successful result for a live cluster into
+`RequeueAfter: RequeueAfterError`.
 
 ---
 
@@ -143,10 +160,15 @@ Other CRDs (`GarageBucket`, `GarageKey`, `GarageNode`, `GarageAdminToken`,
 
 A `GarageCluster` describes two optional tiers, both reconciled from the same CR:
 
-- `spec.storage` — long-lived per-node **StatefulSet**s (one per replica), each
-  with metadata + data PVCs. The cluster spec generates N × `GarageNode` CRs
-  (one per pod ordinal), and the GarageNode controller owns each node's 1-replica
-  STS. Pod node identity persists across restarts via the metadata PVC.
+- `spec.storage` — a default group of long-lived per-node **StatefulSet**s
+  (one per replica), each with metadata + data PVCs, plus optional additive
+  `storage.nodeLocalPools`. Each node-local pool is one operator-managed
+  **DaemonSet** with one generated `GarageNode` identity per selected
+  Kubernetes Node. The default group generates N × `GarageNode` CRs (one per
+  pod ordinal), and the GarageNode controller owns each node's 1-replica STS;
+  node-local pool members are hosted by their pool DaemonSet. Persistent
+  metadata preserves a StatefulSet-backed node's Garage identity, while a
+  node-local identity is preserved by its exact HostPath.
 - `spec.gateway` — in a **unified cluster** (storage + gateway in the same CR),
   the gateway tier ALSO runs as N × per-node `GarageNode` CRs
   (`<cr>-gateway-N`, `gateway: true`) — symmetric with storage — each with a
@@ -214,16 +236,48 @@ Implementation:
   Healthy handles requeue at 5m; unreachable at the fast unhealthy interval.
   `finalize` is a no-op for a handle (nothing owned).
 - **Adoption:** `GarageBucket.spec.bucketId` / `GarageKey.spec.importKey` bind to
-  pre-existing state. Creating a brand-new `GarageKey` without `importKey` needs
+  pre-existing state. For `GarageBucket`, adoption is recorded: once the
+  operator resolves a `spec.bucketId` (or creates a bucket), the ID persists in
+  `status.bucketId`, and the spec field may then be removed — the controller
+  keeps reconciling the recorded bucket (#430). The mapping stays immutable:
+  the webhook rejects re-pointing `spec.bucketId` at a different ID once
+  status is recorded, admission and `ensureExclusiveBucketClaim`
+  (garagebucket_controller.go) reject a bucket ID claimed by two
+  `GarageBucket`s of the same GarageCluster (spec-only claimant loses to a
+  recorded claim; two recorded claims fail closed on both sides), and
+  `finalize` refuses to delete a bucket another live `GarageBucket` still
+  manages. A genuine 404 on the tracked ID releases the status claim before
+  falling back to alias lookup; a wiped status with a live alias fails closed
+  via the "already owned by untracked Garage bucket" error rather than
+  duplicating. Creating a brand-new `GarageKey` without `importKey` needs
   deterministic key material, which derives from an RPC secret the handle does
   not auto-create — set `spec.network.rpcSecretRef` to the external cluster's RPC
   secret, or use `importKey`. The key controller surfaces this as an actionable
   error. A key's generated Secret derives its S3 endpoint from the
-  `connectTo.adminApiEndpoint` host (not a nonexistent managed Service).
+  `connectTo.adminApiEndpoint` host (not a nonexistent managed Service) via
+  `ResolveS3Endpoint` (`internal/controller/helpers.go`), which every consumer
+  shares — parse `status.endpoints.s3` through it rather than `fmt.Sprintf`
+  against it, since the managed writer emits a bare `host:port` and the handle
+  writer a full URL.
 - **Stage 2 (not implemented):** having the operator adopt the external
   StatefulSet + PVCs in place and retire Helm. Blocked on PVC-name mismatch
   (operator `metadata`/`data` vs chart `meta-*`/`data-*`) and the per-node
   GarageNode architecture; needs a dedicated design.
+- **e2e (#295):** two `Label("management-handle")` blocks in
+  `test/e2e/e2e_test.go`, both in the `api` shard.
+  *"Management Handle Cluster"* covers `connectTo.clusterRef` against an
+  operator-managed stand-in. *"Management Handle (externally-managed Garage)"*
+  covers the adoption shape people actually use: `connectTo.adminApiEndpoint` +
+  `adminTokenSecretRef` against a raw StatefulSet the operator did not create.
+  It pins the three one-line conditions a refactor can silently reintroduce
+  (endpoint resolved from `connectTo` not the managed Service FQDN; webhook
+  accepts `connectTo` standalone; bucket/key don't gate on pod-readiness phase)
+  plus the "owns no workload" contract in both directions — nothing is
+  provisioned, and deleting the CRs leaves the external StatefulSet running.
+  The external Garage is a plain manifest, not `helm install` of the upstream
+  chart: that chart lives on git.deuxfleurs.fr and reaching a non-standard
+  forge from CI buys flakes for no extra coverage — all that matters is the
+  absence of an operator ownerReference.
 
 ### Workload differences
 
@@ -331,24 +385,30 @@ to per-node GarageNodes:
 3. Orphan-deletes the legacy STS (`PropagationPolicy: Orphan`). The new
    per-node STSes take ownership of the RWO PVCs as the old pods terminate.
 
-Status surfaced at `status.migration`:
+Progress is surfaced on the `status.conditions` entry whose type is
+`LegacySTSMigrated`:
 
 ```yaml
 status:
-  migration:
-    phase: Completed   # NotStarted | InProgress | Completed | Failed | Skipped
-    migratedOrdinals: [0, 1, 2]
-    startedAt: 2026-05-24T16:00:00Z
-    completedAt: 2026-05-24T16:00:12Z
-    message: "migrated 3 ordinals from legacy StatefulSet to per-node GarageNodes"
+  conditions:
+    - type: LegacySTSMigrated
+      status: "True"
+      reason: Completed
+      message: migrated 3 ordinals from legacy StatefulSet to per-node GarageNodes
 ```
+
+`reason: Completed` means the migration finished or no legacy StatefulSet was
+present. While it is being driven, the condition is `status: "False"` with
+`reason: InProgress`; an error is `status: "False"` with `reason: Failed`.
+There is no `status.migration` object and no `Skipped` reason.
 
 **Multi-HDD clusters auto-migrate to per-node `GarageNode`s with
 `spec.storage.dataPaths[]` populated** (one entry per legacy
 `data-<idx>-<cluster>-<ord>` PVC, index-ordered). `buildAutoModeStorageNode`
 emits `DataPaths` when the bucketed PVC list has more than one entry, and
 `bucketLegacyDataPVCs` discovers the multi-HDD layout. End-state and
-observability are identical to single-HDD migrations (`phase: Completed`).
+observability are identical to single-HDD migrations
+(`LegacySTSMigrated=True, reason=Completed`).
 
 Each migrated multi-HDD `DataPaths[i]` carries:
 
@@ -390,8 +450,9 @@ migration can adopt each metadata + data PVC by name) or delete the
 leftover PVCs to abandon the data.
 
 Implementation: `migrateLegacyStorageSTSIfNeeded` in
-`internal/controller/garagecluster_automode.go`. Idempotent and resumable via
-`status.migration.migratedOrdinals`.
+`internal/controller/garagecluster_automode.go`. The operation is idempotent:
+existing generated `GarageNode`s are left in place, missing ones are created,
+and a completed `LegacySTSMigrated` condition short-circuits future runs.
 
 ---
 
@@ -401,7 +462,7 @@ Implementation: `migrateLegacyStorageSTSIfNeeded` in
 
 | Category | Options |
 |----------|---------|
-| **Tiers** | `spec.storage` (StatefulSet + PVCs) and/or `spec.gateway` (Deployment + EmptyDir) |
+| **Tiers** | `spec.storage` (optional default PVC group plus node-local pools) and/or `spec.gateway` (persistent-identity gateway workloads by default) |
 | **Replication** | `spec.replication.factor` (1-7), `consistencyMode` (consistent/degraded/dangerous) |
 | **Storage tier** | `spec.storage.{replicas,metadata,data,resources,nodeSelector,tolerations,…}` |
 | **Gateway tier** | `spec.gateway.{replicas,resources,nodeSelector,rpcPublicAddr,…}` |
@@ -424,6 +485,44 @@ Transition rules:
 - `Auto → Manual` is supported (one-way). The operator drops its controllerRef on each child `<cluster>-storage-N` GarageNode; the user inherits them. See "Auto → Manual ejection" above.
 - `Manual → Auto` is **rejected by the validating webhook** (see `api/v1beta2/garagecluster_webhook.go`).
 
+### Per-node zones from Kubernetes topology (#294)
+
+`spec.zoneFrom.nodeLabel` (both API versions, so conversion stays lossless)
+derives each storage node's layout zone from a label on the K8s Node its pod
+landed on. Without it a cluster is exactly one zone, which makes
+`replication.zoneRedundancyMode` inert: upstream computes `Maximum` as
+`min(distinct zones, replication_factor)` (`effective_zone_redundancy`,
+../garage `src/rpc/layout/version.rs`), so one zone ⇒ effective redundancy 1.
+
+- **Resolution lives in the GarageNode controller** (`effectiveNodeZone`), not
+  the cluster controller: the answer depends on `pod.spec.nodeName`, which does
+  not exist at GarageNode-generation time. The cluster copies `zoneFrom` down
+  onto each generated node (`buildAutoModeStorageNode`); Manual-mode users set
+  it on the GarageNode themselves. No `Node` informer — the existing 1-minute
+  requeue picks up label changes, which is far cheaper than a cluster-wide
+  Node watch.
+- **Every failure to resolve falls back to `spec.zone`** (still required): pod
+  unscheduled, label absent, or `nodes` unreadable. That last one is not
+  hypothetical — a namespace-scoped install grants only Roles, so the
+  cluster-scoped `nodes` GET 403s; erroring there would wedge every GarageNode
+  in such an install.
+- **Effective zone is published as `status.zone`**, and the `Zone` printcolumn
+  now reads `.status.zone` instead of `.spec.zone` so `kubectl get gn` shows
+  what is actually in the layout.
+- **Never applied to gateway nodes.** `effective_zone_redundancy` counts zones
+  over *all* roles (a `capacity: nil` gateway still carries one) while
+  `generate_nongateway_zone_ids` only collects zones of nodes with capacity —
+  so gateways scattered across per-node zones inflate the requirement past what
+  storage can satisfy and every apply fails with "The number of zones with
+  non-gateway nodes is smaller than the redundancy parameter". The GarageNode
+  webhook warns if a user sets it on a gateway node anyway.
+- Re-resolving on every reconcile is intentional: a pod that moves failure
+  domain should change the layout. Upstream's `minimize_rebalance_load` keeps
+  the resulting reassignment minimal.
+- RBAC: `core/nodes` `get;list;watch` added to the ClusterRole. The
+  namespace-scoped `Role` cannot carry it (cluster-scoped resource) — hence the
+  fallback above.
+
 ---
 
 ## GarageBucket Features
@@ -431,6 +530,65 @@ Transition rules:
 ### Supported (via Admin API)
 
 Quotas, Website hosting (index/error docs), Global/Local aliases, Key permissions
+
+### Website exposure (Ingress / HTTPRoute)
+
+`spec.websiteExposure` creates an `Ingress` or a Gateway API `HTTPRoute`
+(exactly one of the two) that routes a website-enabled bucket's hostname to
+the cluster's web API Service. Both require `spec.website.enabled: true`
+(enforced by the validating webhook).
+
+- The resource is named `<bucket>-website` and is created **in the bucket's
+  namespace**, so it cannot clash across namespaces and always carries a
+  controller owner reference to the bucket (garbage-collected with it).
+  Ingress backends cannot cross namespaces, so **Ingress exposure is only
+  valid when the bucket and the cluster share a namespace** (webhook +
+  controller). **HTTPRoute** exposure works cross-namespace: the route's
+  backend ref points at the cluster's Service in the cluster's namespace and
+  is gated by a Gateway API `ReferenceGrant` in that namespace (owned by the
+  storage admin) — that is the intended Gateway API model, and it keeps a
+  `GarageReferenceGrant` from silently becoming permission to publish routes
+  (with arbitrary annotations) from the storage namespace.
+- `hostnames` (optional list, no wildcards, no duplicates) are the hosts the
+  exposure routes on. When empty the single canonical hostname
+  `<globalAlias><webApi.rootDomain>` is used. Because Garage falls back to
+  the full Host as the alias (`host_to_bucket(host).unwrap_or(host)`), a host
+  equal to the global alias also resolves; for an **HTTPRoute** a host that is
+  neither canonical nor the bare alias gets a `URLRewrite` filter rewriting
+  the Host header to the canonical host, while an **Ingress** (no rewrite
+  filter) only accepts the canonical host or the bare alias and refuses any
+  other hostname on the condition. A not-yet-recorded alias defers the
+  derived host (`WaitingForAlias`, short requeue).
+- `tlsSecretName` lives under `websiteExposure.ingress` and fills the Ingress
+  `spec.tls` section only (HTTPRoute TLS is on the parent Gateway). Default
+  backend is `<cluster>-gateway` for unified clusters (gateway tier, where
+  S3/Web terminates), else the primary `<cluster>` Service. `websiteExposure
+  .backendRef` (optional) overrides it — e.g. a cross-namespace `ServiceImport`
+  — with the port taken from `getWebPort`.
+- Never fails the bucket: outcome is on the `WebsiteExposed` condition +
+  `status.websiteExposure` (`hostnames` and, for HTTPRoute, per-parent
+  `Accepted`/`ResolvedRefs`/`Ready`). Readiness for HTTPRoute is derived from
+  the route's own `status.parents` (not "object written"), so the operator
+  watches the owned `Ingress`/`HTTPRoute` back to the bucket.
+- HTTPRoute is only created/watched when the operator is started with
+  `--enable-gateway-api` (or `ENABLE_GATEWAY_API`, like cert-manager) AND the
+  Gateway API CRDs are installed (RESTMapper probe, same pattern as
+  `monitoringCRDExists` — no informer when the CRD is absent). Missing →
+  `False/GatewayAPIUnavailable` at the drift requeue. A foreign object
+  squatting the generated name is refused, not mutated.
+- Reconcile runs after `updateStatusFromGarage` and persists its own status
+  changes (that function snapshots the old status for its no-op comparison).
+- Ingress is likewise opt-in (v0.8.1, #460): `--enable-ingress` (or
+  `ENABLE_INGRESS`; chart `ingress.enabled`) gates `Owns(&networkingv1.Ingress{})`,
+  Ingress creation and `deleteWebsiteExposureIngress`. Disabled →
+  `False/IngressDisabled` (no error, drift requeue); the operator then needs
+  no Ingress RBAC and starts no Ingress informer.
+- RBAC markers in `internal/controller/garagebucket_exposure.go`; the
+  `gateway.networking.k8s.io/httproutes` and `networking.k8s.io/ingresses`
+  chart rules are gated on `.Values.gatewayAPI.enabled` / `.Values.ingress.enabled`
+  (`clusterrole.yaml`/`namespace-rbac.yaml`) and the generated `config/rbac/role.yaml` stays the superset source of truth
+  (checked by the rbac chart-sync tests). `sigs.k8s.io/gateway-api` v1 is
+  registered in `cmd/main.go` and the test suites.
 
 ### Supported (via Admin API, operator-managed since v2.3.0)
 
@@ -458,12 +616,12 @@ CORS rules, Website redirectAll/routingRules
 | `garage.rajsingh.info/force-layout-apply` | Force apply staged layout (set to `"true"`) |
 | `garage.rajsingh.info/connect-nodes` | Connect nodes: `"nodeId@addr:port,..."` (one-shot, removed after processing) |
 | `garage.rajsingh.info/trigger-snapshot` | Trigger metadata snapshot on all nodes (set to `"true"`, one-shot) |
-| `garage.rajsingh.info/trigger-repair` | Launch repair on all nodes — values: `Tables`, `Blocks`, `Versions`, `MultipartUploads`, `BlockRefs`, `BlockRc`, `Rebalance`, `Aliases`, `ClearResyncQueue` (one-shot) |
+| `garage.rajsingh.info/trigger-repair` | Launch repair on all nodes — values: `Tables`, `Blocks`, `Versions`, `MultipartUploads`, `BlockRefs`, `BlockRc`, `Rebalance`, `Aliases` (one-shot). Use `retry-block-resync` for resync retries; `ClearResyncQueue` is not available at the supported Garage v2.0 floor. |
 | `garage.rajsingh.info/scrub-command` | Control scrub worker on all nodes — values: `start`, `pause`, `resume`, `cancel` (one-shot) |
 | `garage.rajsingh.info/revert-layout` | Discard staged layout changes (set to `"true"`). Does NOT revert an already-applied layout version. (one-shot) |
 | `garage.rajsingh.info/retry-block-resync` | Clear resync backoff for blocks so they retry immediately. Set to `"true"` for all errored blocks, or comma-separated 64-hex-char hashes for specific blocks. (one-shot) |
 | `garage.rajsingh.info/purge-blocks` | **DESTRUCTIVE** — permanently deletes all S3 objects referencing the given blocks. Set to comma-separated 64-hex-char block hashes. No undo. (one-shot) |
-| `garage.rajsingh.info/retry-migration` | Clear `status.migration` and re-run the legacy-STS → per-GarageNode migration on the next reconcile. Use to recover from `Skipped`/`Failed` (e.g. false-positive multi-HDD detection) without hand-patching status. Set to `"true"`. (one-shot) |
+| `garage.rajsingh.info/retry-migration` | Clear the `LegacySTSMigrated` condition and re-drive the legacy-STS → per-GarageNode migration on the next reconcile. Use after correcting a `Failed` migration (for example, a legacy StatefulSet at `replicas=0` with leftover PVCs); inspect the condition for `Completed`, `InProgress`, or `Failed`. Set to `"true"`; the annotation is consumed once. |
 | `garage.rajsingh.info/purge-cluster-layout` | **DESTRUCTIVE** — coordinated replication-factor migration (#208). Value `factor=N[,force]` (must match `spec.replication.factor`). Deletes the on-disk `cluster_layout` on every storage node and rebuilds the layout at factor N — the ONLY way to change the factor (validated upstream). Drives a resumable state machine on `status.factorMigration` (Validating→ScalingDown→Purging→Verifying→RebuildingLayout→Converging). Auto-mode only; **federation refused**; needs ≥ N storage nodes; **refused when any storage node carries per-node config overrides** (multi-HDD `dataPaths`, fsync, network, publicEndpoint, logging) — those use a `<node>-config` ConfigMap the suspended per-node controller can't refresh with the new factor, so the purged pod would boot at the OLD factor and wedge the cluster (remove the overrides or migrate the factor manually). Triggers full re-replication + brief unavailability. `,force` overrides the `dangerous`/pending-tombstone guards. A **failed or aborted** migration tears down cleanly (strips the purge init container, scales each storage STS back to 1, clears suspension) so the tier self-heals — it never leaves storage scaled-to-zero. The purge init container runs as the storage pod's effective UID (root by default), not a hardcoded UID. Abort with `garage.rajsingh.info/purge-cluster-layout-abort: "true"`. |
 | `garage.rajsingh.info/pause-reconcile` | **Deprecated** — use `spec.maintenance.suspended: true` instead |
 
@@ -525,10 +683,11 @@ On failure, `succeeded: false` and `error` contains the message. The annotation 
 | `FederationConfigured` | False when `spec.remoteClusters` is set but no `rpc_public_addr`/`publicEndpoint` (HelloMessage advertises the unroutable pod IP) | set `spec.network.rpcPublicAddr` or a `publicEndpoint` (also a webhook admission warning) |
 | `PeerUnreachable` | True when a peer has been continuously down (`is_up:false`) beyond ~10m — surfaced in `status.unreachablePeers`. Detection is duration-based via `lastSeenSecsAgo` (the admin API can't read Garage's internal `Abandoned` state). | the operator's periodic `ConnectClusterNodes` nudge is the recovery path (esp. for single-link edge gateways) |
 
-Validation notes: a roleless gateway is **not** a deterministic 403 — S3 auth
-falls back to a quorum `get()` that succeeds in a healthy cluster; the
-`capacity: nil` gateway role is a resilience/latency optimization (local-first
-auth, decoupled from storage availability). `degraded` mode lowers only READ
+Validation notes: on the tested Garage v2.3.0, a roleless gateway has no locally
+replicated key record and S3 authentication returns `403 Forbidden: No such
+key`; that sig-auth path does not fall back to a quorum read. The `capacity:
+nil` gateway role is therefore required for local authentication data, not only
+a latency optimization. `degraded` mode lowers only READ
 quorum; it does **not** unblock stuck metadata (GarageKey/bucket) writes — those
 need a reachable majority of roled nodes (`floor(N/2)+1`), and stale gateway
 entries inflate N only in `consistent` mode (so tombstone cleanup matters for
@@ -540,11 +699,63 @@ admin-write availability).
 
 Uses Admin API **v2** at `internal/garage/client.go`.
 
+### Supported Garage versions (#293)
+
+**Floor is Garage v2.0.0** — every endpoint in `internal/garage/client.go` is
+`/v2/...`, and that surface first shipped in upstream v2.0.0 (`doc/api/garage-admin-v2.json`
+does not exist at v1.3.0). Verified: all 30 endpoints the client calls are
+present in v2.0.0's spec, so v2.0.0 really is the floor and not just a guess.
+
+Fields that need newer than the floor, and what happens below it — Garage's
+`Config` has no `deny_unknown_fields`, so a too-new **config** key is silently
+ignored rather than fatal (`read_config` → `toml::from_str`, ../garage
+`src/util/config.rs`):
+
+| Field | Requires | Introduced in ../garage |
+|---|---|---|
+| `GarageBucket.spec.lifecycleRules` | v2.3.0 | `lifecycleRules` on `UpdateBucketRequestBody` |
+| `database.engine: fjall`, `database.fjallBlockCacheSize` | v2.1.0 | `src/db/fjall_adapter.rs` |
+| `blocks.maxConcurrentReads` | v2.1.0 | `default_block_max_concurrent_reads` |
+| `blocks.maxConcurrentWritesPerRequest` | v2.2.0 | `src/api/s3/put.rs` |
+
+The **admin API** has the same laxity and it bites harder: `UpdateBucketRequestBody`
+is a plain serde struct, so a pre-v2.3.0 node accepts `{"lifecycleRules": …}`,
+drops the unknown field, and returns 200 having changed nothing
+(`UpdateBucketRequest::handle` only acts on `websiteAccess`/`quotas`). The bucket
+controller therefore **verifies the readback** after every lifecycle write
+(`verifyLifecycleApplied` in `garagebucket_lifecycle.go`) and fails with an
+error naming v2.3.0 — otherwise `LifecycleConfigured=True` would be a permanent
+lie and the operator would re-issue the same no-op write forever. Only the write
+path pays the extra read; a converged bucket short-circuits on
+`adminLifecycleEqual`.
+
+CI runs two Garage versions on purpose (this is what backs the "v2.x" range
+claim): the Ginkgo suite on v2.4.0 — also `defaultGarageImage` — and the
+topology suites (`hack/e2e-*.sh`) on v2.2.0. Keep it that way; collapsing to one
+version silently narrows what "supported" means.
+
 ### Key Patterns
 
 - Auth: `Authorization: Bearer <prefix>.<secret>` (prefix is 24 hex chars)
 - Error helpers: `garage.IsNotFound(err)`, `garage.IsConflict(err)`, `garage.IsBadRequest(err)`
 - bootstrap_peers format: `<64-char-hex-node-id>@<hostname>:<port>` (addresses without node IDs are ignored)
+
+### Dynamic operator token status (#472)
+
+`reconcileOperatorAdminToken` proves the dynamic operator Admin token on the
+complete managed Pod set (fail-closed). Its outcome is reported as the
+GarageCluster condition `OperatorAdminTokenReady`: `Verified`,
+`ManagedPodsNotReady` (message names the missing/unready Pod or GarageNode —
+only errors tagged `operatorAdminPodSetError` in `operator_admin_token_pods.go`),
+`NotVerified`, or `Provisioning` (token not yet authoritative, so dependents
+still use the static token). Once authoritative, False blocks GarageKey and
+GarageBucket even with quorum; the lever is getting the named Pod Ready.
+Reporting only — the proof is unchanged. Messages are fixed per cause and
+never embed raw error text (ports, request IDs, timings would cost a status
+write every pass); the raw error goes to the log and
+to an `OperatorAdminTokenNotReady` Warning event emitted only when the
+condition changes. One Reconcile writes the condition at most once, pinned by
+`TestReconcileWritesOperatorAdminTokenConditionAtMostOncePerLoop`.
 
 ### Storage-tier reconnect after restart (#203)
 
@@ -621,6 +832,7 @@ Import test: `go get git.deuxfleurs.fr/garage-sdk/garage-admin-sdk-golang` succe
 5. **Single-node clusters** - Supported for multi-cluster federation (1 replica per K8s cluster)
 6. **Node identity in metadata_dir** - Garage stores `node_key` (Ed25519 private key) in `metadata_dir`. This file determines the node ID. Both storage and gateway clusters need persistent metadata to preserve node identity across restarts (see `garage/src/rpc/system.rs:gen_node_key`)
 7. **No operator-internal S3 key** - Since v2.3.0, lifecycle rules are managed via the Admin API (`UpdateBucket`), so the operator no longer needs an internal S3 access key. The `--operator-namespace` flag is kept for backward-compat CLI parsing only and has no effect.
+8. **Owned metadata is merged, never replaced** - Every update path for an operator-managed object (Secrets, ConfigMaps, Services, StatefulSets, DaemonSets, PDBs, ServiceMonitors, generated GarageNodes) goes through `mergeOwnedMetadata` (`internal/controller/helpers.go`). It overlays only the keys the operator sets and reports whether anything changed, so labels/annotations stamped by other controllers survive and a converged object is not rewritten. Replacing the maps wholesale looped forever against Kyverno (`generate.kyverno.io/clone-source`) because the operator `Owns()` the object and every rewrite re-triggered both controllers. Stale operator-set keys are intentionally not tracked or removed.
 
 ### Port Defaults
 
@@ -643,14 +855,29 @@ Import test: `go get git.deuxfleurs.fr/garage-sdk/garage-admin-sdk-golang` succe
 | `helm.yml` | Helm chart lint, verify CRDs, verify version, push to OCI registry |
 | `release.yml` | GitHub release with install.yaml |
 
+### Supply-chain attestations (#292)
+
+Every non-PR build signs and attests the **digest**, so one invocation covers
+all tags pointing at it:
+
+- `docker.yml` — keyless `cosign sign`, `actions/attest-build-provenance`, and
+  an SPDX SBOM (`anchore/sbom-action` → `actions/attest-sbom`), all pushed to
+  GHCR as OCI referrers (`push-to-registry: true`).
+- `helm.yml` — the OCI chart is signed and provenance-attested at the digest
+  parsed out of `helm push` output.
+- `release.yml` — provenance attestation for the `dist/install.yaml` asset.
+
+`provenance: false` stays on `docker/build-push-action` deliberately: buildx's
+inline SLSA attestation adds `unknown/unknown` platform entries to the image
+index. The referrer-based attestations above keep the index clean. Jobs need
+`id-token: write` + `attestations: write`; there are no secrets to rotate.
+
 ```bash
 # Install
 kubectl apply -f https://github.com/rajsinghtech/garage-operator/releases/latest/download/install.yaml
 
 # Release
-make chart-bump VERSION=v0.6.18   # bump Chart.yaml + values.yaml image.tag
-git add -A && git commit -m "release: v0.6.18"
-git tag v0.6.18 && git push origin main v0.6.18
+make release VERSION=v0.6.18   # bump chart, commit, tag, push — all in one step
 ```
 
 ### Chart version management
@@ -658,12 +885,22 @@ git tag v0.6.18 && git push origin main v0.6.18
 The in-repo `charts/garage-operator/Chart.yaml` (version + appVersion) and
 `charts/garage-operator/values.yaml` (image.tag) MUST match the latest release
 tag. The `helm.yml` CI workflow has a `verify-version` job that fails the tag
-push if these three values don't match the tag. Always run
-`make chart-bump VERSION=vX.Y.Z` before committing a release — the target
-updates all three fields atomically. The `appVersion` field is what Helm uses
-as the default image tag when `values.yaml image.tag` is empty; the previous
-practice of leaving them stale caused issue #260 (users installing from a local
-clone got a months-old operator image).
+push if these three values don't match the tag, and `release.yml` now runs
+`make helm-verify-version` as its first step so a mismatch fails the Release
+job loudly before any changelog/GitHub-release is created. Always cut a
+release with `make release VERSION=vX.Y.Z` (bumps Chart.yaml/values.yaml,
+verifies them, commits, tags, and pushes atomically) rather than the
+individual `chart-bump`/`commit`/`tag` steps by hand — doing those manually
+and skipping/misordering a step is exactly what produced the broken
+v0.6.22/v0.6.23 releases on 2026-07-11 (see issue #278). The `appVersion`
+field is what Helm uses as the default image tag when `values.yaml image.tag`
+is empty; the previous practice of leaving them stale caused issue #260
+(users installing from a local clone got a months-old operator image).
+
+Note: `make release` pushes directly to `main`, which only works for an
+actor with branch-protection bypass (repo admin); it must not be run from
+CI with the default `GITHUB_TOKEN`, which is not an admin and would be
+rejected by the 8 required status checks on `main`.
 
 ---
 
@@ -698,4 +935,3 @@ to perform a non-disruptive node swap:
 Use case: replace a node whose underlying disk is failing without taking the
 cluster below quorum or losing the layout slot. A TODO marker is placed in
 `internal/controller/garagenode_controller.go` near the top of `Reconcile`.
-

@@ -27,6 +27,11 @@ spec:
     includeRegion: true
     bucketNameKey: bucket
     includeBucketName: true
+    websiteUrlKey: website-url
+    includeWebsiteUrl: true
+    credentialsFileKey: credentials # AWS shared credentials file data key
+    credentialsFileProfile: default
+    includeCredentialsFile: true
 
   # Bucket permissions
   bucketPermissions:

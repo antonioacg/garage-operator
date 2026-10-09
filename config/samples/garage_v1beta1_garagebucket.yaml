@@ -10,6 +10,10 @@ spec:
   clusterRef:
     name: garage
 
+  # Delete is the default. Use Retain to remove this resource without
+  # deleting the remote Garage bucket.
+  deletionPolicy: Delete
+
   # Bucket quotas
   quotas:
     maxSize: 10Gi
@@ -39,6 +43,39 @@ spec:
     enabled: true
     indexDocument: index.html
     errorDocument: error.html
+
+  # Expose the website at <globalAlias><webApi.rootDomain> through an
+  # Ingress created in the bucket's namespace (the backend Service must
+  # therefore live there too — same namespace as the cluster). Exactly one
+  # of ingress/gateway. An Ingress cannot rewrite the Host header, so
+  # only the canonical hostname or the global alias are accepted.
+  # Requires the operator's --enable-ingress flag (chart value
+  # ingress.enabled=true); otherwise WebsiteExposed=False/IngressDisabled.
+  websiteExposure:
+    # hostnames: [site.example.com, site]
+    ingress:
+      ingressClassName: traefik
+      # tlsSecretName: website-tls
+
+  # Cross-namespace exposure (bucket in a different namespace from the
+  # cluster) is only possible through the Gateway API: the HTTPRoute is
+  # created in the bucket's namespace and reaches the cluster's web
+  # Service (<cluster>-gateway for unified clusters) through a gateway
+  # ReferenceGrant in the cluster's namespace. Requires the Gateway API
+  # CRDs and the operator's --enable-gateway-api flag.
+  # websiteExposure:
+  #   gateway:
+  #     parentRefs:
+  #       - name: public-gateway
+  #     labels:
+  #       external-dns.alpha.kubernetes.io/hostname: site.example.com
+  #   # Optional backend override (e.g. a ServiceImport for
+  #   # multi-cluster):
+  #   # backendRef:
+  #   #   name: garage
+  #   #   kind: ServiceImport
+  #   #   group: multicluster.x-k8s.io
+  #   #   namespace: garage-ns
 
   # Public read access
   keyPermissions:

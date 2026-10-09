@@ -4,10 +4,24 @@ A Kubernetes operator for managing [Garage](https://garagehq.deuxfleurs.fr/) - a
 
 ## Prerequisites
 
-- Kubernetes 1.25+
+- Kubernetes 1.25+. The
+  [`spec.storage.nodeLocalPools`](../../docs/node-local-pools.md) feature
+  requires Kubernetes 1.27+ for Pod scheduling gates and fails closed on older
+  or incompatible servers; clusters that do not use it retain the 1.25 floor.
 - Helm 3.8+
-- cert-manager for admission and conversion webhook certificates, unless `webhooks.enabled=false`
-- (Optional) Prometheus Operator for ServiceMonitor and PrometheusRule resources
+- Garage **v2.0.0 or newer** (the operator drives the `/v2` admin API exclusively; v2.4.0 is the tested default). See [Garage version compatibility](../../README.md#garage-version-compatibility).
+- cert-manager for admission and conversion webhook certificates, unless
+  `webhooks.enabled=false`. That disabled mode is limited to local development
+  or simple v1beta2-only installs; it is unsupported for `nodeLocalPools` and
+  removes the admission boundary for prepared storage deletion. It also
+  rejects controller-managed persistent claims. `EmptyDir` remains available;
+  explicit `existingClaim` volumes can be mounted, but PVC-backed rollout and
+  recovery remain fenced until admission is enabled.
+- (Optional) Prometheus Operator for ServiceMonitor, PodMonitor, and PrometheusRule resources
+
+> `appVersion` tracks the **operator** version, not Garage. The Garage version
+> comes from `GarageCluster.spec.image` / `GarageNode.spec.image`, or the
+> chart-wide `defaultGarageImage` value.
 
 ## Installation
 
@@ -49,14 +63,16 @@ See [values.yaml](values.yaml) for the full list of configurable parameters.
 |-----------|-------------|---------|
 | `replicaCount` | Number of operator replicas | `1` |
 | `image.repository` | Container image repository | `ghcr.io/rajsinghtech/garage-operator` |
-| `image.tag` | Image tag (defaults to chart appVersion) | `""` |
+| `image.tag` | Image tag (operator image tag) | `v0.8.2` |
+| `image.digest` | Immutable `sha256:` image digest (takes precedence over tag) | `""` |
 | `image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `defaultGarageImage` | Default Garage image for GarageCluster/GarageNode resources that omit `spec.image` | `""` |
 | `resources.limits.cpu` | CPU limit | `500m` |
 | `resources.limits.memory` | Memory limit | `256Mi` |
 | `resources.requests.cpu` | CPU request | `10m` |
 | `resources.requests.memory` | Memory request | `128Mi` |
-| `leaderElection.enabled` | Enable leader election for HA deployments | `true` |
+| `leaderElection.enabled` | Require one active controller manager through leader election | `true` |
+| `leaderElection.unsafeAllowDisabled` | Explicitly acknowledge unsupported single-replica operation without leader election | `false` |
 | `logLevel` | Operator log level | `info` |
 | `clusterDomain` | Kubernetes cluster domain used for service FQDNs | `cluster.local` |
 
@@ -76,16 +92,36 @@ See [values.yaml](values.yaml) for the full list of configurable parameters.
 | `metrics.service.port` | Metrics service port | `8443` |
 | `serviceMonitor.enabled` | Create ServiceMonitor for Prometheus | `false` |
 | `serviceMonitor.interval` | Scrape interval | `30s` |
+| `serviceMonitor.namespaceSelector.matchNames` | Override namespaces searched for the metrics Service; empty preserves the release namespace | `[]` |
+| `serviceMonitor.selector.matchLabels` | Override the metrics Service selector; empty preserves the chart selector | `{}` |
+| `serviceMonitor.jobLabel` | Service label used as the Prometheus job label | `""` |
+| `serviceMonitor.targetLabels` | Service labels copied to scraped targets | `[]` |
+| `serviceMonitor.honorLabels` | Preserve labels from scraped metrics | `false` |
+| `serviceMonitor.relabelings` | Prometheus target relabelings | `[]` |
+| `serviceMonitor.metricRelabelings` | Prometheus metric relabelings | `[]` |
+| `podMonitor.enabled` | Create PodMonitor for Prometheus | `false` |
+| `podMonitor.namespaceSelector.matchNames` | Override namespaces searched for operator Pods; empty preserves the release namespace | `[]` |
+| `podMonitor.selector.matchLabels` | Override the operator Pod selector; empty preserves the chart selector | `{}` |
+| `podMonitor.jobLabel` | Pod label used as the Prometheus job label | `""` |
+| `podMonitor.targetLabels` | Pod labels copied to scraped targets | `[]` |
+| `podMonitor.honorLabels` | Preserve labels from scraped metrics | `false` |
+| `podMonitor.relabelings` | Prometheus target relabelings | `[]` |
+| `podMonitor.metricRelabelings` | Prometheus metric relabelings | `[]` |
 | `prometheusRules.enabled` | Create PrometheusRule alerting rules | `false` |
 | `grafanaDashboard.enabled` | Create the Garage Grafana dashboard ConfigMap | `false` |
 | `networkPolicy.enabled` | Create NetworkPolicy for metrics | `false` |
+
+ServiceMonitor and PodMonitor are mutually exclusive. The chart fails to render
+if both are enabled because selecting both would scrape each operator Pod twice.
+The chart's default ServiceMonitor selector and namespace behavior are preserved
+when the corresponding selector overrides are empty.
 
 ### Webhooks
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `webhooks.enabled` | Enable admission and conversion webhooks | `true` |
-| `webhooks.failurePolicy` | Webhook failure policy | `Fail` |
+| `webhooks.enabled` | Enable admission and conversion webhooks; required for `nodeLocalPools`, managed persistent claims, and admission-protected storage deletion | `true` |
+| `webhooks.failurePolicy` | Ordinary webhook failure policy; managed-PVC identity protection always uses `Fail` | `Fail` |
 | `webhooks.certManager.enabled` | Use cert-manager for certificates | `true` |
 
 ### Namespace Scoping & COSI
@@ -96,6 +132,7 @@ See [values.yaml](values.yaml) for the full list of configurable parameters.
 | `watchAnyNamespace` | Force cluster-wide watching when `watchNamespaces` is set | `false` |
 | `cosi.enabled` | Enable the optional COSI driver | `false` |
 | `cosi.driverName` | COSI driver name used by BucketClass/BucketAccessClass | `garage.rajsingh.info` |
+| `cosi.namespace` | Namespace for COSI shadow GarageBucket/GarageKey resources; cross-namespace target clusters require a GarageReferenceGrant | release namespace |
 | `extraObjects` | Extra templated Kubernetes objects to render with the chart | `[]` |
 
 ## Usage

@@ -19,11 +19,14 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
+	"sort"
 	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -41,6 +44,18 @@ import (
 // symmetric across tiers.
 func autoModeGatewayNodeName(clusterName string, ordinal int32) string {
 	return fmt.Sprintf("%s-gateway-%d", clusterName, ordinal)
+}
+
+func parseAutoModeGatewayOrdinal(nodeName, clusterName string) (int32, bool) {
+	prefix := clusterName + "-gateway-"
+	if !strings.HasPrefix(nodeName, prefix) {
+		return 0, false
+	}
+	ordinal, err := strconv.ParseInt(nodeName[len(prefix):], 10, 32)
+	if err != nil || ordinal < 0 {
+		return 0, false
+	}
+	return int32(ordinal), true
 }
 
 // reconcileAutoModeGatewayNodes generates and reconciles one gateway GarageNode
@@ -68,8 +83,19 @@ func (r *GarageClusterReconciler) reconcileAutoModeGatewayNodes(ctx context.Cont
 	if err != nil {
 		return fmt.Errorf("listing operator-owned gateway GarageNodes: %w", err)
 	}
+	if adopted, err := r.ensureAutoModeCycleOwnership(ctx, cluster, existing, tierGateway); err != nil {
+		return err
+	} else if adopted {
+		return nil
+	}
 
+	type pendingGatewayUpdate struct {
+		current *garagev1beta1.GarageNode
+		desired *garagev1beta1.GarageNode
+	}
 	desiredByName := make(map[string]bool, desiredReplicas)
+	var toCreate []*garagev1beta1.GarageNode
+	var toUpdate []pendingGatewayUpdate
 	for i := int32(0); i < desiredReplicas; i++ {
 		desiredByName[autoModeGatewayNodeName(cluster.Name, i)] = true
 
@@ -78,43 +104,130 @@ func (r *GarageClusterReconciler) reconcileAutoModeGatewayNodes(ctx context.Cont
 			return fmt.Errorf("building desired gateway GarageNode for ordinal %d: %w", i, err)
 		}
 
-		current, found := existing[desired.Name]
-		if !found {
-			log.Info("Creating Auto-mode gateway GarageNode", "name", desired.Name)
-			if err := r.Create(ctx, desired); err != nil && !errors.IsAlreadyExists(err) {
-				return fmt.Errorf("creating gateway GarageNode %s: %w", desired.Name, err)
+		// Repeated cycles accumulate exact -cycle suffixes. Keep deleting
+		// ancestors out of the parent scale loop and let the sole live promoted
+		// descendant satisfy this ordinal.
+		descendantNames, current, err := resolveAutoModeCycleSlotForCluster(existing, desired.Name, cluster, tierGateway)
+		if err != nil {
+			return fmt.Errorf("resolving promoted gateway cycle for ordinal %d: %w", i, err)
+		}
+		for _, name := range descendantNames {
+			desiredByName[name] = true
+		}
+		if current != nil {
+			repaired, labelErr := r.repairAutoModeNodeLabels(ctx, cluster, current,
+				expectedAutoModeNodeLabels(cluster, tierGateway, desired.Name))
+			if labelErr != nil {
+				return fmt.Errorf("repairing Auto gateway GarageNode %s labels: %w", current.Name, labelErr)
 			}
+			if repaired {
+				// Keep metadata repair separate from a spec/layout transition. The next
+				// reconcile consumes the fresh labels before doing other work.
+				return nil
+			}
+			changed, handoffErr := r.reconcileCurrentAutoModePVCHandoffs(ctx, cluster, current, desired.Name)
+			if handoffErr != nil {
+				return fmt.Errorf("reconciling retained PVC handoff for gateway ordinal %d: %w", i, handoffErr)
+			}
+			if changed {
+				return nil
+			}
+		}
+		if current == nil {
+			if nameErr := validateManagedGarageNodeName(desired); nameErr != nil {
+				return fmt.Errorf("refusing to create Auto gateway GarageNode ordinal %d: %w", i, nameErr)
+			}
+			toCreate = append(toCreate, desired)
 			continue
 		}
 
 		if autoModeGatewayNodeNeedsUpdate(current, desired) {
-			log.Info("Updating Auto-mode gateway GarageNode (drift detected)", "name", desired.Name)
-			current.Spec.Zone = desired.Spec.Zone
-			current.Spec.Tags = desired.Spec.Tags
-			current.Spec.Network = desired.Spec.Network
-			if current.Spec.Storage == nil {
-				current.Spec.Storage = desired.Spec.Storage
-			} else if desired.Spec.Storage != nil && desired.Spec.Storage.Metadata != nil {
-				if current.Spec.Storage.Metadata == nil {
-					current.Spec.Storage.Metadata = desired.Spec.Storage.Metadata
-				} else if current.Spec.Storage.Metadata.ExistingClaim == "" {
-					current.Spec.Storage.Metadata.Size = desired.Spec.Storage.Metadata.Size
-					current.Spec.Storage.Metadata.StorageClassName = desired.Spec.Storage.Metadata.StorageClassName
-				}
+			if nameErr := validateManagedGarageNodeName(desired); nameErr != nil {
+				return fmt.Errorf("refusing to roll Auto gateway GarageNode ordinal %d: %w", i, nameErr)
 			}
-			if err := r.Update(ctx, current); err != nil {
-				return fmt.Errorf("updating gateway GarageNode %s: %w", current.Name, err)
-			}
+			toUpdate = append(toUpdate, pendingGatewayUpdate{current: current, desired: desired})
 		}
 	}
 
+	if len(toCreate) > 0 || len(toUpdate) > 0 {
+		// Gateway identities are never the empty-cluster bootstrap. The storage
+		// tier must establish the Admin API and settle first, after which gateway
+		// additions and role-affecting updates are admitted one at a time.
+		ready, _, waitingMessage, barrierErr := r.clusterLayoutReadyForMutation(ctx, cluster, false)
+		if barrierErr != nil {
+			waitingMessage = "refusing to start an Auto-mode gateway addition/update until Garage layout convergence can be verified: " + barrierErr.Error()
+		}
+		if barrierErr != nil || !ready {
+			log.Info("Waiting to reconcile Auto-mode gateway topology", "reason", waitingMessage)
+			return nil
+		}
+		if len(toCreate) > 0 {
+			toCreate = toCreate[:1]
+			toUpdate = nil
+		} else {
+			toUpdate = toUpdate[:1]
+		}
+		for _, desired := range toCreate {
+			hasHandoff, handoffErr := r.reserveAutoModeReplacement(ctx, cluster, desired)
+			if handoffErr != nil {
+				return fmt.Errorf("reserving retained PVC handoff for gateway GarageNode %s: %w", desired.Name, handoffErr)
+			}
+			log.Info("Creating Auto-mode gateway GarageNode (serialized topology change)", "name", desired.Name)
+			if err := r.Create(ctx, desired); err != nil && !errors.IsAlreadyExists(err) {
+				return fmt.Errorf("creating gateway GarageNode %s: %w", desired.Name, err)
+			}
+			if hasHandoff {
+				if desired.UID == "" {
+					return fmt.Errorf("creating gateway GarageNode %s returned an empty UID for retained PVC handoff", desired.Name)
+				}
+				if err := r.bindAutoModeReplacement(ctx, cluster, desired, desired.Name); err != nil {
+					return fmt.Errorf("binding retained PVC handoff to gateway GarageNode %s: %w", desired.Name, err)
+				}
+			}
+		}
+		for _, update := range toUpdate {
+			log.Info("Updating Auto-mode gateway GarageNode (serialized topology change)", "name", update.current.Name)
+			applyAutoModeGatewayNodeUpdate(update.current, update.desired)
+			if err := r.Update(ctx, update.current); err != nil {
+				return fmt.Errorf("updating gateway GarageNode %s: %w", update.current.Name, err)
+			}
+		}
+		// Let this batch join and settle before a scale-down or another tier
+		// changes the shared Garage layout.
+		return nil
+	}
+
+	var toDelete []*garagev1beta1.GarageNode
 	for name, n := range existing {
 		if desiredByName[name] {
 			continue
 		}
-		log.Info("Deleting Auto-mode gateway GarageNode (scale-down)", "name", name)
-		if err := r.Delete(ctx, n); err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("deleting gateway GarageNode %s: %w", name, err)
+		toDelete = append(toDelete, n)
+	}
+	sort.Slice(toDelete, func(i, j int) bool {
+		left, leftOK := parseAutoModeGatewayOrdinal(autoNodeSlotForCycle(toDelete[i]), cluster.Name)
+		right, rightOK := parseAutoModeGatewayOrdinal(autoNodeSlotForCycle(toDelete[j]), cluster.Name)
+		if leftOK && rightOK && left != right {
+			return left > right
+		}
+		return toDelete[i].Name > toDelete[j].Name
+	})
+	if len(toDelete) > 0 {
+		candidate := toDelete[0]
+		ready, _, waitingMessage, barrierErr := r.clusterLayoutReadyForMutation(ctx, cluster, false, candidate.Name)
+		if barrierErr != nil {
+			waitingMessage = "refusing to start an Auto-mode gateway drain until Garage layout convergence can be verified: " + barrierErr.Error()
+		}
+		if barrierErr != nil || !ready {
+			log.Info("Waiting to drain Auto-mode gateway GarageNode", "node", candidate.Name, "reason", waitingMessage)
+			return nil
+		}
+		log.Info("Deleting one Auto-mode gateway GarageNode (serialized scale-down)", "name", candidate.Name)
+		if err := r.prepareRetainedAutoModePVCHandoffs(ctx, cluster, candidate); err != nil {
+			return fmt.Errorf("preparing retained PVC handoff for gateway GarageNode %s: %w", candidate.Name, err)
+		}
+		if err := r.Delete(ctx, candidate); err != nil && !errors.IsNotFound(err) {
+			return fmt.Errorf("deleting gateway GarageNode %s: %w", candidate.Name, err)
 		}
 	}
 
@@ -122,25 +235,280 @@ func (r *GarageClusterReconciler) reconcileAutoModeGatewayNodes(ctx context.Cont
 }
 
 // listAutoModeGatewayNodes returns operator-owned gateway GarageNodes for this
-// cluster, keyed by name.
+// cluster, keyed by name. It discovers exact-owned nodes even when one of the
+// mutable generated labels has drifted; unowned label-selected objects remain
+// present so the cycle ownership fence can reject them.
 func (r *GarageClusterReconciler) listAutoModeGatewayNodes(ctx context.Context, cluster *garagev1beta2.GarageCluster) (map[string]*garagev1beta1.GarageNode, error) {
-	nodeList := &garagev1beta1.GarageNodeList{}
-	if err := r.List(ctx, nodeList,
-		client.InNamespace(cluster.Namespace),
-		client.MatchingLabels(map[string]string{
-			labelCluster:      cluster.Name,
-			labelTier:         tierGateway,
-			labelAppManagedBy: managedByOperatorValue,
-		}),
-	); err != nil {
-		return nil, err
+	canonicalNames := make([]string, 0, cluster.GatewayReplicas())
+	for ordinal := int32(0); ordinal < cluster.GatewayReplicas(); ordinal++ {
+		canonicalNames = append(canonicalNames, autoModeGatewayNodeName(cluster.Name, ordinal))
 	}
-	out := make(map[string]*garagev1beta1.GarageNode, len(nodeList.Items))
-	for i := range nodeList.Items {
-		n := &nodeList.Items[i]
-		out[n.Name] = n
+	return r.listAutoModeNodes(ctx, cluster, tierGateway, canonicalNames)
+}
+
+func (r *GarageClusterReconciler) prepareRetainedAutoModePVCHandoffs(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+	node *garagev1beta1.GarageNode,
+) error {
+	policy := stsPVCRetentionPolicy(cluster, node)
+	if policy != nil && policy.WhenDeleted == appsv1.DeletePersistentVolumeClaimRetentionPolicyType {
+		return nil
 	}
-	return out, nil
+	if !metav1.IsControlledBy(node, cluster) || node.Labels[labelAutoNodeSlot] == "" ||
+		node.Labels[labelAppManagedBy] != managedByOperatorValue ||
+		(node.Labels[labelTier] != tierGateway && node.Labels[labelTier] != tierStorage) {
+		return fmt.Errorf("refusing to publish retained PVC handoff for GarageNode without exact Auto-mode ownership")
+	}
+
+	slot := node.Labels[labelAutoNodeSlot]
+	prepared := make([]garagev1beta2.AutoModePVCHandoffStatus, 0, len(node.Status.ManagedPVCs))
+	for i := range node.Status.ManagedPVCs {
+		record := node.Status.ManagedPVCs[i]
+		pvc := &corev1.PersistentVolumeClaim{}
+		key := types.NamespacedName{Name: record.Name, Namespace: node.Namespace}
+		if err := r.safetyReader().Get(ctx, key, pvc); err != nil {
+			if errors.IsNotFound(err) {
+				continue
+			}
+			return fmt.Errorf("reading managed PVC %s before retained handoff: %w", key, err)
+		}
+		if pvc.UID == "" || pvc.Annotations[managedPVCNodeUIDAnnotation] != string(node.UID) {
+			return fmt.Errorf("refusing retained handoff for PVC %s/%s without its exact GarageNode UID correlation", pvc.Namespace, pvc.Name)
+		}
+		switch {
+		case record.UID != "":
+			if record.UID != pvc.UID {
+				return fmt.Errorf("refusing retained handoff for PVC %s/%s UID %s because GarageNode status records %s", pvc.Namespace, pvc.Name, pvc.UID, record.UID)
+			}
+		case record.PendingReservationHash != "":
+			if !managedNodePVCNonceMatches(pvc, record.PendingReservationHash) {
+				return fmt.Errorf("refusing retained handoff for PVC %s/%s because its reservation nonce does not match GarageNode status", pvc.Namespace, pvc.Name)
+			}
+		default:
+			return fmt.Errorf("refusing malformed retained PVC handoff record for %q", record.Name)
+		}
+		prepared = append(prepared, garagev1beta2.AutoModePVCHandoffStatus{
+			SlotName:              slot,
+			PVCName:               pvc.Name,
+			PVCUID:                string(pvc.UID),
+			PreviousGarageNodeUID: string(node.UID),
+		})
+	}
+	if len(prepared) == 0 {
+		return nil
+	}
+
+	return r.updateAutoModePVCHandoffs(ctx, cluster, func(current []garagev1beta2.AutoModePVCHandoffStatus) ([]garagev1beta2.AutoModePVCHandoffStatus, error) {
+		for _, wanted := range prepared {
+			found := false
+			for i := range current {
+				if current[i].PVCName != wanted.PVCName {
+					continue
+				}
+				found = true
+				if current[i].SlotName != wanted.SlotName || current[i].PVCUID != wanted.PVCUID ||
+					current[i].PreviousGarageNodeUID != wanted.PreviousGarageNodeUID {
+					return nil, fmt.Errorf("refusing to replace conflicting retained PVC handoff for %q", wanted.PVCName)
+				}
+			}
+			if !found {
+				current = append(current, wanted)
+			}
+		}
+		sort.Slice(current, func(i, j int) bool { return current[i].PVCName < current[j].PVCName })
+		return current, nil
+	})
+}
+
+func (r *GarageClusterReconciler) reserveAutoModeReplacement(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+	desired *garagev1beta1.GarageNode,
+) (bool, error) {
+	slot := desired.Labels[labelAutoNodeSlot]
+	handoffs := autoModePVCHandoffsForSlot(cluster.Status.AutoModePVCHandoffs, slot)
+	if len(handoffs) == 0 {
+		return false, nil
+	}
+	missing := map[string]struct{}{}
+	for i := range handoffs {
+		pvc := &corev1.PersistentVolumeClaim{}
+		key := types.NamespacedName{Name: handoffs[i].PVCName, Namespace: desired.Namespace}
+		if err := r.safetyReader().Get(ctx, key, pvc); err != nil {
+			if errors.IsNotFound(err) {
+				missing[handoffs[i].PVCName] = struct{}{}
+				continue
+			}
+			return false, fmt.Errorf("checking retained PVC %s before replacement: %w", key, err)
+		}
+		if string(pvc.UID) != handoffs[i].PVCUID {
+			return false, fmt.Errorf("refusing replacement for retained PVC %s: expected UID %s, got %s", key, handoffs[i].PVCUID, pvc.UID)
+		}
+		if !pvc.DeletionTimestamp.IsZero() {
+			return false, fmt.Errorf("waiting for retained PVC %s UID %s to finish terminating", key, pvc.UID)
+		}
+	}
+	if len(missing) > 0 {
+		if err := r.updateAutoModePVCHandoffs(ctx, cluster, func(current []garagev1beta2.AutoModePVCHandoffStatus) ([]garagev1beta2.AutoModePVCHandoffStatus, error) {
+			kept := current[:0]
+			for i := range current {
+				if current[i].SlotName == slot {
+					if _, absent := missing[current[i].PVCName]; absent {
+						continue
+					}
+				}
+				kept = append(kept, current[i])
+			}
+			return kept, nil
+		}); err != nil {
+			return false, err
+		}
+		handoffs = autoModePVCHandoffsForSlot(cluster.Status.AutoModePVCHandoffs, slot)
+		if len(handoffs) == 0 {
+			return false, nil
+		}
+	}
+	absent, err := authoritativeObjectAbsent(ctx, r.safetyReader(), client.ObjectKeyFromObject(desired), &garagev1beta1.GarageNode{})
+	if err != nil {
+		return false, fmt.Errorf("checking replacement GarageNode absence: %w", err)
+	}
+	if !absent {
+		return false, fmt.Errorf("refusing to reserve a replacement nonce while GarageNode %s/%s already exists", desired.Namespace, desired.Name)
+	}
+	nonce, hash, err := newManagedNodePVCNonce()
+	if err != nil {
+		return false, err
+	}
+	if desired.Annotations == nil {
+		desired.Annotations = map[string]string{}
+	}
+	desired.Annotations[autoModePVCHandoffNonceAnnotation] = nonce
+	if err := r.updateAutoModePVCHandoffs(ctx, cluster, func(current []garagev1beta2.AutoModePVCHandoffStatus) ([]garagev1beta2.AutoModePVCHandoffStatus, error) {
+		found := false
+		for i := range current {
+			if current[i].SlotName != slot {
+				continue
+			}
+			found = true
+			current[i].ReplacementReservationHash = hash
+			current[i].ReplacementGarageNodeUID = ""
+		}
+		if !found {
+			return nil, fmt.Errorf("retained PVC handoff for Auto-mode slot %q disappeared before replacement reservation", slot)
+		}
+		return current, nil
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (r *GarageClusterReconciler) bindAutoModeReplacement(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+	node *garagev1beta1.GarageNode,
+	slot string,
+) error {
+	if node.UID == "" || !metav1.IsControlledBy(node, cluster) || node.Labels[labelAutoNodeSlot] != slot {
+		return fmt.Errorf("replacement GarageNode does not have exact Auto-mode ownership")
+	}
+	return r.updateAutoModePVCHandoffs(ctx, cluster, func(current []garagev1beta2.AutoModePVCHandoffStatus) ([]garagev1beta2.AutoModePVCHandoffStatus, error) {
+		found := false
+		for i := range current {
+			if current[i].SlotName != slot {
+				continue
+			}
+			found = true
+			if !managedNodePVCNonceMatchesNode(node, current[i].ReplacementReservationHash) {
+				return nil, fmt.Errorf("replacement GarageNode nonce does not match the durable handoff commitment")
+			}
+			if current[i].ReplacementGarageNodeUID != "" && current[i].ReplacementGarageNodeUID != string(node.UID) {
+				return nil, fmt.Errorf("retained PVC handoff is already bound to GarageNode UID %s", current[i].ReplacementGarageNodeUID)
+			}
+			current[i].ReplacementGarageNodeUID = string(node.UID)
+		}
+		if !found {
+			return nil, fmt.Errorf("retained PVC handoff for Auto-mode slot %q disappeared before UID binding", slot)
+		}
+		return current, nil
+	})
+}
+
+func (r *GarageClusterReconciler) reconcileCurrentAutoModePVCHandoffs(
+	ctx context.Context,
+	cluster *garagev1beta2.GarageCluster,
+	node *garagev1beta1.GarageNode,
+	slot string,
+) (bool, error) {
+	handoffs := autoModePVCHandoffsForSlot(cluster.Status.AutoModePVCHandoffs, slot)
+	if len(handoffs) == 0 {
+		return false, nil
+	}
+	if !metav1.IsControlledBy(node, cluster) || node.Labels[labelAutoNodeSlot] != slot {
+		return false, fmt.Errorf("GarageNode %s/%s does not have exact ownership for retained slot %q", node.Namespace, node.Name, slot)
+	}
+	if string(node.UID) == handoffs[0].PreviousGarageNodeUID {
+		if !node.DeletionTimestamp.IsZero() {
+			return false, nil
+		}
+		if err := r.clearAutoModePVCHandoffsForSlot(ctx, cluster, slot); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	for i := range handoffs {
+		if handoffs[i].PreviousGarageNodeUID != handoffs[0].PreviousGarageNodeUID ||
+			handoffs[i].ReplacementGarageNodeUID != handoffs[0].ReplacementGarageNodeUID ||
+			handoffs[i].ReplacementReservationHash != handoffs[0].ReplacementReservationHash {
+			return false, fmt.Errorf("retained slot %q has inconsistent GarageNode identity commitments", slot)
+		}
+	}
+	if handoffs[0].ReplacementGarageNodeUID == "" {
+		if err := r.bindAutoModeReplacement(ctx, cluster, node, slot); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if handoffs[0].ReplacementGarageNodeUID != string(node.UID) {
+		return false, fmt.Errorf("retained slot %q authorizes GarageNode UID %s, not %s", slot, handoffs[0].ReplacementGarageNodeUID, node.UID)
+	}
+
+	for i := range handoffs {
+		record, found, err := managedNodePVCReservation(node, handoffs[i].PVCName)
+		if err != nil {
+			return false, err
+		}
+		if !found || record.UID != types.UID(handoffs[i].PVCUID) {
+			return false, nil
+		}
+		pvc := &corev1.PersistentVolumeClaim{}
+		key := types.NamespacedName{Name: handoffs[i].PVCName, Namespace: node.Namespace}
+		if err := r.safetyReader().Get(ctx, key, pvc); err != nil {
+			return false, fmt.Errorf("verifying consumed retained PVC handoff %s: %w", key, err)
+		}
+		if string(pvc.UID) != handoffs[i].PVCUID || pvc.Annotations[managedPVCNodeUIDAnnotation] != string(node.UID) {
+			return false, nil
+		}
+	}
+	if err := r.clearAutoModePVCHandoffsForSlot(ctx, cluster, slot); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (r *GarageClusterReconciler) clearAutoModePVCHandoffsForSlot(
+	ctx context.Context, cluster *garagev1beta2.GarageCluster, slot string,
+) error {
+	return r.updateAutoModePVCHandoffs(ctx, cluster, func(current []garagev1beta2.AutoModePVCHandoffStatus) ([]garagev1beta2.AutoModePVCHandoffStatus, error) {
+		kept := current[:0]
+		for i := range current {
+			if current[i].SlotName != slot {
+				kept = append(kept, current[i])
+			}
+		}
+		return kept, nil
+	})
 }
 
 // buildAutoModeGatewayNode constructs the desired gateway GarageNode for an
@@ -157,6 +525,15 @@ func (r *GarageClusterReconciler) listAutoModeGatewayNodes(ctx context.Context, 
 func (r *GarageClusterReconciler) buildAutoModeGatewayNode(cluster *garagev1beta2.GarageCluster, ordinal int32, adoptedMetadataPVC string) (*garagev1beta1.GarageNode, error) {
 	name := autoModeGatewayNodeName(cluster.Name, ordinal)
 
+	// spec.zoneFrom (#294) is intentionally NOT propagated to gateway nodes.
+	// Upstream computes ZoneRedundancy::Maximum as min(distinct zones over ALL
+	// roles, replication_factor) — gateways included, since a capacity:nil role
+	// still carries a zone — but then requires that many distinct zones among
+	// *non-gateway* nodes (../garage src/rpc/layout/version.rs:
+	// effective_zone_redundancy vs generate_nongateway_zone_ids). Scattering
+	// gateways across per-node zones would inflate the requirement past what
+	// storage can satisfy and every layout apply would fail with "The number of
+	// zones with non-gateway nodes (N) is smaller than the redundancy parameter".
 	zone := cluster.Spec.Zone
 	if zone == "" {
 		zone = defaultZoneName
@@ -173,6 +550,18 @@ func (r *GarageClusterReconciler) buildAutoModeGatewayNode(cluster *garagev1beta
 		storage = &garagev1beta1.NodeStorageConfig{
 			Metadata: &garagev1beta1.NodeVolumeConfig{ExistingClaim: adoptedMetadataPVC},
 		}
+	} else if gw := cluster.Spec.Gateway; gw != nil && gw.Metadata != nil && gw.Metadata.Type == garagev1beta2.VolumeTypeEmptyDir {
+		// Fully-ephemeral gateway metadata (#283): EmptyDir, no PVC. Node identity
+		// is not persisted across restarts — acceptable for throwaway gateways and
+		// already flagged by the cluster webhook's identity warning. Only carry an
+		// explicit size (as the EmptyDir sizeLimit); do NOT inject the 1Gi PVC
+		// default, which would silently bound the tmpfs the user never sized.
+		meta := &garagev1beta1.NodeVolumeConfig{Type: garagev1beta1.VolumeTypeEmptyDir}
+		if gw.Metadata.Size != nil && !gw.Metadata.Size.IsZero() {
+			s := gw.Metadata.Size.DeepCopy()
+			meta.Size = &s
+		}
+		storage = &garagev1beta1.NodeStorageConfig{Metadata: meta}
 	} else {
 		// Metadata PVC sizing: gateway.metadata.size when set, else the 1Gi default.
 		metaSize := gatewayDefaultMetadataSize
@@ -190,6 +579,18 @@ func (r *GarageClusterReconciler) buildAutoModeGatewayNode(cluster *garagev1beta
 				StorageClassName: metaSC,
 			},
 		}
+		if gw := cluster.Spec.Gateway; gw != nil && gw.Metadata != nil {
+			storage.Metadata.AccessModes = append([]corev1.PersistentVolumeAccessMode(nil), gw.Metadata.AccessModes...)
+			if gw.Metadata.Selector != nil {
+				storage.Metadata.Selector = gw.Metadata.Selector.DeepCopy()
+			}
+			storage.Metadata.Labels = maps.Clone(gw.Metadata.Labels)
+			storage.Metadata.Annotations = maps.Clone(gw.Metadata.Annotations)
+			if gw.Metadata.DataSourceRef != nil {
+				storage.Metadata.DataSourceRef = gw.Metadata.DataSourceRef.DeepCopy()
+			}
+			storage.Metadata.VolumeAttributesClassName = cloneStringPtr(gw.Metadata.VolumeAttributesClassName)
+		}
 	}
 
 	node := &garagev1beta1.GarageNode{
@@ -200,6 +601,7 @@ func (r *GarageClusterReconciler) buildAutoModeGatewayNode(cluster *garagev1beta
 				labelCluster:      cluster.Name,
 				labelTier:         tierGateway,
 				labelAppManagedBy: managedByOperatorValue,
+				labelAutoNodeSlot: name,
 			},
 		},
 		Spec: garagev1beta1.GarageNodeSpec{
@@ -260,9 +662,32 @@ func autoModeGatewayNodeNeedsUpdate(current, desired *garagev1beta1.GarageNode) 
 			if cm.Size != nil && dm.Size != nil && cm.Size.Cmp(*dm.Size) != 0 {
 				return true
 			}
+			if !equality.Semantic.DeepEqual(cm.VolumeAttributesClassName, dm.VolumeAttributesClassName) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+func applyAutoModeGatewayNodeUpdate(current, desired *garagev1beta1.GarageNode) {
+	current.Spec.Zone = desired.Spec.Zone
+	current.Spec.Tags = desired.Spec.Tags
+	current.Spec.Network = desired.Spec.Network
+	if current.Spec.Storage == nil {
+		current.Spec.Storage = desired.Spec.Storage
+		return
+	}
+	if desired.Spec.Storage == nil || desired.Spec.Storage.Metadata == nil {
+		return
+	}
+	if current.Spec.Storage.Metadata == nil {
+		current.Spec.Storage.Metadata = desired.Spec.Storage.Metadata
+	} else if current.Spec.Storage.Metadata.ExistingClaim == "" {
+		current.Spec.Storage.Metadata.Size = desired.Spec.Storage.Metadata.Size
+		current.Spec.Storage.Metadata.StorageClassName = desired.Spec.Storage.Metadata.StorageClassName
+		current.Spec.Storage.Metadata.VolumeAttributesClassName = cloneStringPtr(desired.Spec.Storage.Metadata.VolumeAttributesClassName)
+	}
 }
 
 // deleteAutoModeGatewayNodes deletes all operator-owned gateway GarageNodes for
@@ -274,11 +699,36 @@ func (r *GarageClusterReconciler) deleteAutoModeGatewayNodes(ctx context.Context
 	if err != nil {
 		return err
 	}
-	for name, n := range existing {
-		log.Info("Deleting Auto-mode gateway GarageNode (gateway tier removed)", "name", name)
-		if err := r.Delete(ctx, n); err != nil && !errors.IsNotFound(err) {
-			return fmt.Errorf("deleting gateway GarageNode %s: %w", name, err)
+	if len(existing) == 0 {
+		return nil
+	}
+	candidates := make([]*garagev1beta1.GarageNode, 0, len(existing))
+	for _, node := range existing {
+		candidates = append(candidates, node)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		left, leftOK := parseAutoModeGatewayOrdinal(autoNodeSlotForCycle(candidates[i]), cluster.Name)
+		right, rightOK := parseAutoModeGatewayOrdinal(autoNodeSlotForCycle(candidates[j]), cluster.Name)
+		if leftOK && rightOK && left != right {
+			return left > right
 		}
+		return candidates[i].Name > candidates[j].Name
+	})
+	candidate := candidates[0]
+	ready, _, waitingMessage, barrierErr := r.clusterLayoutReadyForMutation(ctx, cluster, false, candidate.Name)
+	if barrierErr != nil {
+		waitingMessage = "refusing to drain the removed Auto-mode gateway tier until Garage layout convergence can be verified: " + barrierErr.Error()
+	}
+	if barrierErr != nil || !ready {
+		log.Info("Waiting to drain removed Auto-mode gateway GarageNode", "node", candidate.Name, "reason", waitingMessage)
+		return nil
+	}
+	log.Info("Deleting one Auto-mode gateway GarageNode (gateway tier removed)", "name", candidate.Name)
+	if err := r.prepareRetainedAutoModePVCHandoffs(ctx, cluster, candidate); err != nil {
+		return fmt.Errorf("preparing retained PVC handoff for removed gateway GarageNode %s: %w", candidate.Name, err)
+	}
+	if err := r.Delete(ctx, candidate); err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("deleting gateway GarageNode %s: %w", candidate.Name, err)
 	}
 	return nil
 }
@@ -287,24 +737,14 @@ func (r *GarageClusterReconciler) deleteAutoModeGatewayNodes(ctx context.Context
 // label from each operator-owned gateway GarageNode (Auto→Manual hand-off),
 // mirroring ejectAutoModeStorageNodes.
 func (r *GarageClusterReconciler) ejectAutoModeGatewayNodes(ctx context.Context, cluster *garagev1beta2.GarageCluster) error {
-	log := logf.FromContext(ctx)
-	existing, err := r.listAutoModeGatewayNodes(ctx, cluster)
+	// No canonical names, for the same reason as ejectAutoModeStorageNodes: an
+	// already-ejected node must not fail the pass that finishes the hand-off.
+	existing, err := r.listAutoModeNodes(ctx, cluster, tierGateway, nil)
 	if err != nil {
 		return err
 	}
-	for name, n := range existing {
-		newOwners := n.OwnerReferences[:0]
-		for _, ref := range n.OwnerReferences {
-			if ref.UID == cluster.UID {
-				continue
-			}
-			newOwners = append(newOwners, ref)
-		}
-		n.OwnerReferences = newOwners
-		delete(n.Labels, labelAppManagedBy)
-
-		log.Info("Ejecting Auto-mode gateway GarageNode (Auto→Manual)", "name", name)
-		if err := r.Update(ctx, n); err != nil {
+	for name := range existing {
+		if err := r.ejectAutoModeNode(ctx, cluster, name); err != nil {
 			return fmt.Errorf("ejecting gateway GarageNode %s: %w", name, err)
 		}
 	}
